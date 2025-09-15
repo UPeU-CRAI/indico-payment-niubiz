@@ -15,10 +15,8 @@ from indico_payment_niubiz import _
 from indico_payment_niubiz.util import (authorize_transaction, create_session_token,
                                         get_security_token)
 
-status_map = {
-    'COMPLETED': TransactionAction.complete,
-    'PENDING': TransactionAction.pending,
-}
+CANCEL_ACTION = getattr(TransactionAction, 'cancel', TransactionAction.reject)
+SUCCESS_ACTION_CODE = '000'
 
 
 class RHNiubizBase(RH):
@@ -50,30 +48,23 @@ class RHNiubizBase(RH):
         self.event = registration.event
 
     def _get_endpoint(self):
-        endpoint = current_plugin.settings.get('endpoint')
-        if endpoint in {'sandbox', 'prod'}:
-            return endpoint
-
-        for url in (current_plugin.settings.get('security_url', ''),
-                    current_plugin.settings.get('session_url', '')):
-            if not url:
-                continue
-            url_lower = url.lower()
-            if 'sandbox' in url_lower or 'qas' in url_lower:
-                return 'sandbox'
-        return 'prod'
+        endpoint = (current_plugin.event_settings.get(self.event, 'endpoint') or
+                    current_plugin.settings.get('endpoint') or 'sandbox')
+        endpoint = (endpoint or '').lower()
+        return 'sandbox' if endpoint == 'sandbox' else 'prod'
 
     def _get_credentials(self):
-        access_key = (current_plugin.settings.get('access_key') or
-                      current_plugin.settings.get('api_username'))
-        secret_key = (current_plugin.settings.get('secret_key') or
-                      current_plugin.settings.get('api_password'))
+        access_key = (current_plugin.event_settings.get(self.event, 'access_key') or
+                      current_plugin.settings.get('access_key'))
+        secret_key = (current_plugin.event_settings.get(self.event, 'secret_key') or
+                      current_plugin.settings.get('secret_key'))
         if not access_key or not secret_key:
             raise BadRequest(_('Niubiz credentials are not configured.'))
         return access_key, secret_key
 
     def _get_merchant_id(self):
-        merchant_id = current_plugin.event_settings.get(self.event, 'merchant_id')
+        merchant_id = (current_plugin.event_settings.get(self.event, 'merchant_id') or
+                       current_plugin.settings.get('merchant_id'))
         if not merchant_id:
             raise BadRequest(_('The Niubiz merchant ID is not configured.'))
         return merchant_id
@@ -87,18 +78,19 @@ class RHNiubizBase(RH):
     def _get_purchase_number(self):
         return f'{self.registration.event_id}-{self.registration.id}'
 
+    def _get_client_ip(self):
+        return request.remote_addr or '127.0.0.1'
+
+    def _get_checkout_script(self):
+        endpoint = self._get_endpoint()
+        return ('https://static-content-qas.vnforapps.com/v2/js/checkout.js'
+                if endpoint == 'sandbox'
+                else 'https://static-content.vnforapps.com/v2/js/checkout.js')
+
 
 class RHNiubizCallback(RHNiubizBase):
     def _process(self):
-        data = request.json or request.form
-        status = data.get('status') or data.get('statusOrder')
-        action = status_map.get(status, TransactionAction.reject)
-        register_transaction(registration=self.registration,
-                             amount=float(data.get('amount', 0)),
-                             currency=data.get('currency', self.registration.currency),
-                             action=action,
-                             provider='niubiz',
-                             data=data)
+        logging.getLogger(__name__).info('Received Niubiz callback notification (stub).')
         return '', 204
 
 
@@ -123,10 +115,11 @@ class RHNiubizSuccess(RHNiubizBase):
                 self._get_currency(),
                 access_token,
                 endpoint,
+                client_ip=self._get_client_ip(),
             )
         except BadRequest:
             raise
-        except requests.RequestException as exc:
+        except requests.RequestException:
             logging.getLogger(__name__).exception('Niubiz authorization failed')
             flash(_('There was a problem confirming your Niubiz payment.'), 'error')
             return redirect(url_for('event_registration.display_regform',
@@ -134,7 +127,8 @@ class RHNiubizSuccess(RHNiubizBase):
 
         auth_data = authorization.get('data', {}) if isinstance(authorization, dict) else {}
         action_code = auth_data.get('ACTION_CODE')
-        action = TransactionAction.complete if action_code == '000' else TransactionAction.reject
+        success = action_code == SUCCESS_ACTION_CODE
+        action = TransactionAction.complete if success else TransactionAction.reject
 
         register_transaction(registration=self.registration,
                              amount=self._get_amount(),
@@ -143,7 +137,7 @@ class RHNiubizSuccess(RHNiubizBase):
                              provider='niubiz',
                              data=authorization)
 
-        if action is TransactionAction.complete:
+        if success:
             flash(_('Your payment was authorized successfully.'), 'success')
         else:
             flash(_('Your payment could not be authorized (code {code}).').format(code=action_code),
@@ -160,14 +154,21 @@ class RHNiubizSuccess(RHNiubizBase):
             'action_code': action_code,
             'transaction_id': auth_data.get('TRANSACTION_ID'),
             'masked_card': auth_data.get('CARD'),
-            'success': action is TransactionAction.complete,
+            'success': success,
+            'standalone': True,
         }
 
-        return render_template('payment_niubiz/event_payment_form.html', **context)
+        return render_template('payment_niubiz/transaction_details.html', **context)
 
 
 class RHNiubizCancel(RHNiubizBase):
     def _process(self):
+        register_transaction(registration=self.registration,
+                             amount=self._get_amount(),
+                             currency=self._get_currency(),
+                             action=CANCEL_ACTION,
+                             provider='niubiz',
+                             data={'status': 'cancelled'})
         flash(_('You cancelled the payment process.'), 'info')
         return redirect(url_for('event_registration.display_regform', self.registration.locator.registrant))
 
@@ -184,6 +185,8 @@ class RHNiubizStart(RHNiubizBase):
                 self._get_currency(),
                 access_token,
                 endpoint,
+                client_ip=self._get_client_ip(),
+                client_id=f'indico-registration-{self.registration.id}',
             )
         except BadRequest:
             raise
@@ -197,10 +200,16 @@ class RHNiubizStart(RHNiubizBase):
             'registration': self.registration,
             'event': self.event,
             'amount': self._get_amount(),
+            'amount_value': float(self._get_amount()),
             'currency': self._get_currency(),
             'merchant_id': self._get_merchant_id(),
             'purchase_number': self._get_purchase_number(),
             'sessionKey': session_key,
+            'checkout_js_url': self._get_checkout_script(),
+            'cancel_url': url_for('payment_niubiz.cancel',
+                                  event_id=self.event.id,
+                                  reg_form_id=self.registration.registration_form.id,
+                                  reg_id=self.registration.id),
         }
 
         return render_template('payment_niubiz/event_payment_form.html', **context)
