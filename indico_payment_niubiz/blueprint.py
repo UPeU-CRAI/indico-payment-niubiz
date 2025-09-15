@@ -1,6 +1,7 @@
 from indico.core.plugins import IndicoPluginBlueprint
 
-from indico_payment_niubiz.controllers import RHNiubizCancel, RHNiubizCallback, RHNiubizSuccess
+from indico_payment_niubiz.controllers import (RHNiubizCancel, RHNiubizCallback, RHNiubizStart,
+                                               RHNiubizSuccess)
 
 blueprint = IndicoPluginBlueprint(
     'payment_niubiz', __name__,
@@ -8,5 +9,6 @@ blueprint = IndicoPluginBlueprint(
 )
 
 blueprint.add_url_rule('/cancel', 'cancel', RHNiubizCancel, methods=('GET', 'POST'))
-blueprint.add_url_rule('/success', 'success', RHNiubizSuccess, methods=('GET', 'POST'))
+blueprint.add_url_rule('/start/<int:reg_id>', 'start', RHNiubizStart, methods=('POST',))
+blueprint.add_url_rule('/success/<int:reg_id>', 'success', RHNiubizSuccess, methods=('GET', 'POST'))
 blueprint.add_url_rule('/callback', 'notify', RHNiubizCallback, methods=('POST',))
