@@ -30,6 +30,8 @@ def test_create_session_token_sandbox():
         assert kwargs['json']['amount'] == 10.0
         assert kwargs['json']['currency'] == 'PEN'
         assert kwargs['json']['channel'] == 'web'
+        assert kwargs['json']['antifraud']['clientIp'] == '127.0.0.1'
+        assert kwargs['json']['dataMap']['clientId'] == 'indico-user'
         assert token == 'xyz'
 
 
@@ -49,4 +51,17 @@ def test_authorize_transaction_sandbox():
         assert kwargs['json']['order']['purchaseNumber'] == 'PN-1'
         assert kwargs['json']['order']['amount'] == 50.0
         assert kwargs['json']['order']['currency'] == 'PEN'
+        assert kwargs['json']['dataMap']['clientIp'] == '127.0.0.1'
         assert result == response_payload
+
+
+def test_authorize_transaction_with_custom_ip():
+    with patch('indico_payment_niubiz.util.requests.post') as post:
+        post.return_value.json.return_value = {'data': {}}
+        post.return_value.raise_for_status.return_value = None
+
+        authorize_transaction('MERCHANT', 'tx-token', 'PN-1', 50, 'PEN', 'token', 'sandbox',
+                              client_ip='10.0.0.1')
+
+        kwargs = post.call_args[1]
+        assert kwargs['json']['dataMap']['clientIp'] == '10.0.0.1'

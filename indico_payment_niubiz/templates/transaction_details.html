@@ -1,19 +1,51 @@
 {% extends 'events/payment/transaction_details.html' %}
-{% from 'message_box.html' import message_box %}
+
+{% macro niubiz_detail_rows(transaction_id_value, amount_value, currency_value, status_text, masked_card_value, action_code_value) %}
+    <dt>{% trans %}Transaction number{% endtrans %}</dt>
+    <dd>{{ transaction_id_value or '-' }}</dd>
+    <dt>{% trans %}Amount{% endtrans %}</dt>
+    <dd>{{ format_currency(amount_value, currency_value, locale=session.lang) }}</dd>
+    <dt>{% trans %}Currency{% endtrans %}</dt>
+    <dd>{{ currency_value }}</dd>
+    <dt>{% trans %}Status{% endtrans %}</dt>
+    <dd>
+        {{ status_text }}
+        {% if action_code_value %}
+            <span class="text-muted">({% trans code=action_code_value %}code {{ code }}{% endtrans %})</span>
+        {% endif %}
+    </dd>
+    <dt>{% trans %}Masked card{% endtrans %}</dt>
+    <dd>{{ masked_card_value or '-' }}</dd>
+{% endmacro %}
 
 {% block details %}
-    <dt>{% trans %}Transaction number{% endtrans %}</dt>
-    <dd>{{ transaction.data.operationNumber }}</dd>
-    <dt>{% trans %}Order ID{% endtrans %}</dt>
-    <dd>{{ transaction.data.orderId }}</dd>
+    {% set txn = transaction if transaction is defined else none %}
+    {% set payload = authorization if authorization is defined else (txn.data if txn else {}) %}
+    {% set amount_value = amount if amount is defined else (txn.amount if txn else 0) %}
+    {% set currency_value = currency if currency is defined else (txn.currency if txn else 'PEN') %}
+    {% set transaction_id_value = transaction_id or payload.get('TRANSACTION_ID') or payload.get('operationNumber') %}
+    {% set masked_card_value = masked_card or payload.get('CARD') or payload.get('cardNumber') %}
+    {% set action_code_value = action_code or payload.get('ACTION_CODE') %}
+    {% set success_value = success if success is defined else (action_code_value == '000') %}
+    {% set status_text = success_value and _('Successful') or _('Declined') %}
+    {{ niubiz_detail_rows(transaction_id_value, amount_value, currency_value, status_text, masked_card_value, action_code_value) }}
 {% endblock %}
 
-{% block warning_box %}
-    {% if transaction.amount != transaction.registration.price %}
-        {% call message_box('warning') %}
-            <p>{% trans %}The paid amount does not match the required amount. Please contact the registrant to solve the issue.{% endtrans %}</p>
-            <p>{% trans %}Paid: {% endtrans %}{{ format_currency(transaction.amount, transaction.currency, locale=session.lang) }}</p>
-            <p>{% trans %}Required: {% endtrans %}{{ transaction.registration.render_price() }}</p>
-        {% endcall %}
+{% block warning_box %}{% endblock %}
+
+{% block content %}
+    {% if standalone %}
+        <div class="i-box">
+            <div class="i-box-header">
+                <h3 class="i-box-title">{% trans %}Niubiz transaction{% endtrans %}</h3>
+            </div>
+            <div class="i-box-content">
+                <dl class="i-data-list">
+                    {{ self.details() }}
+                </dl>
+            </div>
+        </div>
+    {% else %}
+        {{ super() }}
     {% endif %}
 {% endblock %}

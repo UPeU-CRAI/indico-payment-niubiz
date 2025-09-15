@@ -1,53 +1,46 @@
-{% set niubiz_session_key = sessionKey or session_token %}
+{% set has_session = sessionKey %}
 
-{% if authorization %}
-    <h3>{% trans %}Niubiz payment details{% endtrans %}</h3>
-    <dl class="i-data-list">
-        <dt>{% trans %}Status{% endtrans %}</dt>
-        <dd>
-            {% if success %}
-                {% trans %}Authorized{% endtrans %}
-            {% else %}
-                {% trans %}Declined{% endtrans %}
-            {% endif %}
-            {% if action_code %}
-                <span class="text-muted">(CODE {{ action_code }})</span>
-            {% endif %}
-        </dd>
-        <dt>{% trans %}Transaction ID{% endtrans %}</dt>
-        <dd>{{ transaction_id or authorization.get('TRANSACTION_ID') }}</dd>
-        <dt>{% trans %}Purchase number{% endtrans %}</dt>
-        <dd>{{ purchase_number }}</dd>
-        <dt>{% trans %}Amount{% endtrans %}</dt>
-        <dd>{{ format_currency(amount, currency or 'PEN', locale=session.lang) }}</dd>
-        <dt>{% trans %}Card{% endtrans %}</dt>
-        <dd>{{ masked_card or authorization.get('CARD') }}</dd>
-    </dl>
-{% else %}
-    <p>{% trans %}Click the button below to pay with Niubiz.{% endtrans %}</p>
-    <form action="{{ url_for('payment_niubiz.start', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id) }}"
-          method="post">
+<div class="i-box">
+  <div class="i-box-content">
+    {% if not has_session %}
+      <p>
+        {% trans %}Click the button below to start the Niubiz checkout process.{% endtrans %}
+      </p>
+      <form action="{{ url_for('payment_niubiz.start', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id) }}"
+            method="post">
         <button type="submit" class="btn btn-primary">
-            {% trans %}Pay with Niubiz{% endtrans %}
+          {% trans %}Pay with Niubiz{% endtrans %}
         </button>
-    </form>
+      </form>
+    {% else %}
+      <p>
+        {% trans amount=format_currency(amount, currency or 'PEN', locale=session.lang) %}You are about to pay {{ amount }} using Niubiz.{% endtrans %}
+      </p>
+      <div class="d-flex flex-column flex-sm-row gap-2">
+        <button type="button" class="btn btn-primary" onclick="launchNiubizCheckout()">
+          {% trans %}Pay with Niubiz{% endtrans %}
+        </button>
+        <a class="btn btn-secondary" href="{{ cancel_url or url_for('payment_niubiz.cancel', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id) }}">
+          {% trans %}Cancel payment{% endtrans %}
+        </a>
+      </div>
 
-    {% if niubiz_session_key %}
-        <script src="https://static-content-qas.vnforapps.com/v2/js/checkout.js"></script>
-        <script>
-          function launchNiubizCheckout() {
-            VisanetCheckout.configure({
-              sessionkey: "{{ niubiz_session_key }}",
-              channel: "web",
-              merchantid: "{{ merchant_id }}",
-              purchasenumber: "{{ purchase_number }}",
-              amount: "{{ amount }}",
-              callbackurl: "{{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True) }}"
-            });
-            VisanetCheckout.open();
-          }
-
-          document.addEventListener('DOMContentLoaded', launchNiubizCheckout);
-        </script>
+      <script src="{{ checkout_js_url or 'https://static-content-qas.vnforapps.com/v2/js/checkout.js' }}"></script>
+      {% set checkout_amount = amount_value if amount_value is defined else amount %}
+      <script>
+        function launchNiubizCheckout() {
+          VisanetCheckout.configure({
+            sessionkey: "{{ sessionKey }}",
+            channel: "web",
+            merchantid: "{{ merchant_id }}",
+            purchasenumber: "{{ purchase_number }}",
+            amount: "{{ '%.2f' % checkout_amount }}",
+            callbackurl: "{{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True) }}"
+          });
+          VisanetCheckout.open();
+        }
+        document.addEventListener('DOMContentLoaded', launchNiubizCheckout);
+      </script>
     {% endif %}
-{% endif %}
+  </div>
+</div>
