@@ -1,15 +1,12 @@
-import requests
-from flask import request
 from wtforms.fields import StringField, URLField
 from wtforms.validators import DataRequired
 
-from indico.core.plugins import IndicoPlugin, url_for_plugin
+from indico.core.plugins import IndicoPlugin
 from indico.modules.events.payment import (PaymentEventSettingsFormBase, PaymentPluginMixin,
                                            PaymentPluginSettingsFormBase)
 
 from indico_payment_niubiz import _
 from indico_payment_niubiz.blueprint import blueprint
-from indico_payment_niubiz.util import get_security_token, create_session_token
 
 
 class PluginSettingsForm(PaymentPluginSettingsFormBase):
@@ -58,24 +55,9 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         currency = registration.currency
         purchase_number = f"{registration.event_id}-{registration.id}"
 
-        security_token = get_security_token(self.settings.get('security_url'),
-                                            self.settings.get('api_username'),
-                                            self.settings.get('api_password'))
-        payload = {
-            'channel': 'web',
-            'amount': amount,
-            'antifraud': {'clientIp': request.remote_addr, 'merchantDefineData': {}},
-            'dataMap': {},
-        }
-        session_token = create_session_token(self.settings.get('session_url'), security_token, payload)
-
         data.update({
-            'session_token': session_token,
             'merchant_id': self.event_settings.get(event, 'merchant_id'),
             'amount': amount,
             'currency': currency,
             'purchase_number': purchase_number,
-            'return_url': url_for_plugin('payment_niubiz.success', registration.locator.uuid, _external=True),
-            'cancel_url': url_for_plugin('payment_niubiz.cancel', registration.locator.uuid, _external=True),
-            'notify_url': url_for_plugin('payment_niubiz.notify', registration.locator.uuid, _external=True),
         })

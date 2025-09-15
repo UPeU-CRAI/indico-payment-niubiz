@@ -1,24 +1,53 @@
-Clicking on the <strong>Pay now</strong> button you will be redirected to the Niubiz checkout to complete your transaction.
+{% set niubiz_session_key = sessionKey or session_token %}
 
-<dl class="i-data-list">
-    <dt>{% trans %}First name{% endtrans %}</dt>
-    <dd>{{ registration.first_name }}</dd>
-    <dt>{% trans %}Last name{% endtrans %}</dt>
-    <dd>{{ registration.last_name }}</dd>
-    <dt>{% trans %}Total amount{% endtrans %}</dt>
-    <dd>{{ format_currency(amount, currency, locale=session.lang) }}</dd>
-    <dt></dt>
-    <dd>
-        <form id="niubiz-payment" action="{{ return_url }}" method="POST"></form>
-        <script src="https://static-content-qas.vnforapps.com/v2/js/checkout.js"
-                data-sessiontoken="{{ session_token }}"
-                data-channel="web"
-                data-merchantid="{{ merchant_id }}"
-                data-purchasenumber="{{ purchase_number }}"
-                data-amount="{{ amount }}"
-                data-action="{{ return_url }}"
-                data-timeouturl="{{ cancel_url }}"
-                data-merchantlogo="{{ plugin.logo_url }}">
+{% if authorization %}
+    <h3>{% trans %}Niubiz payment details{% endtrans %}</h3>
+    <dl class="i-data-list">
+        <dt>{% trans %}Status{% endtrans %}</dt>
+        <dd>
+            {% if success %}
+                {% trans %}Authorized{% endtrans %}
+            {% else %}
+                {% trans %}Declined{% endtrans %}
+            {% endif %}
+            {% if action_code %}
+                <span class="text-muted">(CODE {{ action_code }})</span>
+            {% endif %}
+        </dd>
+        <dt>{% trans %}Transaction ID{% endtrans %}</dt>
+        <dd>{{ transaction_id or authorization.get('TRANSACTION_ID') }}</dd>
+        <dt>{% trans %}Purchase number{% endtrans %}</dt>
+        <dd>{{ purchase_number }}</dd>
+        <dt>{% trans %}Amount{% endtrans %}</dt>
+        <dd>{{ format_currency(amount, currency or 'PEN', locale=session.lang) }}</dd>
+        <dt>{% trans %}Card{% endtrans %}</dt>
+        <dd>{{ masked_card or authorization.get('CARD') }}</dd>
+    </dl>
+{% else %}
+    <p>{% trans %}Click the button below to pay with Niubiz.{% endtrans %}</p>
+    <form action="{{ url_for('payment_niubiz.start', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id) }}"
+          method="post">
+        <button type="submit" class="btn btn-primary">
+            {% trans %}Pay with Niubiz{% endtrans %}
+        </button>
+    </form>
+
+    {% if niubiz_session_key %}
+        <script src="https://static-content-qas.vnforapps.com/v2/js/checkout.js"></script>
+        <script>
+          function launchNiubizCheckout() {
+            VisanetCheckout.configure({
+              sessionkey: "{{ niubiz_session_key }}",
+              channel: "web",
+              merchantid: "{{ merchant_id }}",
+              purchasenumber: "{{ purchase_number }}",
+              amount: "{{ amount }}",
+              callbackurl: "{{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True) }}"
+            });
+            VisanetCheckout.open();
+          }
+
+          document.addEventListener('DOMContentLoaded', launchNiubizCheckout);
         </script>
-    </dd>
-</dl>
+    {% endif %}
+{% endif %}
