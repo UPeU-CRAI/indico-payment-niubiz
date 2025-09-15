@@ -1,8 +1,8 @@
 [project]
-name = 'indico-plugin-payment-paypal'
-description = 'PayPal payments for Indico event registration fees'
+name = 'indico-plugin-payment-niubiz'
+description = 'Niubiz payments for Indico event registration fees'
 readme = 'README.md'
-version = '3.3.2'
+version = '0.1.0'
 license = 'MIT'
 authors = [{ name = 'Indico Team', email = 'indico-team@cern.ch' }]
 classifiers = [
@@ -18,14 +18,14 @@ dependencies = ['indico>=3.3']
 GitHub = 'https://github.com/indico/indico-plugins'
 
 [project.entry-points.'indico.plugins']
-payment_paypal = 'indico_payment_paypal.plugin:PaypalPaymentPlugin'
+payment_niubiz = 'indico_payment_niubiz.plugin:NiubizPaymentPlugin'
 
 [build-system]
 requires = ['hatchling==1.27.0']
 build-backend = 'hatchling.build'
 
 [tool.hatch.build]
-packages = ['indico_payment_paypal']
+packages = ['indico_payment_niubiz']
 exclude = [
     '*.no-header',
     '.keep',
