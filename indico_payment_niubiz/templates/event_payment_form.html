@@ -1,0 +1,24 @@
+Clicking on the <strong>Pay now</strong> button you will be redirected to the Niubiz checkout to complete your transaction.
+
+<dl class="i-data-list">
+    <dt>{% trans %}First name{% endtrans %}</dt>
+    <dd>{{ registration.first_name }}</dd>
+    <dt>{% trans %}Last name{% endtrans %}</dt>
+    <dd>{{ registration.last_name }}</dd>
+    <dt>{% trans %}Total amount{% endtrans %}</dt>
+    <dd>{{ format_currency(amount, currency, locale=session.lang) }}</dd>
+    <dt></dt>
+    <dd>
+        <form id="niubiz-payment" action="{{ return_url }}" method="POST"></form>
+        <script src="https://static-content-qas.vnforapps.com/v2/js/checkout.js"
+                data-sessiontoken="{{ session_token }}"
+                data-channel="web"
+                data-merchantid="{{ merchant_id }}"
+                data-purchasenumber="{{ purchase_number }}"
+                data-amount="{{ amount }}"
+                data-action="{{ return_url }}"
+                data-timeouturl="{{ cancel_url }}"
+                data-merchantlogo="{{ plugin.logo_url }}">
+        </script>
+    </dd>
+</dl>

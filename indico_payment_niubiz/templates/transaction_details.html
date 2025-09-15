@@ -1,0 +1,19 @@
+{% extends 'events/payment/transaction_details.html' %}
+{% from 'message_box.html' import message_box %}
+
+{% block details %}
+    <dt>{% trans %}Transaction number{% endtrans %}</dt>
+    <dd>{{ transaction.data.operationNumber }}</dd>
+    <dt>{% trans %}Order ID{% endtrans %}</dt>
+    <dd>{{ transaction.data.orderId }}</dd>
+{% endblock %}
+
+{% block warning_box %}
+    {% if transaction.amount != transaction.registration.price %}
+        {% call message_box('warning') %}
+            <p>{% trans %}The paid amount does not match the required amount. Please contact the registrant to solve the issue.{% endtrans %}</p>
+            <p>{% trans %}Paid: {% endtrans %}{{ format_currency(transaction.amount, transaction.currency, locale=session.lang) }}</p>
+            <p>{% trans %}Required: {% endtrans %}{{ transaction.registration.render_price() }}</p>
+        {% endcall %}
+    {% endif %}
+{% endblock %}
