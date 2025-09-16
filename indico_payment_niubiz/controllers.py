@@ -1,4 +1,6 @@
+import json
 import logging
+from typing import Any, Dict
 
 from flask import flash, redirect, render_template, request
 from flask_pluginengine import current_plugin
@@ -12,16 +14,29 @@ from indico.web.flask.util import url_for
 from indico.web.rh import RH
 
 from indico_payment_niubiz import _
-from indico_payment_niubiz.util import authorize_transaction, create_session_token, get_security_token
+from indico_payment_niubiz.util import (authorize_transaction, create_session_token,
+                                        get_checkout_script_url, get_security_token)
 
 CANCEL_ACTION = getattr(TransactionAction, 'cancel', TransactionAction.reject)
 SUCCESS_ACTION_CODE = '000'
+AUTHORIZED_STATUS_VALUES = {
+    'authorized', 'authorised', 'autorizado', 'autorizada', 'approved', 'completed', 'complete', 'success', 'successful'
+}
+CANCELLED_STATUS_VALUES = {'cancelled', 'canceled', 'cancelado', 'cancelada'}
+EXPIRED_STATUS_VALUES = {'expired', 'expirada', 'expirado'}
 
 logger = logging.getLogger(__name__)
 
 
 class RHNiubizBase(RH):
     CSRF_ENABLED = False
+
+    @staticmethod
+    def _normalize_optional(value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
 
     def _process_args(self):
         self.event_id = request.view_args['event_id']
@@ -54,6 +69,12 @@ class RHNiubizBase(RH):
         endpoint = (endpoint or '').lower()
         return 'sandbox' if endpoint == 'sandbox' else 'prod'
 
+    def _get_scoped_setting(self, name):
+        event_value = self._normalize_optional(current_plugin.event_settings.get(self.event, name))
+        if event_value is not None:
+            return event_value
+        return self._normalize_optional(current_plugin.settings.get(name))
+
     def _get_credentials(self):
         access_key = (current_plugin.event_settings.get(self.event, 'access_key') or
                       current_plugin.settings.get('access_key'))
@@ -80,13 +101,99 @@ class RHNiubizBase(RH):
         return f'{self.registration.event_id}-{self.registration.id}'
 
     def _get_client_ip(self):
+        forwarded = request.headers.get('X-Forwarded-For', '')
+        if forwarded:
+            return forwarded.split(',')[0].strip() or (request.remote_addr or '127.0.0.1')
         return request.remote_addr or '127.0.0.1'
+
+    def _get_client_id(self):
+        email = getattr(self.registration, 'email', None)
+        if email:
+            return str(email)
+        return f'indico-registration-{self.registration.id}'
+
+    def _get_customer_email(self):
+        email = getattr(self.registration, 'email', None)
+        if email:
+            return str(email)
+        user = getattr(self.registration, 'user', None)
+        if user is not None:
+            user_email = getattr(user, 'email', None)
+            if user_email:
+                return str(user_email)
+        return None
+
+    def _get_mdd_context(self) -> Dict[str, Any]:
+        registration = self.registration
+        context: Dict[str, Any] = {
+            'registration_id': getattr(registration, 'id', ''),
+            'registration_uuid': getattr(registration, 'uuid', ''),
+            'event_id': getattr(self.event, 'id', ''),
+            'amount': self._get_amount(),
+            'currency': self._get_currency(),
+        }
+
+        for attr, key in (
+            ('email', 'registration_email'),
+            ('phone', 'registration_phone'),
+            ('company', 'registration_company'),
+            ('full_name', 'registration_name'),
+        ):
+            value = getattr(registration, attr, None)
+            if value:
+                context[key] = value
+
+        return context
+
+    def _load_merchant_defined_data(self, raw_value):
+        if not raw_value:
+            return {}
+        try:
+            parsed = json.loads(raw_value)
+        except (TypeError, ValueError):
+            logger.warning('Invalid Niubiz merchant defined data configuration. Value=%s', raw_value)
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning('Niubiz merchant defined data configuration must be a JSON object. Value=%s', raw_value)
+            return {}
+
+        context = self._get_mdd_context()
+
+        class _SafeDict(dict):
+            def __missing__(self, key):
+                return ''
+
+        result = {}
+        for key, value in parsed.items():
+            if value in (None, ''):
+                continue
+            key_str = str(key)
+            try:
+                formatted = str(value).format_map(_SafeDict(context))
+            except Exception:  # pragma: no cover - defensive formatting guard
+                logger.warning('Could not format Niubiz MDD value for key %s', key_str, exc_info=True)
+                formatted = str(value)
+            formatted = formatted.strip()
+            if formatted:
+                result[key_str] = formatted
+
+        return result
+
+    def _get_merchant_defined_data(self):
+        raw_value = self._get_scoped_setting('merchant_defined_data')
+        return self._load_merchant_defined_data(raw_value)
+
+    def _get_checkout_button_color(self):
+        value = self._get_scoped_setting('button_color')
+        return value
+
+    def _get_merchant_logo_url(self):
+        value = self._get_scoped_setting('merchant_logo_url')
+        return value
 
     def _get_checkout_script(self):
         endpoint = self._get_endpoint()
-        return ('https://static-content-qas.vnforapps.com/v2/js/checkout.js'
-                if endpoint == 'sandbox'
-                else 'https://static-content.vnforapps.com/v2/js/checkout.js')
+        return get_checkout_script_url(endpoint)
 
 
 def _apply_registration_status(*, registration, paid=None, cancelled=False, expired=False):
@@ -166,7 +273,7 @@ class RHNiubizCallback(RH):
 
         status_value = (payload.get('statusOrder') or '').upper()
         if registration and status_value:
-            if status_value == 'COMPLETED':
+            if status_value in {'COMPLETED', 'AUTHORIZED', 'APPROVED', 'SUCCESS'}:
                 logger.info('Marking registration %s as paid from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, paid=True)
             elif status_value == 'EXPIRED':
@@ -175,6 +282,9 @@ class RHNiubizCallback(RH):
             elif status_value in {'CANCELLED', 'CANCELED'}:
                 logger.info('Marking registration %s as cancelled from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, cancelled=True)
+            elif status_value in {'DENIED', 'REJECTED'}:
+                logger.info('Marking registration %s as rejected from Niubiz notification.', registration.id)
+                _apply_registration_status(registration=registration, paid=False)
             else:
                 logger.info('Unhandled Niubiz notification status %s for registration %s.',
                             status_value, registration.id)
@@ -224,6 +334,7 @@ class RHNiubizSuccess(RHNiubizBase):
             access_token,
             endpoint,
             client_ip=self._get_client_ip(),
+            client_id=self._get_client_id(),
             token_refresher=refresh_token,
         )
 
@@ -245,14 +356,15 @@ class RHNiubizSuccess(RHNiubizBase):
 
         action_code = (auth_data.get('ACTION_CODE') or auth_data.get('actionCode') or
                        payload.get('ACTION_CODE') or payload.get('actionCode'))
-        action_code = action_code or ''
-        action_code = str(action_code)
-        success = action_code == SUCCESS_ACTION_CODE
-        status_token = (auth_data.get('STATUS') or auth_data.get('status') or '').lower()
-
-        status_token = (auth_data.get('STATUS') or auth_data.get('status') or '').lower()
-        cancelled = status_token in {'cancelled', 'canceled'}
-        expired = status_token in {'expired', 'expirada'}
+        action_code = str(action_code or '').strip()
+        status_token_raw = (auth_data.get('STATUS') or auth_data.get('status') or
+                             payload.get('STATUS') or payload.get('status') or '')
+        status_token = str(status_token_raw).strip().lower()
+        success = (action_code == SUCCESS_ACTION_CODE or status_token in AUTHORIZED_STATUS_VALUES)
+        cancelled = status_token in CANCELLED_STATUS_VALUES
+        expired = status_token in EXPIRED_STATUS_VALUES
+        if cancelled or expired:
+            success = False
         action = (TransactionAction.complete if success else
                   (CANCEL_ACTION if cancelled else TransactionAction.reject))
 
@@ -306,7 +418,7 @@ class RHNiubizSuccess(RHNiubizBase):
         elif expired:
             status_label = _('Expirado')
         elif success:
-            status_label = _('Éxito')
+            status_label = _('Autorizado')
         else:
             status_label = _('Rechazado')
 
@@ -320,6 +432,7 @@ class RHNiubizSuccess(RHNiubizBase):
             'authorization': auth_data,
             'raw_authorization': payload,
             'action_code': action_code or None,
+            'status_token': status_token_raw,
             'authorization_code': authorization_code,
             'transaction_id': transaction_id,
             'transaction_date': transaction_date,
@@ -361,6 +474,9 @@ class RHNiubizStart(RHNiubizBase):
         access_token = token_result['token']
 
         session_key = None
+        session_expiration = None
+        merchant_defined_data = self._get_merchant_defined_data()
+        client_id = self._get_client_id()
 
         def refresh_token():
             logger.info('Refreshing Niubiz security token while starting checkout session.')
@@ -373,7 +489,10 @@ class RHNiubizStart(RHNiubizBase):
             access_token,
             endpoint,
             client_ip=self._get_client_ip(),
-            client_id=f'indico-registration-{self.registration.id}',
+            client_id=client_id,
+            purchase_number=self._get_purchase_number(),
+            merchant_defined_data=merchant_defined_data,
+            customer_email=self._get_customer_email(),
             token_refresher=refresh_token,
         )
 
@@ -383,6 +502,7 @@ class RHNiubizStart(RHNiubizBase):
             return redirect(redirect_url)
 
         session_key = session_result['session_key']
+        session_expiration = session_result.get('expiration_time')
 
         if session_key is None:
             flash(_('The Niubiz checkout could not be started. Please try again.'), 'error')
@@ -398,6 +518,9 @@ class RHNiubizStart(RHNiubizBase):
             'purchase_number': self._get_purchase_number(),
             'sessionKey': session_key,
             'checkout_js_url': self._get_checkout_script(),
+            'merchant_logo_url': self._get_merchant_logo_url(),
+            'checkout_button_color': self._get_checkout_button_color(),
+            'session_expiration': session_expiration,
             'cancel_url': url_for('payment_niubiz.cancel',
                                   event_id=self.event.id,
                                   reg_form_id=self.registration.registration_form.id,

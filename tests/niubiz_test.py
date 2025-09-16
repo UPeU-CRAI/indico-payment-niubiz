@@ -44,12 +44,12 @@ def _make_registration():
 def test_get_security_token_returns_token():
     response = _build_response(text='  my-token  ')
 
-    with patch('indico_payment_niubiz.util.requests.post', return_value=response) as mock_post:
+    with patch('indico_payment_niubiz.util.requests.request', return_value=response) as mock_request:
         result = get_security_token('access', 'secret', 'sandbox')
 
     assert result['success'] is True
     assert result['token'] == 'my-token'
-    mock_post.assert_called_once()
+    mock_request.assert_called_once()
     response.raise_for_status.assert_called_once()
 
 
@@ -103,7 +103,7 @@ def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
     registration.update_state.assert_not_called()
     assert flashes == [('success', 'Tu pago fue autorizado correctamente.')]
     assert rendered['template'] == 'payment_niubiz/transaction_details.html'
-    assert result['status_label'] == 'Éxito'
+    assert result['status_label'] == 'Autorizado'
 
 
 def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypatch):
@@ -187,7 +187,7 @@ def test_session_token_refreshes_on_token_expiration(monkeypatch):
     success_response = _build_response(json_payload={'sessionKey': 'SESSION123'})
 
     post_mock = Mock(side_effect=[expired_response, success_response])
-    monkeypatch.setattr('indico_payment_niubiz.util.requests.post', post_mock)
+    monkeypatch.setattr('indico_payment_niubiz.util.requests.request', post_mock)
 
     refreshed_tokens = []
 

@@ -14,10 +14,14 @@
     {% set purchase_number_value = purchase_number or raw_payload.get('purchaseNumber') or payload.get('purchaseNumber') or (raw_payload.get('order') or {}).get('purchaseNumber') %}
     {% set action_code_value = action_code or payload.get('ACTION_CODE') or payload.get('actionCode') %}
     {% set success_value = success if success is defined else (action_code_value == '000') %}
-    {% set status_token = status_label if status_label is defined else (payload.get('STATUS') or payload.get('status')) %}
+    {% if status_token is defined and status_token %}
+        {% set status_token_value = status_token %}
+    {% else %}
+        {% set status_token_value = status_label if status_label is defined else (payload.get('STATUS') or payload.get('status')) %}
+    {% endif %}
     {% if status_label is defined %}
         {% set status_text = status_label %}
-    {% elif status_token and status_token.lower() in ('cancelled', 'canceled') %}
+    {% elif status_token_value and status_token_value.lower() in ('cancelled', 'canceled') %}
         {% set status_text = _('Cancelled') %}
     {% else %}
         {% set status_text = success_value and _('Successful') or _('Declined') %}
@@ -49,21 +53,21 @@
     {% set base_status_text = _('Rechazado') %}
     {% if status_label is defined and status_label %}
         {% set status_text = status_label %}
-    {% elif status_token %}
-        {% set status_lower = status_token.lower() %}
+    {% elif status_token_value %}
+        {% set status_lower = status_token_value.lower() %}
         {% if status_lower in ('cancelled', 'canceled') %}
             {% set status_text = _('Cancelado') %}
         {% elif status_lower in ('expired', 'expirada') %}
             {% set status_text = _('Expirado') %}
-        {% elif status_lower in ('completed', 'complete', 'success', 'successful') %}
-            {% set status_text = _('Éxito') %}
+        {% elif status_lower in ('completed', 'complete', 'success', 'successful', 'authorized', 'authorised', 'autorizado', 'autorizada', 'approved') %}
+            {% set status_text = _('Autorizado') %}
         {% elif status_lower in ('rejected', 'rechazado', 'denied') %}
             {% set status_text = _('Rechazado') %}
         {% else %}
             {% set status_text = base_status_text %}
         {% endif %}
     {% elif success_value %}
-        {% set status_text = _('Éxito') %}
+        {% set status_text = _('Autorizado') %}
     {% else %}
         {% set status_text = base_status_text %}
     {% endif %}

@@ -1,4 +1,4 @@
-from wtforms.fields import SelectField, StringField
+from wtforms.fields import SelectField, StringField, TextAreaField
 from wtforms.validators import DataRequired, Optional
 
 from indico.core.plugins import IndicoPlugin
@@ -18,6 +18,21 @@ class PluginSettingsForm(PaymentPluginSettingsFormBase):
                                      description=_('Access key provided by Niubiz.'))
     secret_key = IndicoPasswordField(_('Secret key'), [DataRequired()],
                                      description=_('Secret key provided by Niubiz.'))
+    merchant_logo_url = StringField(
+        _('Merchant logo URL'),
+        [Optional()],
+        description=_('HTTPS URL of the logo that Niubiz should display in the checkout form.'),
+    )
+    button_color = StringField(
+        _('Checkout button color'),
+        [Optional()],
+        description=_('Hexadecimal color (e.g. #1a6ec2) used to customise the Niubiz checkout button.'),
+    )
+    merchant_defined_data = TextAreaField(
+        _('Merchant Define Data (MDD)'),
+        [Optional()],
+        description=_('JSON map with the antifraud fields (MDDs) provided by Niubiz.'),
+    )
     endpoint = SelectField(
         _('Environment'),
         [DataRequired()],
@@ -36,6 +51,21 @@ class EventSettingsForm(PaymentEventSettingsFormBase):
                                      description=_('Override the default access key for this event.'))
     secret_key = IndicoPasswordField(_('Secret key override'), [Optional()],
                                      description=_('Override the default secret key for this event.'))
+    merchant_logo_url = StringField(
+        _('Merchant logo URL override'),
+        [Optional()],
+        description=_('Override the default logo used in the Niubiz checkout form.'),
+    )
+    button_color = StringField(
+        _('Checkout button color override'),
+        [Optional()],
+        description=_('Override the Niubiz checkout button color.'),
+    )
+    merchant_defined_data = TextAreaField(
+        _('Merchant Define Data override'),
+        [Optional()],
+        description=_('Override the JSON map of Niubiz MDD antifraud fields for this event.'),
+    )
     endpoint = SelectField(
         _('Environment override'),
         [Optional()],
@@ -63,6 +93,9 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         'merchant_id': '',
         'access_key': '',
         'secret_key': '',
+        'merchant_logo_url': '',
+        'button_color': '',
+        'merchant_defined_data': '',
         'endpoint': 'sandbox',
     }
     default_event_settings = {
@@ -71,6 +104,9 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         'merchant_id': None,
         'access_key': None,
         'secret_key': None,
+        'merchant_logo_url': None,
+        'button_color': None,
+        'merchant_defined_data': None,
         'endpoint': None,
     }
 
@@ -85,12 +121,18 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         purchase_number = f"{registration.event_id}-{registration.id}"
         merchant_id = (self.event_settings.get(event, 'merchant_id') or
                        self.settings.get('merchant_id'))
+        merchant_logo = (self.event_settings.get(event, 'merchant_logo_url') or
+                         self.settings.get('merchant_logo_url'))
+        button_color = (self.event_settings.get(event, 'button_color') or
+                        self.settings.get('button_color'))
 
         data.update({
             'merchant_id': merchant_id,
             'amount': amount,
             'currency': currency,
             'purchase_number': purchase_number,
+            'merchant_logo_url': merchant_logo,
+            'checkout_button_color': button_color,
             'start_url': url_for('payment_niubiz.start', event_id=event.id,
                                  reg_form_id=registration.registration_form.id, reg_id=registration.id),
             'cancel_url': url_for('payment_niubiz.cancel', event_id=event.id,

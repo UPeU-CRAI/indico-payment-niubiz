@@ -16,6 +16,11 @@
       <p>
         {% trans amount=format_currency(amount, currency or 'PEN', locale=session.lang) %}Estás a punto de pagar {{ amount }} con Niubiz.{% endtrans %}
       </p>
+      {% if session_expiration %}
+        <p class="text-muted small">
+          {% trans expiration=session_expiration %}La sesión de pago expira el {{ expiration }}.{% endtrans %}
+        </p>
+      {% endif %}
       <div class="d-flex flex-column flex-sm-row gap-2">
         <button type="button" class="btn btn-primary" onclick="launchNiubizCheckout()">
           {% trans %}Pay with Niubiz{% endtrans %}
@@ -26,18 +31,24 @@
       </div>
       <div id="niubiz-error" class="alert alert-danger d-none mt-3" role="alert"></div>
 
-      <script src="{{ checkout_js_url or 'https://static-content-qas.vnforapps.com/v2/js/checkout.js' }}"></script>
+      <script src="{{ checkout_js_url or 'https://static-content-qas.vnforapps.com/env/sandbox/js/checkout.js' }}"></script>
       {% set checkout_amount = amount_value if amount_value is defined else amount %}
       <script>
         (function() {
           const checkoutConfig = {
-            sessionkey: "{{ sessionKey }}",
+            sessionkey: {{ sessionKey|tojson }},
             channel: "web",
-            merchantid: "{{ merchant_id }}",
-            purchasenumber: "{{ purchase_number }}",
-            amount: "{{ '%.2f' % checkout_amount }}",
-            callbackurl: "{{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True) }}"
+            merchantid: {{ merchant_id|tojson }},
+            purchasenumber: {{ purchase_number|tojson }},
+            amount: {{ ('%.2f' % checkout_amount)|tojson }},
+            callbackurl: {{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True)|tojson }}
           };
+          {% if merchant_logo_url %}
+          checkoutConfig.merchantlogo = {{ merchant_logo_url|tojson }};
+          {% endif %}
+          {% if checkout_button_color %}
+          checkoutConfig.formbuttoncolor = {{ checkout_button_color|tojson }};
+          {% endif %}
           const errorBox = document.getElementById('niubiz-error');
 
           function showCheckoutError(message) {
