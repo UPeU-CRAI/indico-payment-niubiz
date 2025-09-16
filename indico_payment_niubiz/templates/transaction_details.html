@@ -43,6 +43,8 @@
     <dd>{{ authorization_code_value or '-' }}</dd>
     <dt>{% trans %}Tarjeta enmascarada{% endtrans %}</dt>
     <dd>{{ masked_card_value or '-' }}</dd>
+    <dt>{% trans %}Marca de la tarjeta{% endtrans %}</dt>
+    <dd>{{ card_brand or (payload.get('BRAND') or payload.get('brand') or '-') }}</dd>
     <dt>{% trans %}Fecha y hora{% endtrans %}</dt>
     <dd>{{ transaction_date_value or '-' }}</dd>
     <dt>{% trans %}Monto y moneda{% endtrans %}</dt>
@@ -59,7 +61,7 @@
             {% set status_text = _('Cancelado') %}
         {% elif status_lower in ('expired', 'expirada') %}
             {% set status_text = _('Expirado') %}
-        {% elif status_lower in ('completed', 'complete', 'success', 'successful', 'authorized', 'authorised', 'autorizado', 'autorizada', 'approved') %}
+        {% elif status_lower in ('completed', 'complete', 'success', 'successful', 'authorized', 'authorised', 'autorizado', 'autorizada', 'approved', 'paid') %}
             {% set status_text = _('Autorizado') %}
         {% elif status_lower in ('rejected', 'rechazado', 'denied') %}
             {% set status_text = _('Rechazado') %}

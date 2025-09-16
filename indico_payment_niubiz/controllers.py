@@ -15,28 +15,65 @@ from indico.web.rh import RH
 
 from indico_payment_niubiz import _
 from indico_payment_niubiz.util import (authorize_transaction, create_session_token,
-                                        get_checkout_script_url, get_security_token)
+                                        get_checkout_script_url, get_security_token,
+                                        query_order_status_by_external_id, query_order_status_by_order_id,
+                                        query_transaction_status)
 
 CANCEL_ACTION = getattr(TransactionAction, 'cancel', TransactionAction.reject)
 SUCCESS_ACTION_CODE = '000'
 AUTHORIZED_STATUS_VALUES = {
-    'authorized', 'authorised', 'autorizado', 'autorizada', 'approved', 'completed', 'complete', 'success', 'successful'
+    'authorized', 'authorised', 'autorizado', 'autorizada', 'approved', 'completed', 'complete', 'success', 'successful',
+    'paid'
 }
 CANCELLED_STATUS_VALUES = {'cancelled', 'canceled', 'cancelado', 'cancelada'}
 EXPIRED_STATUS_VALUES = {'expired', 'expirada', 'expirado'}
+REJECTED_STATUS_VALUES = {'rejected', 'rechazado', 'rechazada', 'denied', 'not authorized', 'not_authorized',
+                          'notauthorised', 'failed'}
+PENDING_STATUS_VALUES = {'pending', 'pendiente', 'generated', 'generado', 'created', 'in process', 'processing',
+                         'in_progress', 'en proceso'}
 
 logger = logging.getLogger(__name__)
 
 
+def _normalize_optional(value):
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+def _get_scoped_setting(event, name):
+    event_value = _normalize_optional(current_plugin.event_settings.get(event, name))
+    if event_value is not None:
+        return event_value
+    return _normalize_optional(current_plugin.settings.get(name))
+
+
+def get_endpoint_for_event(event):
+    endpoint = (_get_scoped_setting(event, 'endpoint') or 'sandbox').lower()
+    return 'sandbox' if endpoint == 'sandbox' else 'prod'
+
+
+def get_credentials_for_event(event):
+    access_key = (current_plugin.event_settings.get(event, 'access_key') or
+                  current_plugin.settings.get('access_key'))
+    secret_key = (current_plugin.event_settings.get(event, 'secret_key') or
+                  current_plugin.settings.get('secret_key'))
+    if not access_key or not secret_key:
+        raise BadRequest(_('Niubiz credentials are not configured.'))
+    return access_key, secret_key
+
+
+def get_merchant_id_for_event(event):
+    merchant_id = (current_plugin.event_settings.get(event, 'merchant_id') or
+                   current_plugin.settings.get('merchant_id'))
+    if not merchant_id:
+        raise BadRequest(_('The Niubiz merchant ID is not configured.'))
+    return merchant_id
+
+
 class RHNiubizBase(RH):
     CSRF_ENABLED = False
-
-    @staticmethod
-    def _normalize_optional(value):
-        if isinstance(value, str):
-            value = value.strip()
-            return value or None
-        return value
 
     def _process_args(self):
         self.event_id = request.view_args['event_id']
@@ -64,32 +101,16 @@ class RHNiubizBase(RH):
         self.event = registration.event
 
     def _get_endpoint(self):
-        endpoint = (current_plugin.event_settings.get(self.event, 'endpoint') or
-                    current_plugin.settings.get('endpoint') or 'sandbox')
-        endpoint = (endpoint or '').lower()
-        return 'sandbox' if endpoint == 'sandbox' else 'prod'
+        return get_endpoint_for_event(self.event)
 
     def _get_scoped_setting(self, name):
-        event_value = self._normalize_optional(current_plugin.event_settings.get(self.event, name))
-        if event_value is not None:
-            return event_value
-        return self._normalize_optional(current_plugin.settings.get(name))
+        return _get_scoped_setting(self.event, name)
 
     def _get_credentials(self):
-        access_key = (current_plugin.event_settings.get(self.event, 'access_key') or
-                      current_plugin.settings.get('access_key'))
-        secret_key = (current_plugin.event_settings.get(self.event, 'secret_key') or
-                      current_plugin.settings.get('secret_key'))
-        if not access_key or not secret_key:
-            raise BadRequest(_('Niubiz credentials are not configured.'))
-        return access_key, secret_key
+        return get_credentials_for_event(self.event)
 
     def _get_merchant_id(self):
-        merchant_id = (current_plugin.event_settings.get(self.event, 'merchant_id') or
-                       current_plugin.settings.get('merchant_id'))
-        if not merchant_id:
-            raise BadRequest(_('The Niubiz merchant ID is not configured.'))
-        return merchant_id
+        return get_merchant_id_for_event(self.event)
 
     def _get_amount(self):
         return self.registration.price
@@ -233,6 +254,77 @@ def _apply_registration_status(*, registration, paid=None, cancelled=False, expi
         db.session.flush()
 
 
+def _apply_status_from_value(registration, status_value):
+    if not registration or not status_value:
+        return False
+    status = str(status_value).strip().lower()
+    if status in AUTHORIZED_STATUS_VALUES:
+        _apply_registration_status(registration=registration, paid=True)
+        return True
+    if status in CANCELLED_STATUS_VALUES:
+        _apply_registration_status(registration=registration, cancelled=True)
+        return True
+    if status in EXPIRED_STATUS_VALUES:
+        _apply_registration_status(registration=registration, expired=True)
+        return True
+    if status in REJECTED_STATUS_VALUES:
+        _apply_registration_status(registration=registration, paid=False)
+        return True
+    return False
+
+
+def _synchronise_registration_with_query(*, registration, event, order_id=None, external_id=None,
+                                         transaction_id=None):
+    if registration is None or event is None:
+        return None
+
+    try:
+        merchant_id = get_merchant_id_for_event(event)
+        access_key, secret_key = get_credentials_for_event(event)
+    except BadRequest:
+        logger.exception('Missing Niubiz credentials while synchronising registration %s',
+                         getattr(registration, 'id', 'unknown'))
+        return None
+
+    endpoint = get_endpoint_for_event(event)
+    token_result = get_security_token(access_key, secret_key, endpoint)
+    if not token_result.get('success'):
+        logger.warning('Could not obtain Niubiz security token to synchronise registration %s: %s',
+                       getattr(registration, 'id', 'unknown'), token_result.get('error'))
+        return token_result
+
+    access_token = token_result['token']
+
+    def refresh_token():
+        logger.info('Refreshing Niubiz security token while querying order information for registration %s',
+                    getattr(registration, 'id', 'unknown'))
+        return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
+
+    query_result = None
+    if order_id:
+        query_result = query_order_status_by_order_id(merchant_id, str(order_id), access_token, endpoint,
+                                                      token_refresher=refresh_token)
+    elif external_id:
+        query_result = query_order_status_by_external_id(merchant_id, str(external_id), access_token, endpoint,
+                                                         token_refresher=refresh_token)
+
+    if (not query_result or not query_result.get('success')) and transaction_id:
+        query_result = query_transaction_status(merchant_id, str(transaction_id), access_token, endpoint,
+                                                token_refresher=refresh_token)
+
+    if query_result and query_result.get('success'):
+        status_value = query_result.get('status')
+        if status_value:
+            logger.info('Synchronised Niubiz status %s for registration %s', status_value,
+                        getattr(registration, 'id', 'unknown'))
+            _apply_status_from_value(registration, status_value)
+    else:
+        logger.info('Niubiz status query did not succeed for registration %s: %s',
+                    getattr(registration, 'id', 'unknown'), query_result)
+
+    return query_result
+
+
 class RHNiubizCallback(RH):
     CSRF_ENABLED = False
 
@@ -251,6 +343,8 @@ class RHNiubizCallback(RH):
         status_value = (payload.get('statusOrder') or '').upper()
         amount_value = payload.get('amount')
         currency_value = payload.get('currency')
+        transaction_id = (payload.get('transactionId') or order_info.get('transactionId') or
+                          payload.get('operationNumber'))
 
         logger.info('Received Niubiz callback (externalId=%s, orderId=%s, status=%s, amount=%s, currency=%s)',
                     external_id, purchase_number, status_value or 'UNKNOWN', amount_value, currency_value)
@@ -272,29 +366,46 @@ class RHNiubizCallback(RH):
                                     .first())
 
         status_value = (payload.get('statusOrder') or '').upper()
+        status_applied = False
         if registration and status_value:
             if status_value in {'COMPLETED', 'AUTHORIZED', 'APPROVED', 'SUCCESS'}:
                 logger.info('Marking registration %s as paid from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, paid=True)
+                status_applied = True
             elif status_value == 'EXPIRED':
                 logger.info('Marking registration %s as expired from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, expired=True)
+                status_applied = True
             elif status_value in {'CANCELLED', 'CANCELED'}:
                 logger.info('Marking registration %s as cancelled from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, cancelled=True)
+                status_applied = True
             elif status_value in {'DENIED', 'REJECTED'}:
                 logger.info('Marking registration %s as rejected from Niubiz notification.', registration.id)
                 _apply_registration_status(registration=registration, paid=False)
+                status_applied = True
             else:
                 logger.info('Unhandled Niubiz notification status %s for registration %s.',
                             status_value, registration.id)
+        should_query = registration and (not status_applied and (order_id or external_id or transaction_id))
+        if registration and status_value and status_value.lower() in PENDING_STATUS_VALUES:
+            should_query = True
+
+        if should_query:
+            logger.info('Attempting to synchronise Niubiz status for registration %s (orderId=%s, externalId=%s).',
+                        registration.id, order_id, external_id)
+            _synchronise_registration_with_query(registration=registration,
+                                                 event=registration.event,
+                                                 order_id=order_id or purchase_number,
+                                                 external_id=external_id,
+                                                 transaction_id=transaction_id)
         elif reference_number:
             logger.info('Could not match Niubiz notification to a registration (purchaseNumber=%s).',
                         reference_number)
         else:
             logger.info('Niubiz notification missing reference number. Payload: %s', payload)
 
-        return '', 204
+        return '', 200
 
 
 class RHNiubizSuccess(RHNiubizBase):
@@ -323,7 +434,7 @@ class RHNiubizSuccess(RHNiubizBase):
 
         def refresh_token():
             logger.info('Refreshing Niubiz security token during transaction authorisation.')
-            return get_security_token(access_key, secret_key, endpoint)
+            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
 
         result = authorize_transaction(
             self._get_merchant_id(),
@@ -360,9 +471,36 @@ class RHNiubizSuccess(RHNiubizBase):
         status_token_raw = (auth_data.get('STATUS') or auth_data.get('status') or
                              payload.get('STATUS') or payload.get('status') or '')
         status_token = str(status_token_raw).strip().lower()
+        order_section = auth_data.get('ORDER') or auth_data.get('order') or {}
+        order_id_value = (auth_data.get('ORDER_ID') or payload.get('orderId') or order_section.get('orderId'))
+        external_id_value = (auth_data.get('EXTERNAL_ID') or payload.get('externalId') or
+                             order_section.get('externalId'))
+        transaction_id_value = (auth_data.get('TRANSACTION_ID') or auth_data.get('transactionId') or
+                                payload.get('transactionId') or payload.get('operationNumber') or
+                                order_section.get('transactionId'))
+
+        query_status = None
+        if (status_token in PENDING_STATUS_VALUES or not status_token) and (
+                order_id_value or external_id_value or transaction_id_value):
+            logger.info('Authorisation returned pending status for registration %s. Synchronising with Niubiz.',
+                        self.registration.id)
+            query_result = _synchronise_registration_with_query(
+                registration=self.registration,
+                event=self.event,
+                order_id=order_id_value or self._get_purchase_number(),
+                external_id=external_id_value,
+                transaction_id=transaction_id_value,
+            )
+            if query_result and query_result.get('success'):
+                query_status = query_result.get('status')
+                if query_status:
+                    status_token_raw = query_status
+                    status_token = str(query_status).strip().lower()
+
         success = (action_code == SUCCESS_ACTION_CODE or status_token in AUTHORIZED_STATUS_VALUES)
         cancelled = status_token in CANCELLED_STATUS_VALUES
         expired = status_token in EXPIRED_STATUS_VALUES
+        rejected = status_token in REJECTED_STATUS_VALUES and not success
         if cancelled or expired:
             success = False
         action = (TransactionAction.complete if success else
@@ -381,6 +519,10 @@ class RHNiubizSuccess(RHNiubizBase):
         elif expired:
             logger.info('Niubiz transaction for registration %s expired before completion.', self.registration.id)
             _apply_registration_status(registration=self.registration, expired=True)
+        elif rejected:
+            logger.info('Niubiz transaction for registration %s explicitly rejected by Niubiz.',
+                        self.registration.id)
+            _apply_registration_status(registration=self.registration, paid=False)
         elif success:
             logger.info('Niubiz transaction for registration %s approved with action code %s.',
                         self.registration.id, action_code or 'unknown')
@@ -394,7 +536,7 @@ class RHNiubizSuccess(RHNiubizBase):
                         auth_data.get('actionDescription') or auth_data.get('actionMessage') or '')
 
         if success:
-            flash(_('Tu pago fue autorizado correctamente.'), 'success')
+            flash(_('¡Tu pago ha sido procesado con éxito!'), 'success')
         else:
             code_value = action_code or _('desconocido')
             message = _('Niubiz rechazó tu pago (código {code}).').format(code=code_value)
@@ -403,10 +545,15 @@ class RHNiubizSuccess(RHNiubizBase):
             flash(message, 'error')
 
         card_info = auth_data.get('CARD') or auth_data.get('card')
+        card_brand = None
         if isinstance(card_info, dict):
             masked_card = (card_info.get('PAN') or card_info.get('pan') or card_info.get('maskedCard'))
+            card_brand = (card_info.get('BRAND') or card_info.get('brand') or card_info.get('cardBrand'))
         else:
             masked_card = card_info
+        if not card_brand:
+            card_brand = (auth_data.get('BRAND') or payload.get('brand') or
+                          payload.get('cardBrand') or auth_data.get('cardBrand'))
 
         authorization_code = (auth_data.get('AUTHORIZATION_CODE') or auth_data.get('authorizationCode'))
         transaction_id = (auth_data.get('TRANSACTION_ID') or auth_data.get('transactionId') or
@@ -417,8 +564,12 @@ class RHNiubizSuccess(RHNiubizBase):
             status_label = _('Cancelado')
         elif expired:
             status_label = _('Expirado')
+        elif status_token in AUTHORIZED_STATUS_VALUES:
+            status_label = _('Autorizado')
         elif success:
             status_label = _('Autorizado')
+        elif status_token in REJECTED_STATUS_VALUES:
+            status_label = _('Rechazado')
         else:
             status_label = _('Rechazado')
 
@@ -437,6 +588,7 @@ class RHNiubizSuccess(RHNiubizBase):
             'transaction_id': transaction_id,
             'transaction_date': transaction_date,
             'masked_card': masked_card,
+            'card_brand': card_brand,
             'status_label': status_label,
             'success': success,
             'standalone': True,
@@ -480,7 +632,7 @@ class RHNiubizStart(RHNiubizBase):
 
         def refresh_token():
             logger.info('Refreshing Niubiz security token while starting checkout session.')
-            return get_security_token(access_key, secret_key, endpoint)
+            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
 
         session_result = create_session_token(
             self._get_merchant_id(),

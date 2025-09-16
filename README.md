@@ -27,18 +27,45 @@ transacciones y sincroniza automáticamente el estado de las inscripciones.
    - `access_key`
    - `secret_key`
    - `endpoint` (`sandbox` o `prod`)
+   - Logo, color de botón y campos MDD opcionales
 3. Guardar los cambios y reiniciar los servicios de Indico si es necesario.
+4. (Opcional) Define variables de entorno como `NIUBIZ_MERCHANT_ID`, `NIUBIZ_ACCESS_KEY` y `NIUBIZ_SECRET_KEY` para centralizar las credenciales.
+
+## Flujo de estados y sincronización
+- **Autorización inmediata**: el flujo de tarjeta/QR usa el `transactionToken` y el plugin analiza `ACTION_CODE` y `STATUS`.
+- **Pagos asincrónicos (PagoEfectivo/CIP)**: cuando Niubiz devuelve `PENDING`, el plugin consulta automáticamente:
+  - API de órdenes por `orderId` o `externalId`.
+  - API de transacciones (`authorization/transactions`).
+- **Estados soportados**:
+  - `COMPLETED`, `PAID`, `AUTHORIZED` → inscripción marcada como pagada.
+  - `CANCELED`, `CANCELLED` → inscripción cancelada.
+  - `EXPIRED` → inscripción vencida.
+  - `REJECTED`, `DENIED`, `NOT AUTHORIZED` → inscripción rechazada.
+- **Cancelaciones manuales**: el botón de “Cancelar pago” registra la transacción como cancelada y mueve la inscripción a `withdrawn`.
+
+## Notificaciones `/notify`
+- Endpoint público: `https://<tu-dominio>/event/<event_id>/registrations/<reg_form_id>/payment/response/niubiz/notify` (HTTPS obligatorio).
+- El controlador procesa `statusOrder`, registra el payload en los logs y vuelve a consultar a Niubiz para confirmar el estado final.
+- Responde con `HTTP 200` a Niubiz para evitar reintentos.
+- Si requieres validar el header `NBZ-Signature`, extiende `RHNiubizCallback` usando la `secret key` para validar el HMAC SHA256.
+
+## Gestión del token de seguridad
+- El token `accessToken` se cachea por 55 minutos y se renueva de forma proactiva cinco minutos antes de expirar.
+- Cualquier respuesta `401 Unauthorized` dispara automáticamente la regeneración del token y el reintento del request original (máx. 2 intentos).
+- Puedes forzar la renovación manual con `get_security_token(..., force_refresh=True)` desde scripts administrativos.
+
+## Experiencia de usuario
+- Éxito: se muestra “¡Tu pago ha sido procesado con éxito!”, número de pedido, fecha/hora, monto, moneda, tarjeta enmascarada, marca y código de autorización.
+- Rechazo: mensaje claro con el código (`ACTION_CODE`) y la descripción (`ACTION_DESCRIPTION`).
+- Checkout web/desacoplado: el JavaScript del plugin maneja `completeCallback`, `errorCallback`, eventos `change` del formulario desacoplado y la promesa `createToken()` para mostrar mensajes amigables.
 
 ## Pruebas en sandbox
-- Activar el plugin con endpoint `sandbox`.
-- Datos de prueba Niubiz:
-  - Tarjeta: `4111111111111111`
-  - CVV: `123`
-  - Fecha: cualquier fecha futura
-  - Monto: `10.00 PEN`
-- Resultados esperados:
-  - `ACTION_CODE == "000"` → pago exitoso.
-  - Cualquier otro código → pago rechazado.
+- Endpoint `sandbox` activo.
+- Tarjeta exitosa: `4111111111111111`, CVV `123`, monto `10.00 PEN`.
+- Casos negativos:
+  - `ACTION_CODE 101` → tarjeta vencida.
+  - `ACTION_CODE 116` → fondos insuficientes.
+  - Notificación `statusOrder EXPIRED` → inscripción expirada.
 
 ## Estados de pago soportados
 - Pagado
@@ -107,3 +134,4 @@ Ejecutar la suite de pruebas después de cualquier cambio:
 ```bash
 pytest
 ```
+Las pruebas unitarias simulan respuestas de la API de Niubiz, vencimiento de tokens (`401`), sincronización de órdenes y callbacks `/notify` para garantizar la cobertura de los escenarios críticos.

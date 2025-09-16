@@ -50,6 +50,7 @@
           checkoutConfig.formbuttoncolor = {{ checkout_button_color|tojson }};
           {% endif %}
           const errorBox = document.getElementById('niubiz-error');
+          const fieldErrorClass = 'niubiz-field-error';
 
           function showCheckoutError(message) {
             if (!errorBox) {
@@ -65,6 +66,50 @@
             }
             errorBox.textContent = '';
             errorBox.classList.add('d-none');
+          }
+
+          function setFieldError(fieldName, message) {
+            if (!fieldName) {
+              showCheckoutError(message);
+              return;
+            }
+            const field = document.querySelector('[data-niubiz-field="' + fieldName + '"]');
+            if (!field) {
+              showCheckoutError(message);
+              return;
+            }
+            const container = field.closest('.form-group, .i-form-group, .mb-3') || field.parentElement;
+            if (!container) {
+              showCheckoutError(message);
+              return;
+            }
+            let feedback = container.querySelector('.' + fieldErrorClass);
+            if (!feedback) {
+              feedback = document.createElement('div');
+              feedback.className = fieldErrorClass + ' invalid-feedback d-block';
+              container.appendChild(feedback);
+            }
+            feedback.textContent = message || '';
+            feedback.classList.toggle('d-none', !message);
+          }
+
+          function clearFieldError(fieldName) {
+            if (!fieldName) {
+              return;
+            }
+            const field = document.querySelector('[data-niubiz-field="' + fieldName + '"]');
+            if (!field) {
+              return;
+            }
+            const container = field.closest('.form-group, .i-form-group, .mb-3') || field.parentElement;
+            if (!container) {
+              return;
+            }
+            const feedback = container.querySelector('.' + fieldErrorClass);
+            if (feedback) {
+              feedback.textContent = '';
+              feedback.classList.add('d-none');
+            }
           }
 
           function buildErrorMessage(error, fallback) {
@@ -106,6 +151,62 @@
             }
           }
 
+          function normaliseChangePayload(event) {
+            if (!event) {
+              return {};
+            }
+            if (event.detail && typeof event.detail === 'object') {
+              return event.detail;
+            }
+            return event;
+          }
+
+          function handlePayformChange(event) {
+            const detail = normaliseChangePayload(event);
+            const fieldName = detail && (detail.field || detail.name || detail.code);
+            if (detail && detail.isValid === false) {
+              const message = detail.message || detail.userMessage || detail.errorMessage ||
+                {{ _('Revisa los datos ingresados en el formulario de pago.')|tojson }};
+              setFieldError(fieldName, message);
+              showCheckoutError(message);
+            } else if (fieldName) {
+              clearFieldError(fieldName);
+              if (!errorBox || errorBox.classList.contains('d-none')) {
+                return;
+              }
+            }
+          }
+
+          function initDetachedPayformListeners() {
+            const payform = (window.Niubiz && window.Niubiz.payform) || window.NiubizPayform || window.payform;
+            if (!payform) {
+              return;
+            }
+            if (typeof payform.on === 'function') {
+              try {
+                payform.on('change', handlePayformChange);
+              } catch (error) {
+                // ignore listener errors silently but keep logging in console
+                console.warn('Niubiz payform change listener could not be registered', error);
+              }
+            }
+            if (typeof payform.createToken === 'function' && !payform.__indicoNiubizWrapped) {
+              const originalCreateToken = payform.createToken.bind(payform);
+              payform.createToken = function() {
+                return originalCreateToken.apply(this, arguments).catch(function(error) {
+                  handleCheckoutError(error);
+                  throw error;
+                });
+              };
+              Object.defineProperty(payform, '__indicoNiubizWrapped', {
+                value: true,
+                enumerable: false,
+                configurable: true,
+                writable: true
+              });
+            }
+          }
+
           function launchNiubizCheckout() {
             clearCheckoutError();
             if (typeof VisanetCheckout === 'undefined' || typeof VisanetCheckout.configure !== 'function') {
@@ -130,6 +231,7 @@
           }
 
           window.launchNiubizCheckout = launchNiubizCheckout;
+          initDetachedPayformListeners();
           if ({% if has_session %}true{% else %}false{% endif %}) {
             document.addEventListener('DOMContentLoaded', function() {
               launchNiubizCheckout();
