@@ -240,21 +240,28 @@ class RHNiubizSuccess(RHNiubizBase):
                              data=authorization)
 
         if cancelled:
+            logger.info('Niubiz transaction for registration %s was cancelled by the user.', self.registration.id)
             _apply_registration_status(registration=self.registration, cancelled=True)
         elif expired:
+            logger.info('Niubiz transaction for registration %s expired before completion.', self.registration.id)
             _apply_registration_status(registration=self.registration, expired=True)
         elif success:
+            logger.info('Niubiz transaction for registration %s approved with action code %s.',
+                        self.registration.id, action_code or 'unknown')
             _apply_registration_status(registration=self.registration, paid=True)
         else:
+            logger.info('Niubiz transaction for registration %s rejected with action code %s.',
+                        self.registration.id, action_code or 'unknown')
             _apply_registration_status(registration=self.registration, paid=False)
 
         description = (auth_data.get('ACTION_DESCRIPTION') or auth_data.get('ACTION_MESSAGE') or
                         auth_data.get('actionDescription') or auth_data.get('actionMessage') or '')
 
         if success:
-            flash(_('Your payment was authorized successfully.'), 'success')
+            flash(_('Tu pago fue autorizado correctamente.'), 'success')
         else:
-            message = _('Your payment could not be authorized (code {code}).').format(code=action_code)
+            code_value = action_code or _('desconocido')
+            message = _('Niubiz rechazó tu pago (código {code}).').format(code=code_value)
             if description:
                 message = f'{message} {description}'
             flash(message, 'error')
