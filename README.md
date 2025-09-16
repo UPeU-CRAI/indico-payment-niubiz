@@ -29,30 +29,26 @@ Before installing the plugin make sure you have the following:
 
 ### Global configuration
 
-Open **Administration → Customisation → Plugins → Niubiz** and fill the
-following fields:
+Open **Administration → Customisation → Plugins → Niubiz** and fill in the
+credentials provided by Niubiz:
 
-* **Merchant ID** – The Niubiz merchant identifier assigned to your commerce.
-* **Access key** – The access key used to request security tokens.
-* **Secret key** – The secret key paired with the access key.
-* **Environment** – Choose between *Sandbox* (`apisandbox.vnforappstest.com`)
-  and *Production* (`apiprod.vnforapps.com`).
+* **Merchant ID** (`merchant_id`) – The store identifier assigned by Niubiz.
+* **Access key** (`access_key`) – Used when requesting a security token.
+* **Secret key** (`secret_key`) – The shared secret associated with the access
+  key.
+* **Environment** (`endpoint`) – Choose *Sandbox* (`apisandbox.vnforappstest.com`)
+  while testing or *Production* (`apiprod.vnforapps.com`) for live payments.
 
 All sensitive fields use masked password widgets. The values are stored in the
 plugin settings and can be overridden per event if necessary.
 
 ### Event configuration
 
-Navigate to **Management → Payments** inside the event, enable the Niubiz
-payment method and optionally override the following settings for that specific
-event:
-
-* Merchant ID
-* Access key
-* Secret key
-* Environment (leave empty to reuse the global value)
-
-When no event override is provided the global configuration is used.
+Navigate to **Management → Payments** inside the event, enable **Niubiz** and
+specify the credentials that should be used for that specific registration
+form. The per-event form allows overriding the four fields mentioned above. If
+an override is left empty the value from the global plugin configuration is
+used instead.
 
 ## Payment flow
 
@@ -87,15 +83,15 @@ production.
    security token successfully.
 2. Start a registration payment using the **Pay with Niubiz** button. The
    plugin will create a `sessionToken` and launch the Niubiz checkout.
-3. Use the test card `4111111111111111` with any future expiry date and CVV
-   `123` (or any other value accepted by the sandbox).
-4. Use an amount of at least **10.00 PEN**. Smaller amounts can be rejected by
-   antifraud rules in the sandbox.
-5. Complete the checkout. The Niubiz callback should return
-   `ACTION_CODE == "000"` for a successful authorization.
-6. The registration is marked as paid and the transaction details page displays
-   the purchase number, transaction ID, authorization code, masked card, amount
-   and the final status.
+3. Use the test card `4111111111111111` with any future expiry date and a
+   three digit CVV (for example `123`).
+4. Use an amount of at least **10.00 PEN** to avoid antifraud rejections in the
+   sandbox environment.
+5. Complete the checkout. A successful authorization returns
+   `ACTION_CODE == "000"` and marks the registration as paid in Indico.
+6. The confirmation page shows the order number (`purchaseNumber`), transaction
+   ID, authorization code, masked card, amount, currency and the status of the
+   operation (Éxito, Denegado o Cancelado).
 
 ### Common errors
 
@@ -105,7 +101,7 @@ production.
 * **Expired security token** – Niubiz tokens are short lived. The plugin
   automatically refreshes the token and retries the request, but repeated
   failures can indicate that the system clock is out of sync or that the
-  credentials were rotated.
+  credentials were rotated. Regenerate the token if needed.
 * **Purchase rejected (`ACTION_CODE` ≠ `000`)** – The payment was denied by
-  Niubiz. Check the action description returned in the response for details and
-  ensure the test amount and card number are correct.
+  Niubiz. The plugin displays the rejection message returned by Niubiz so the
+  registrant can retry the payment or contact support.

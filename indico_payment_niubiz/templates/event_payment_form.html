@@ -77,6 +77,12 @@
               return;
             }
             const data = response.data || response;
+            if (data.error || response.error || data.success === false) {
+              const errorMessage = data.error && (data.error.userMessage || data.error.errorMessage || data.error.message);
+              const message = errorMessage || buildErrorMessage(response.error, {{ _('The Niubiz checkout reported an unexpected error. Please try again.')|tojson }});
+              showCheckoutError(message);
+              return;
+            }
             const code = data.ACTION_CODE || data.actionCode;
             if (code && code !== '000') {
               const description = data.ACTION_DESCRIPTION || data.ACTION_MESSAGE || data.actionDescription || data.actionMessage;

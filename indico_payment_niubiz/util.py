@@ -1,6 +1,6 @@
 import base64
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
@@ -23,26 +23,6 @@ AUTHORIZATION_ENDPOINTS = {
 
 
 logger = logging.getLogger(__name__)
-
-
-class NiubizAPIError(Exception):
-    """Raised when a Niubiz API call fails."""
-
-    def __init__(self, message: str, *, payload: Optional[Dict[str, Any]] = None,
-                 status_code: Optional[int] = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.payload = payload or {}
-        self.status_code = status_code
-
-    def __str__(self) -> str:  # pragma: no cover - mostly for debugging/flash messages
-        return self.message
-
-
-class NiubizTokenExpired(NiubizAPIError):
-    """Raised when the Niubiz security token has expired."""
-
-    pass
 
 
 def _normalize_endpoint(endpoint: Optional[str]) -> str:
@@ -72,26 +52,6 @@ def _extract_error_message(response: requests.Response) -> str:
     return text
 
 
-def _handle_response_errors(response: requests.Response, default_message: str,
-                            allow_token_refresh: bool = False) -> None:
-    message = _extract_error_message(response)
-    status_code = response.status_code
-    if allow_token_refresh and status_code == 401:
-        logger.exception('Niubiz security token expired (HTTP %s).', status_code)
-        raise NiubizTokenExpired(
-            _('The Niubiz security token expired. A new token is being requested.'),
-            status_code=status_code,
-            payload=_safe_json(response),
-        )
-
-    if message:
-        formatted = f'{default_message} [HTTP {status_code}] - {message}'
-    else:
-        formatted = f'{default_message} [HTTP {status_code}]'
-    logger.exception('Niubiz API responded with an error: %s', formatted)
-    raise NiubizAPIError(formatted, status_code=status_code, payload=_safe_json(response))
-
-
 def _safe_json(response: requests.Response) -> Dict[str, Any]:
     try:
         data = response.json()
@@ -102,24 +62,54 @@ def _safe_json(response: requests.Response) -> Dict[str, Any]:
 
 def _perform_request(url: str, *, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None,
                      timeout: int = 15, error_message: str,
-                     allow_token_refresh: bool = False) -> requests.Response:
+                     allow_token_refresh: bool = False) -> Dict[str, Any]:
     try:
         response = requests.post(url, json=json, headers=headers, timeout=timeout)
-    except requests.Timeout as exc:
+        response.raise_for_status()
+    except requests.Timeout:
         logger.exception('Timeout while calling Niubiz API at %s', url)
-        raise NiubizAPIError(_('The Niubiz service did not respond in time. Please try again.'),
-                              payload={'timeout': True}) from exc
-    except requests.RequestException as exc:
+        return {
+            'success': False,
+            'error': _('The Niubiz service did not respond in time. Please try again.'),
+            'timeout': True,
+        }
+    except requests.HTTPError as exc:
+        response = exc.response
+        payload = _safe_json(response) if response is not None else {}
+        status_code = response.status_code if response is not None else None
+        if allow_token_refresh and status_code == 401:
+            logger.exception('Niubiz security token expired (HTTP %s).', status_code)
+            return {
+                'success': False,
+                'error': _('The Niubiz security token expired. A new token is being requested.'),
+                'status_code': status_code,
+                'payload': payload,
+                'token_expired': True,
+            }
+
+        message = _extract_error_message(response) if response is not None else ''
+        if message:
+            formatted = f'{error_message} [HTTP {status_code}] - {message}'
+        else:
+            formatted = f'{error_message} [HTTP {status_code}]'
+        logger.exception('Niubiz API responded with an error: %s', formatted)
+        return {
+            'success': False,
+            'error': formatted,
+            'status_code': status_code,
+            'payload': payload,
+        }
+    except requests.RequestException:
         logger.exception('Error while calling Niubiz API at %s', url)
-        raise NiubizAPIError(_('Could not communicate with Niubiz. Please try again later.')) from exc
+        return {
+            'success': False,
+            'error': _('Could not communicate with Niubiz. Please try again later.'),
+        }
 
-    if response.status_code >= 400:
-        _handle_response_errors(response, error_message, allow_token_refresh)
-
-    return response
+    return {'success': True, 'response': response}
 
 
-def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbox') -> str:
+def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbox') -> Dict[str, Any]:
     """Generate a security token from the Niubiz security API."""
 
     endpoint_key = _normalize_endpoint(endpoint)
@@ -128,16 +118,27 @@ def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbo
     credentials = f'{access_key}:{secret_key}'.encode('utf-8')
     headers = {'Authorization': 'Basic ' + base64.b64encode(credentials).decode('utf-8')}
 
-    response = _perform_request(url,
-                                headers=headers,
-                                error_message=_('Failed to obtain the Niubiz security token.'))
+    result = _perform_request(url,
+                              headers=headers,
+                              error_message=_('Failed to obtain the Niubiz security token.'))
+
+    if not result['success']:
+        return result
+
+    response = result['response']
 
     token = response.text.strip()
     if token:
-        return token
+        return {'success': True, 'token': token}
 
     payload = _safe_json(response)
-    return payload.get('accessToken', '')
+    token = payload.get('accessToken', '')
+    if token:
+        return {'success': True, 'token': token, 'payload': payload}
+
+    logger.exception('Niubiz security token response was empty.')
+    return {'success': False, 'error': _('Failed to obtain the Niubiz security token. The response was empty.'),
+            'payload': payload}
 
 
 def create_session_token(
@@ -149,7 +150,8 @@ def create_session_token(
     *,
     client_ip: Optional[str] = None,
     client_id: Optional[str] = None,
-) -> str:
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Generate a session token for the Niubiz web checkout."""
 
     endpoint_key = _normalize_endpoint(endpoint)
@@ -165,20 +167,36 @@ def create_session_token(
         'antifraud': {'clientIp': antifraud_ip},
         'dataMap': {'clientId': customer_id},
     }
-    response = _perform_request(
-        url,
-        headers=headers,
-        json=body,
-        error_message=_('Failed to create the Niubiz checkout session.'),
-        allow_token_refresh=True,
-    )
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            url,
+            headers=headers,
+            json=body,
+            error_message=_('Failed to create the Niubiz checkout session.'),
+            allow_token_refresh=True,
+        )
 
-    payload = _safe_json(response)
-    try:
-        return payload['sessionKey']
-    except KeyError as exc:  # pragma: no cover - defensive programming
-        logger.exception('Niubiz session token response did not include a sessionKey.')
-        raise NiubizAPIError(_('The Niubiz session response was invalid.')) from exc
+        if result['success']:
+            payload = _safe_json(result['response'])
+            session_key = payload.get('sessionKey')
+            if session_key:
+                return {'success': True, 'session_key': session_key, 'payload': payload, 'access_token': token}
+            logger.exception('Niubiz session token response did not include a sessionKey.')
+            return {'success': False, 'error': _('The Niubiz session response was invalid.'), 'payload': payload}
+
+        if result.get('token_expired') and token_refresher:
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {'success': False,
+                                     'error': _('Failed to obtain a new Niubiz security token.')}  # pragma: no cover
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to create the Niubiz checkout session.')}
 
 
 def authorize_transaction(
@@ -191,6 +209,7 @@ def authorize_transaction(
     endpoint: str = 'sandbox',
     *,
     client_ip: Optional[str] = None,
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Authorize a Niubiz transaction using the checkout transaction token."""
 
@@ -211,12 +230,29 @@ def authorize_transaction(
         },
         'dataMap': {'clientIp': antifraud_ip},
     }
-    response = _perform_request(
-        url,
-        headers=headers,
-        json=body,
-        error_message=_('Failed to authorise the Niubiz transaction.'),
-        allow_token_refresh=True,
-    )
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            url,
+            headers=headers,
+            json=body,
+            error_message=_('Failed to authorise the Niubiz transaction.'),
+            allow_token_refresh=True,
+        )
 
-    return _safe_json(response)
+        if result['success']:
+            payload = _safe_json(result['response'])
+            return {'success': True, 'data': payload, 'access_token': token}
+
+        if result.get('token_expired') and token_refresher:
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {'success': False,
+                                     'error': _('Failed to obtain a new Niubiz security token.')}  # pragma: no cover
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to authorise the Niubiz transaction.')}
