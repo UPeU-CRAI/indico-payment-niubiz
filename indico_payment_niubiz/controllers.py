@@ -93,16 +93,23 @@ def _apply_registration_status(*, registration, paid=None, cancelled=False, expi
     if registration is None:
         return
 
+    changed = False
+
     if cancelled:
-        registration.update_state(withdrawn=True)
+        registration.update_state(withdrawn=True, paid=False)
+        changed = True
     elif expired:
         registration.update_state(paid=False)
+        changed = True
     elif paid is True:
         registration.update_state(paid=True)
+        changed = True
     elif paid is False:
         registration.update_state(paid=False)
+        changed = True
 
-    db.session.flush()
+    if changed:
+        db.session.flush()
 
 
 class RHNiubizCallback(RH):
@@ -270,7 +277,7 @@ class RHNiubizSuccess(RHNiubizBase):
         elif success:
             status_label = _('Éxito')
         else:
-            status_label = _('Denegado')
+            status_label = _('Rechazado')
 
         context = {
             'registration': self.registration,

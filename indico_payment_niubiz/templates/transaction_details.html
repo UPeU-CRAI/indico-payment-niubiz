@@ -46,7 +46,7 @@
         {{ format_currency(amount_value, currency_value, locale=session.lang) }}
         <span class="text-muted">({{ currency_value }})</span>
     </dd>
-    {% set base_status_text = _('Denegado') %}
+    {% set base_status_text = _('Rechazado') %}
     {% if status_label is defined and status_label %}
         {% set status_text = status_label %}
     {% elif status_token %}
@@ -57,6 +57,8 @@
             {% set status_text = _('Expirado') %}
         {% elif status_lower in ('completed', 'complete', 'success', 'successful') %}
             {% set status_text = _('Éxito') %}
+        {% elif status_lower in ('rejected', 'rechazado', 'denied') %}
+            {% set status_text = _('Rechazado') %}
         {% else %}
             {% set status_text = base_status_text %}
         {% endif %}

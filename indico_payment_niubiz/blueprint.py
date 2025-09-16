@@ -11,4 +11,4 @@ blueprint = IndicoPluginBlueprint(
 blueprint.add_url_rule('/cancel', 'cancel', RHNiubizCancel, methods=('GET', 'POST'))
 blueprint.add_url_rule('/start/<int:reg_id>', 'start', RHNiubizStart, methods=('GET', 'POST'))
 blueprint.add_url_rule('/success/<int:reg_id>', 'success', RHNiubizSuccess, methods=('GET', 'POST'))
-blueprint.add_url_rule('/callback', 'notify', RHNiubizCallback, methods=('POST',))
+blueprint.add_url_rule('/notify', 'notify', RHNiubizCallback, methods=('POST',))
