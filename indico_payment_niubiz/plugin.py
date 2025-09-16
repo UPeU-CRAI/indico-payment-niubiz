@@ -1,4 +1,11 @@
-"""Niubiz payment plugin configuration and integration points."""
+"""Niubiz payment plugin configuration and integration with Indico.
+
+Este módulo define:
+- Configuración global y por evento para la pasarela Niubiz.
+- Métodos habilitados: tarjeta, Yape, PagoEfectivo, QR y tokenización.
+- Integración con el flujo de pagos de Indico.
+- Placeholder para refund() pendiente de implementar con APIs Niubiz.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +44,9 @@ from indico_payment_niubiz.settings import (
 
 logger = logging.getLogger(__name__)
 
-
+# ----------------------------------------------------------------------
+# Choices
+# ----------------------------------------------------------------------
 BOOL_INHERIT_CHOICES = (
     ("", _("Usar configuración global")),
     ("1", _("Activado")),
@@ -45,6 +54,9 @@ BOOL_INHERIT_CHOICES = (
 )
 
 
+# ----------------------------------------------------------------------
+# Configuración global del plugin
+# ----------------------------------------------------------------------
 class PluginSettingsForm(PaymentPluginSettingsFormBase):
     merchant_id = StringField(
         _("Merchant ID"),
@@ -111,6 +123,9 @@ class PluginSettingsForm(PaymentPluginSettingsFormBase):
     )
 
 
+# ----------------------------------------------------------------------
+# Configuración específica por evento
+# ----------------------------------------------------------------------
 class EventSettingsForm(PaymentEventSettingsFormBase):
     merchant_id = StringField(
         _("Merchant ID"),
@@ -174,10 +189,16 @@ class EventSettingsForm(PaymentEventSettingsFormBase):
     )
 
 
+# ----------------------------------------------------------------------
+# Plugin principal
+# ----------------------------------------------------------------------
 class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
+    """Plugin de integración de Niubiz en Indico."""
+
     configurable = True
     settings_form = PluginSettingsForm
     event_settings_form = EventSettingsForm
+
     default_settings = {
         "method_name": "Niubiz",
         "merchant_id": "",
@@ -196,6 +217,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         "callback_hmac_secret": "",
         "callback_ip_whitelist": "",
     }
+
     default_event_settings = {
         "enabled": False,
         "method_name": None,
@@ -220,9 +242,10 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         return blueprint
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Helpers internos
     # ------------------------------------------------------------------
     def _get_bool(self, event, name: str) -> bool:
+        """Resuelve booleanos heredados entre plugin y evento."""
         override = self.event_settings.get(event, name)
         if isinstance(override, str) and override in {"0", "1"}:
             return override == "1"
@@ -231,12 +254,14 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         return bool(self.settings.get(name))
 
     def _get_setting(self, event, name: str) -> Optional[str]:
+        """Obtiene valor de configuración con fallback al global."""
         value = self.event_settings.get(event, name)
         if value in (None, ""):
             return self.settings.get(name) or None
         return value
 
     def _build_client(self, event) -> NiubizClient:
+        """Crea cliente Niubiz según credenciales y entorno configurado."""
         merchant_id = get_merchant_id_for_event(event, plugin=self)
         access_key, secret_key = get_credentials_for_event(event, plugin=self)
         endpoint = get_endpoint_for_event(event, plugin=self)
@@ -248,6 +273,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         )
 
     def _collect_methods(self, event) -> Dict[str, bool]:
+        """Recopila métodos de pago habilitados para el evento."""
         return {
             "card": self._get_bool(event, "enable_card"),
             "yape": self._get_bool(event, "enable_yape"),
@@ -256,9 +282,10 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         }
 
     # ------------------------------------------------------------------
-    # Public hooks
+    # Hooks públicos
     # ------------------------------------------------------------------
     def adjust_payment_form_data(self, data):
+        """Completa datos para mostrar el formulario de pago en Indico."""
         registration = data["registration"]
         event = data["event"]
         amount = registration.price
@@ -292,10 +319,15 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
 
         user = getattr(registration, "user", None)
         if user is not None:
-            tokens = (NiubizStoredToken.query.filter_by(user_id=user.id).order_by(NiubizStoredToken.created_at.desc()).all())
+            tokens = (
+                NiubizStoredToken.query.filter_by(user_id=user.id)
+                .order_by(NiubizStoredToken.created_at.desc())
+                .all()
+            )
             data["stored_tokens"] = tokens
 
     def process_payment(self, registration, data):
+        """Prepara inicio de pago según método elegido."""
         method = (data or {}).get("method") or "card"
         event = registration.event
         methods = self._collect_methods(event)
@@ -329,6 +361,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         return {"action": "redirect", "url": url}
 
     def refund(self, registration, transaction=None, amount=None, reason=None, **kwargs):
+        """Manejo de reembolsos (placeholder)."""
         registration = registration or getattr(transaction, "registration", None)
         if registration is None:
             return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
@@ -381,6 +414,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_transaction_id(payload: Dict[str, object]) -> Optional[str]:
+        """Extrae transactionId de payloads con diferentes formatos Niubiz."""
         if not isinstance(payload, dict):
             return None
         for key in ("transaction_id", "transactionId", "TRANSACTION_ID", "operationNumber"):
@@ -393,11 +427,13 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         return None
 
     def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:
+        """Obtiene tokens almacenados de un usuario."""
         if user is None:
             return []
         return NiubizStoredToken.query.filter_by(user_id=user.id).order_by(NiubizStoredToken.created_at.desc())
 
     def store_token(self, user, token: str, payload: Dict[str, object]) -> NiubizStoredToken:
+        """Guarda token retornado por Niubiz para futuros cobros."""
         stored = NiubizStoredToken(user_id=user.id, token=token)
         stored.update_from_token_response(payload)
         from indico.core.db import db
@@ -407,6 +443,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         return stored
 
     def delete_token(self, user, token_id: int) -> bool:
+        """Elimina token almacenado por ID."""
         if user is None:
             return False
         stored = NiubizStoredToken.query.filter_by(user_id=user.id, id=token_id).first()
