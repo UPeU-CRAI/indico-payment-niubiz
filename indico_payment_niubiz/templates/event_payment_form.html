@@ -24,22 +24,101 @@
           {% trans %}Cancel payment{% endtrans %}
         </a>
       </div>
+      <div id="niubiz-error" class="alert alert-danger d-none mt-3" role="alert"></div>
 
       <script src="{{ checkout_js_url or 'https://static-content-qas.vnforapps.com/v2/js/checkout.js' }}"></script>
       {% set checkout_amount = amount_value if amount_value is defined else amount %}
       <script>
-        function launchNiubizCheckout() {
-          VisanetCheckout.configure({
+        (function() {
+          const checkoutConfig = {
             sessionkey: "{{ sessionKey }}",
             channel: "web",
             merchantid: "{{ merchant_id }}",
             purchasenumber: "{{ purchase_number }}",
             amount: "{{ '%.2f' % checkout_amount }}",
             callbackurl: "{{ url_for('payment_niubiz.success', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id, _external=True) }}"
-          });
-          VisanetCheckout.open();
-        }
-        document.addEventListener('DOMContentLoaded', launchNiubizCheckout);
+          };
+          const errorBox = document.getElementById('niubiz-error');
+
+          function showCheckoutError(message) {
+            if (!errorBox) {
+              return;
+            }
+            errorBox.textContent = message;
+            errorBox.classList.remove('d-none');
+          }
+
+          function clearCheckoutError() {
+            if (!errorBox) {
+              return;
+            }
+            errorBox.textContent = '';
+            errorBox.classList.add('d-none');
+          }
+
+          function buildErrorMessage(error, fallback) {
+            if (error) {
+              if (typeof error === 'string') {
+                return error;
+              }
+              return error.userMessage || error.errorMessage || error.message || fallback;
+            }
+            return fallback;
+          }
+
+          function handleCheckoutError(error) {
+            const fallback = {{ _('The Niubiz checkout could not be started. Please try again.')|tojson }};
+            const message = buildErrorMessage(error, fallback);
+            showCheckoutError(message);
+          }
+
+          function handleCheckoutResponse(response) {
+            if (!response || typeof response !== 'object') {
+              return;
+            }
+            const data = response.data || response;
+            const code = data.ACTION_CODE || data.actionCode;
+            if (code && code !== '000') {
+              const description = data.ACTION_DESCRIPTION || data.ACTION_MESSAGE || data.actionDescription || data.actionMessage;
+              let message = {{ _('The payment was rejected by Niubiz. Please try again or contact support if the problem persists.')|tojson }};
+              message += ' (code ' + code + ')';
+              if (description) {
+                message += ' - ' + description;
+              }
+              showCheckoutError(message);
+            }
+          }
+
+          function launchNiubizCheckout() {
+            clearCheckoutError();
+            if (typeof VisanetCheckout === 'undefined' || typeof VisanetCheckout.configure !== 'function') {
+              showCheckoutError({{ _('The Niubiz checkout library is not available at the moment.')|tojson }});
+              return;
+            }
+
+            const config = Object.assign({}, checkoutConfig, {
+              completeCallback: handleCheckoutResponse,
+              errorCallback: handleCheckoutError
+            });
+
+            try {
+              VisanetCheckout.configure(config);
+              const opened = VisanetCheckout.open();
+              if (opened === false) {
+                showCheckoutError({{ _('The Niubiz checkout could not be opened. Please try again.')|tojson }});
+              }
+            } catch (error) {
+              handleCheckoutError(error);
+            }
+          }
+
+          window.launchNiubizCheckout = launchNiubizCheckout;
+          if ({% if has_session %}true{% else %}false{% endif %}) {
+            document.addEventListener('DOMContentLoaded', function() {
+              launchNiubizCheckout();
+            });
+          }
+        })();
       </script>
     {% endif %}
   </div>

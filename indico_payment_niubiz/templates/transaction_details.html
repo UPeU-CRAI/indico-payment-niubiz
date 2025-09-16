@@ -1,8 +1,46 @@
 {% extends 'events/payment/transaction_details.html' %}
 
-{% macro niubiz_detail_rows(transaction_id_value, amount_value, currency_value, status_text, masked_card_value, action_code_value) %}
-    <dt>{% trans %}Transaction number{% endtrans %}</dt>
+{% block details %}
+    {% set txn = transaction if transaction is defined else none %}
+    {% set base_payload = authorization if authorization is defined else (txn.data if txn else {}) %}
+    {% set raw_payload = raw_authorization if raw_authorization is defined and raw_authorization else base_payload %}
+    {% if base_payload is mapping and base_payload.get('data') is mapping %}
+        {% set payload = base_payload['data'] %}
+    {% else %}
+        {% set payload = base_payload %}
+    {% endif %}
+    {% set amount_value = amount if amount is defined else (txn.amount if txn else 0) %}
+    {% set currency_value = currency if currency is defined else (txn.currency if txn else 'PEN') %}
+    {% set purchase_number_value = purchase_number or raw_payload.get('purchaseNumber') or payload.get('purchaseNumber') or (raw_payload.get('order') or {}).get('purchaseNumber') %}
+    {% set action_code_value = action_code or payload.get('ACTION_CODE') or payload.get('actionCode') %}
+    {% set success_value = success if success is defined else (action_code_value == '000') %}
+    {% set status_token = status_label if status_label is defined else (payload.get('STATUS') or payload.get('status')) %}
+    {% if status_label is defined %}
+        {% set status_text = status_label %}
+    {% elif status_token and status_token.lower() in ('cancelled', 'canceled') %}
+        {% set status_text = _('Cancelled') %}
+    {% else %}
+        {% set status_text = success_value and _('Successful') or _('Declined') %}
+    {% endif %}
+    {% set transaction_id_value = transaction_id or payload.get('TRANSACTION_ID') or payload.get('transactionId') or payload.get('operationNumber') or raw_payload.get('transactionId') %}
+    {% set authorization_code_value = authorization_code or payload.get('AUTHORIZATION_CODE') or payload.get('authorizationCode') %}
+    {% set card_payload = masked_card or payload.get('CARD') or payload.get('card') or payload.get('cardNumber') %}
+    {% if card_payload is mapping %}
+        {% set masked_card_value = card_payload.get('PAN') or card_payload.get('pan') or card_payload.get('maskedCard') %}
+    {% else %}
+        {% set masked_card_value = card_payload %}
+    {% endif %}
+    {% set transaction_date_value = transaction_date or payload.get('TRANSACTION_DATE') or payload.get('transactionDate') %}
+    <dt>{% trans %}Purchase number{% endtrans %}</dt>
+    <dd>{{ purchase_number_value or '-' }}</dd>
+    <dt>{% trans %}Transaction ID{% endtrans %}</dt>
     <dd>{{ transaction_id_value or '-' }}</dd>
+    <dt>{% trans %}Authorization code{% endtrans %}</dt>
+    <dd>{{ authorization_code_value or '-' }}</dd>
+    <dt>{% trans %}Masked card{% endtrans %}</dt>
+    <dd>{{ masked_card_value or '-' }}</dd>
+    <dt>{% trans %}Date and time{% endtrans %}</dt>
+    <dd>{{ transaction_date_value or '-' }}</dd>
     <dt>{% trans %}Amount{% endtrans %}</dt>
     <dd>{{ format_currency(amount_value, currency_value, locale=session.lang) }}</dd>
     <dt>{% trans %}Currency{% endtrans %}</dt>
@@ -14,21 +52,6 @@
             <span class="text-muted">({% trans code=action_code_value %}code {{ code }}{% endtrans %})</span>
         {% endif %}
     </dd>
-    <dt>{% trans %}Masked card{% endtrans %}</dt>
-    <dd>{{ masked_card_value or '-' }}</dd>
-{% endmacro %}
-
-{% block details %}
-    {% set txn = transaction if transaction is defined else none %}
-    {% set payload = authorization if authorization is defined else (txn.data if txn else {}) %}
-    {% set amount_value = amount if amount is defined else (txn.amount if txn else 0) %}
-    {% set currency_value = currency if currency is defined else (txn.currency if txn else 'PEN') %}
-    {% set transaction_id_value = transaction_id or payload.get('TRANSACTION_ID') or payload.get('operationNumber') %}
-    {% set masked_card_value = masked_card or payload.get('CARD') or payload.get('cardNumber') %}
-    {% set action_code_value = action_code or payload.get('ACTION_CODE') %}
-    {% set success_value = success if success is defined else (action_code_value == '000') %}
-    {% set status_text = success_value and _('Successful') or _('Declined') %}
-    {{ niubiz_detail_rows(transaction_id_value, amount_value, currency_value, status_text, masked_card_value, action_code_value) }}
 {% endblock %}
 
 {% block warning_box %}{% endblock %}
