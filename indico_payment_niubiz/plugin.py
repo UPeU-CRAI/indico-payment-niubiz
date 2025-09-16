@@ -1,296 +1,524 @@
-from wtforms.fields import SelectField, StringField, TextAreaField
-from wtforms.validators import DataRequired, Optional
+"""Niubiz payment plugin configuration and integration points."""
+
+from __future__ import annotations
 
 import logging
+from typing import Dict, Iterable, Optional
+
+from wtforms.fields import BooleanField, SelectField, StringField, TextAreaField
+from wtforms.validators import DataRequired, Optional as OptionalValidator
 
 from werkzeug.exceptions import BadRequest
 
 from indico.core.plugins import IndicoPlugin
-from indico.modules.events.payment import (PaymentEventSettingsFormBase, PaymentPluginMixin,
-                                           PaymentPluginSettingsFormBase)
+from indico.modules.events.payment import (
+    PaymentEventSettingsFormBase,
+    PaymentPluginMixin,
+    PaymentPluginSettingsFormBase,
+)
+from indico.modules.events.payment.models.transactions import TransactionStatus
 from indico.web.forms.fields import IndicoPasswordField
 from indico.web.flask.util import url_for
 
 from indico_payment_niubiz import _
 from indico_payment_niubiz.blueprint import blueprint
-from indico_payment_niubiz.indico_integration import build_transaction_data, handle_refund, parse_amount
-from indico_payment_niubiz.settings import (get_credentials_for_event, get_endpoint_for_event,
-                                            get_merchant_id_for_event)
-from indico_payment_niubiz.util import get_security_token, refund_transaction
+from indico_payment_niubiz.client import NiubizClient
+from indico_payment_niubiz.indico_integration import (
+    build_transaction_data,
+    handle_refund,
+    parse_amount,
+)
+from indico_payment_niubiz.models import NiubizStoredToken
+from indico_payment_niubiz.settings import (
+    get_credentials_for_event,
+    get_endpoint_for_event,
+    get_merchant_id_for_event,
+)
+from indico_payment_niubiz.util import map_action_code_to_status
 
 
 logger = logging.getLogger(__name__)
 
 
+BOOL_INHERIT_CHOICES = (
+    ("", _("Usar configuración global")),
+    ("1", _("Activado")),
+    ("0", _("Desactivado")),
+)
+
+
 class PluginSettingsForm(PaymentPluginSettingsFormBase):
-    merchant_id = StringField(_('Merchant ID'), [DataRequired()],
-                              description=_('Your Niubiz merchant identifier.'))
-    access_key = IndicoPasswordField(_('Access key'), [DataRequired()],
-                                     description=_('Access key provided by Niubiz.'))
-    secret_key = IndicoPasswordField(_('Secret key'), [DataRequired()],
-                                     description=_('Secret key provided by Niubiz.'))
+    merchant_id = StringField(
+        _("Merchant ID"),
+        [DataRequired()],
+        description=_("Identificador de comercio asignado por Niubiz."),
+    )
+    access_key = IndicoPasswordField(
+        _("Access key"),
+        [DataRequired()],
+        description=_("Access key proporcionada por Niubiz."),
+    )
+    secret_key = IndicoPasswordField(
+        _("Secret key"),
+        [DataRequired()],
+        description=_("Secret key proporcionada por Niubiz."),
+    )
     merchant_logo_url = StringField(
-        _('Merchant logo URL'),
-        [Optional()],
-        description=_('HTTPS URL of the logo that Niubiz should display in the checkout form.'),
+        _("Logo del comercio"),
+        [OptionalValidator()],
+        description=_("URL HTTPS del logo que se mostrará en el checkout."),
     )
     button_color = StringField(
-        _('Checkout button color'),
-        [Optional()],
-        description=_('Hexadecimal color (e.g. #1a6ec2) used to customise the Niubiz checkout button.'),
+        _("Color del botón"),
+        [OptionalValidator()],
+        description=_("Color hexadecimal del botón principal del checkout."),
     )
     merchant_defined_data = TextAreaField(
-        _('Merchant Define Data (MDD)'),
-        [Optional()],
-        description=_('JSON map with the antifraud fields (MDDs) provided by Niubiz.'),
+        _("Merchant Define Data (MDD)"),
+        [OptionalValidator()],
+        description=_("Mapa JSON con campos antifraude MDD provistos por Niubiz."),
     )
     endpoint = SelectField(
-        _('Environment'),
+        _("Entorno"),
         [DataRequired()],
         choices=(
-            ('sandbox', _('Sandbox (testing)')),
-            ('prod', _('Production')),
+            ("sandbox", _("Sandbox (pruebas)")),
+            ("prod", _("Producción")),
         ),
-        description=_('Choose the Niubiz environment that should be used when processing payments.'),
+        description=_("Selecciona el entorno de Niubiz a utilizar."),
+    )
+    enable_card = BooleanField(_("Tarjeta"), default=True)
+    enable_yape = BooleanField(_("Yape"), default=False)
+    enable_pagoefectivo = BooleanField(_("PagoEfectivo"), default=False)
+    enable_qr = BooleanField(_("QR"), default=False)
+    enable_tokenization = BooleanField(
+        _("Tokenización"),
+        default=False,
+        description=_("Permitir almacenar tokens para cobros recurrentes."),
+    )
+    callback_authorization_token = IndicoPasswordField(
+        _("Token de autorización de callback"),
+        [OptionalValidator()],
+        description=_("Valor esperado en el header Authorization de los callbacks."),
+    )
+    callback_hmac_secret = IndicoPasswordField(
+        _("Secreto HMAC"),
+        [OptionalValidator()],
+        description=_("Clave usada para validar la firma NBZ-Signature."),
+    )
+    callback_ip_whitelist = TextAreaField(
+        _("Whitelist de IPs"),
+        [OptionalValidator()],
+        description=_("Lista de IPs o rangos CIDR autorizados para callbacks."),
     )
 
 
 class EventSettingsForm(PaymentEventSettingsFormBase):
-    merchant_id = StringField(_('Merchant ID override'), [Optional()],
-                              description=_('Override the default merchant identifier for this event.'))
-    access_key = IndicoPasswordField(_('Access key override'), [Optional()],
-                                     description=_('Override the default access key for this event.'))
-    secret_key = IndicoPasswordField(_('Secret key override'), [Optional()],
-                                     description=_('Override the default secret key for this event.'))
+    merchant_id = StringField(
+        _("Merchant ID"),
+        [OptionalValidator()],
+        description=_("Sobrescribe el Merchant ID del plugin."),
+    )
+    access_key = IndicoPasswordField(
+        _("Access key"),
+        [OptionalValidator()],
+        description=_("Sobrescribe el Access key del plugin."),
+    )
+    secret_key = IndicoPasswordField(
+        _("Secret key"),
+        [OptionalValidator()],
+        description=_("Sobrescribe el Secret key del plugin."),
+    )
     merchant_logo_url = StringField(
-        _('Merchant logo URL override'),
-        [Optional()],
-        description=_('Override the default logo used in the Niubiz checkout form.'),
+        _("Logo"),
+        [OptionalValidator()],
+        description=_("Logo mostrado en el checkout."),
     )
     button_color = StringField(
-        _('Checkout button color override'),
-        [Optional()],
-        description=_('Override the Niubiz checkout button color.'),
+        _("Color del botón"),
+        [OptionalValidator()],
+        description=_("Color del botón del checkout."),
     )
     merchant_defined_data = TextAreaField(
-        _('Merchant Define Data override'),
-        [Optional()],
-        description=_('Override the JSON map of Niubiz MDD antifraud fields for this event.'),
+        _("Merchant Define Data"),
+        [OptionalValidator()],
+        description=_("Mapa JSON MDD específico del evento."),
     )
     endpoint = SelectField(
-        _('Environment override'),
-        [Optional()],
+        _("Entorno"),
+        [OptionalValidator()],
         choices=(
-            ('', _('Use plugin default')),
-            ('sandbox', _('Sandbox (testing)')),
-            ('prod', _('Production')),
+            ("", _("Usar configuración global")),
+            ("sandbox", _("Sandbox (pruebas)")),
+            ("prod", _("Producción")),
         ),
-        default='',
-        description=_('Use a different Niubiz environment for this event.'),
+        default="",
+    )
+    enable_card = SelectField(_("Tarjeta"), choices=BOOL_INHERIT_CHOICES, default="")
+    enable_yape = SelectField(_("Yape"), choices=BOOL_INHERIT_CHOICES, default="")
+    enable_pagoefectivo = SelectField(_("PagoEfectivo"), choices=BOOL_INHERIT_CHOICES, default="")
+    enable_qr = SelectField(_("QR"), choices=BOOL_INHERIT_CHOICES, default="")
+    enable_tokenization = SelectField(_("Tokenización"), choices=BOOL_INHERIT_CHOICES, default="")
+    callback_authorization_token = IndicoPasswordField(
+        _("Token de autorización"),
+        [OptionalValidator()],
+        description=_("Valor específico para validar callbacks en este evento."),
+    )
+    callback_hmac_secret = IndicoPasswordField(
+        _("Secreto HMAC"),
+        [OptionalValidator()],
+        description=_("Clave HMAC específica para este evento."),
+    )
+    callback_ip_whitelist = TextAreaField(
+        _("Whitelist de IPs"),
+        [OptionalValidator()],
+        description=_("IPs adicionales o personalizadas para validar callbacks."),
     )
 
 
 class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
-    """Niubiz
-
-    Provides a payment method using the Niubiz web checkout API.
-    """
-
     configurable = True
     settings_form = PluginSettingsForm
     event_settings_form = EventSettingsForm
     default_settings = {
-        'method_name': 'Niubiz',
-        'merchant_id': '',
-        'access_key': '',
-        'secret_key': '',
-        'merchant_logo_url': '',
-        'button_color': '',
-        'merchant_defined_data': '',
-        'endpoint': 'sandbox',
+        "method_name": "Niubiz",
+        "merchant_id": "",
+        "access_key": "",
+        "secret_key": "",
+        "merchant_logo_url": "",
+        "button_color": "",
+        "merchant_defined_data": "",
+        "endpoint": "sandbox",
+        "enable_card": True,
+        "enable_yape": False,
+        "enable_pagoefectivo": False,
+        "enable_qr": False,
+        "enable_tokenization": False,
+        "callback_authorization_token": "",
+        "callback_hmac_secret": "",
+        "callback_ip_whitelist": "",
     }
     default_event_settings = {
-        'enabled': False,
-        'method_name': None,
-        'merchant_id': None,
-        'access_key': None,
-        'secret_key': None,
-        'merchant_logo_url': None,
-        'button_color': None,
-        'merchant_defined_data': None,
-        'endpoint': None,
+        "enabled": False,
+        "method_name": None,
+        "merchant_id": None,
+        "access_key": None,
+        "secret_key": None,
+        "merchant_logo_url": None,
+        "button_color": None,
+        "merchant_defined_data": None,
+        "endpoint": None,
+        "enable_card": None,
+        "enable_yape": None,
+        "enable_pagoefectivo": None,
+        "enable_qr": None,
+        "enable_tokenization": None,
+        "callback_authorization_token": None,
+        "callback_hmac_secret": None,
+        "callback_ip_whitelist": None,
     }
 
     def get_blueprints(self):
         return blueprint
 
-    def adjust_payment_form_data(self, data):
-        registration = data['registration']
-        event = data['event']
-        amount = registration.price
-        currency = registration.currency or 'PEN'
-        purchase_number = f"{registration.event_id}-{registration.id}"
-        merchant_id = (self.event_settings.get(event, 'merchant_id') or
-                       self.settings.get('merchant_id'))
-        merchant_logo = (self.event_settings.get(event, 'merchant_logo_url') or
-                         self.settings.get('merchant_logo_url'))
-        button_color = (self.event_settings.get(event, 'button_color') or
-                        self.settings.get('button_color'))
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _get_bool(self, event, name: str) -> bool:
+        override = self.event_settings.get(event, name)
+        if isinstance(override, str) and override in {"0", "1"}:
+            return override == "1"
+        if override is not None and not isinstance(override, str):
+            return bool(override)
+        return bool(self.settings.get(name))
 
-        data.update({
-            'merchant_id': merchant_id,
-            'amount': amount,
-            'currency': currency,
-            'purchase_number': purchase_number,
-            'merchant_logo_url': merchant_logo,
-            'checkout_button_color': button_color,
-            'start_url': url_for('payment_niubiz.start', event_id=event.id,
-                                 reg_form_id=registration.registration_form.id, reg_id=registration.id),
-            'cancel_url': url_for('payment_niubiz.cancel', event_id=event.id,
-                                  reg_form_id=registration.registration_form.id, reg_id=registration.id),
-        })
+    def _get_setting(self, event, name: str) -> Optional[str]:
+        value = self.event_settings.get(event, name)
+        if value in (None, ""):
+            return self.settings.get(name) or None
+        return value
+
+    def _build_client(self, event) -> NiubizClient:
+        merchant_id = get_merchant_id_for_event(event, plugin=self)
+        access_key, secret_key = get_credentials_for_event(event, plugin=self)
+        endpoint = get_endpoint_for_event(event, plugin=self)
+        return NiubizClient(
+            merchant_id=merchant_id,
+            access_key=access_key,
+            secret_key=secret_key,
+            endpoint=endpoint,
+        )
+
+    def _collect_methods(self, event) -> Dict[str, bool]:
+        return {
+            "card": self._get_bool(event, "enable_card"),
+            "yape": self._get_bool(event, "enable_yape"),
+            "pagoefectivo": self._get_bool(event, "enable_pagoefectivo"),
+            "qr": self._get_bool(event, "enable_qr"),
+        }
+
+    # ------------------------------------------------------------------
+    # Public hooks
+    # ------------------------------------------------------------------
+    def adjust_payment_form_data(self, data):
+        registration = data["registration"]
+        event = data["event"]
+        amount = registration.price
+        currency = registration.currency or "PEN"
+        purchase_number = f"{registration.event_id}-{registration.id}"
+
+        data.update(
+            {
+                "merchant_id": self._get_setting(event, "merchant_id"),
+                "amount": amount,
+                "currency": currency,
+                "purchase_number": purchase_number,
+                "merchant_logo_url": self._get_setting(event, "merchant_logo_url"),
+                "checkout_button_color": self._get_setting(event, "button_color"),
+                "checkout_methods": self._collect_methods(event),
+                "tokenization_enabled": self._get_bool(event, "enable_tokenization"),
+                "start_url": url_for(
+                    "payment_niubiz.start",
+                    event_id=event.id,
+                    reg_form_id=registration.registration_form.id,
+                    reg_id=registration.id,
+                ),
+                "cancel_url": url_for(
+                    "payment_niubiz.cancel",
+                    event_id=event.id,
+                    reg_form_id=registration.registration_form.id,
+                    reg_id=registration.id,
+                ),
+            }
+        )
+
+        user = getattr(registration, "user", None)
+        if user is not None:
+            tokens = (NiubizStoredToken.query.filter_by(user_id=user.id).order_by(NiubizStoredToken.created_at.desc()).all())
+            data["stored_tokens"] = tokens
+
+    def process_payment(self, registration, data):
+        method = (data or {}).get("method") or "card"
+        event = registration.event
+        methods = self._collect_methods(event)
+
+        if method == "token":
+            if not self._get_bool(event, "enable_tokenization"):
+                raise BadRequest(_("La tokenización no está habilitada para este evento."))
+            token_id = (data or {}).get("token_id")
+            if not token_id:
+                raise BadRequest(_("No se proporcionó el token almacenado."))
+            url = url_for(
+                "payment_niubiz.start",
+                event_id=event.id,
+                reg_form_id=registration.registration_form.id,
+                reg_id=registration.id,
+                method="token",
+                token_id=token_id,
+            )
+            return {"action": "redirect", "url": url}
+
+        if method not in methods or not methods[method]:
+            raise BadRequest(_("El método de pago seleccionado no está habilitado."))
+
+        url = url_for(
+            "payment_niubiz.start",
+            event_id=event.id,
+            reg_form_id=registration.registration_form.id,
+            reg_id=registration.id,
+            method=method,
+        )
+        return {"action": "redirect", "url": url}
 
     def refund(self, registration, transaction=None, amount=None, reason=None, **kwargs):
-        registration = registration or getattr(transaction, 'registration', None)
+        registration = registration or getattr(transaction, "registration", None)
         if registration is None:
-            return {'success': False, 'error': _('No se pudo identificar la inscripción a reembolsar.')}
+            return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
 
         event = registration.event
-        txn = transaction or getattr(registration, 'transaction', None)
-
-        currency = getattr(txn, 'currency', None) or getattr(registration, 'currency', None) or 'PEN'
+        txn = transaction or getattr(registration, "transaction", None)
+        currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
         amount_decimal = parse_amount(amount, None) if amount is not None else None
         if amount_decimal is None:
-            amount_decimal = parse_amount(getattr(txn, 'amount', None), None)
+            amount_decimal = parse_amount(getattr(txn, "amount", None), None)
         if amount_decimal is None:
-            amount_decimal = parse_amount(getattr(registration, 'price', None), None)
+            amount_decimal = parse_amount(getattr(registration, "price", None), None)
 
-        def _extract_transaction_id(payload):
-            if not isinstance(payload, dict):
-                return None
-            for key in ('transaction_id', 'transactionId', 'TRANSACTION_ID', 'operationNumber'):
-                value = payload.get(key)
-                if value:
-                    return value
-            nested = payload.get('payload') or payload.get('data') or payload.get('ORDER') or payload.get('order')
-            if isinstance(nested, dict):
-                return _extract_transaction_id(nested)
-            return None
-
-        transaction_payload = getattr(txn, 'data', {}) or {}
-        transaction_id = _extract_transaction_id(transaction_payload)
+        transaction_payload = getattr(txn, "data", {}) or {}
+        transaction_id = self._extract_transaction_id(transaction_payload)
 
         if transaction_id is None:
-            summary = _('No se pudo determinar el identificador de la transacción de Niubiz para emitir el reembolso.')
-            data = build_transaction_data(source='refund', reason=reason, message=summary)
-            data['currency'] = currency
+            summary = _("No se encontró el identificador de la transacción de Niubiz.")
+            data = build_transaction_data(source="refund", reason=reason, message=summary)
+            data["currency"] = currency
             if amount_decimal is not None:
-                data['amount'] = float(amount_decimal)
-            handle_refund(registration,
-                          amount=amount_decimal,
-                          currency=currency,
-                          transaction_id=None,
-                          status=None,
-                          summary=summary,
-                          data=data,
-                          success=False)
-            return {'success': False, 'error': summary}
+                data["amount"] = float(amount_decimal)
+            handle_refund(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=None,
+                status=None,
+                summary=summary,
+                data=data,
+                success=False,
+            )
+            return {"success": False, "error": summary}
 
         try:
-            endpoint = get_endpoint_for_event(event, plugin=self)
-            access_key, secret_key = get_credentials_for_event(event, plugin=self)
-            merchant_id = get_merchant_id_for_event(event, plugin=self)
+            client = self._build_client(event)
         except BadRequest as exc:
-            message = getattr(exc, 'description', str(exc))
-            logger.warning('Cannot issue Niubiz refund for registration %s: %s', getattr(registration, 'id', 'unknown'),
-                           message)
-            data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason,
-                                          message=message)
-            data['currency'] = currency
+            message = getattr(exc, "description", str(exc))
+            logger.warning("No se pudo emitir el reembolso de Niubiz: %s", message)
+            data = build_transaction_data(
+                source="refund",
+                transaction_id=str(transaction_id),
+                reason=reason,
+                message=message,
+            )
+            data["currency"] = currency
             if amount_decimal is not None:
-                data['amount'] = float(amount_decimal)
-            handle_refund(registration,
-                          amount=amount_decimal,
-                          currency=currency,
-                          transaction_id=str(transaction_id),
-                          status=None,
-                          summary=_('El reembolso de Niubiz no se pudo iniciar por una configuración incompleta.'),
-                          data=data,
-                          success=False)
-            return {'success': False, 'error': message}
+                data["amount"] = float(amount_decimal)
+            handle_refund(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=str(transaction_id),
+                status=None,
+                summary=_("No fue posible iniciar el reembolso de Niubiz."),
+                data=data,
+                success=False,
+            )
+            return {"success": False, "error": message}
 
-        token_result = get_security_token(access_key, secret_key, endpoint)
-        if not token_result.get('success'):
-            message = token_result.get('error') or _('No se pudo obtener el token de seguridad de Niubiz.')
-            logger.error('Niubiz refund failed while obtaining security token for registration %s: %s',
-                         getattr(registration, 'id', 'unknown'), message)
-            data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason,
-                                          message=message)
-            data['currency'] = currency
-            if amount_decimal is not None:
-                data['amount'] = float(amount_decimal)
-            handle_refund(registration,
-                          amount=amount_decimal,
-                          currency=currency,
-                          transaction_id=str(transaction_id),
-                          status=None,
-                          summary=_('Niubiz no pudo iniciar el reembolso.'),
-                          data=data,
-                          success=False)
-            return {'success': False, 'error': message}
+        amount_value = float(amount_decimal) if amount_decimal is not None else float(
+            getattr(txn, "amount", 0) or getattr(registration, "price", 0) or 0
+        )
 
-        access_token = token_result['token']
+        settled = self._is_transaction_settled(transaction_payload)
+        logger.info(
+            "Emitiendo %s de Niubiz para la inscripción %s (transaction_id=%s, amount=%s)",
+            "reversal" if not settled else "refund",
+            getattr(registration, "id", "?"),
+            transaction_id,
+            amount_value,
+        )
 
-        refund_data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason)
-        refund_data['currency'] = currency
-        if amount_decimal is not None:
-            refund_data['amount'] = float(amount_decimal)
-        purchase_number = f"{getattr(registration, 'event_id', '')}-{getattr(registration, 'id', '')}"
-        refund_data['purchase_number'] = purchase_number
+        if not settled:
+            response = client.reverse_transaction(
+                transaction_id=str(transaction_id), amount=amount_value, currency=currency
+            )
+        else:
+            response = client.refund_transaction(
+                transaction_id=str(transaction_id), amount=amount_value, currency=currency, reason=reason
+            )
 
-        def refresh_token():
-            logger.info('Refreshing Niubiz security token during refund for registration %s.',
-                        getattr(registration, 'id', 'unknown'))
-            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
+        payload = response.get("data") or {}
+        status_value = response.get("status") or ""
+        action_code = response.get("action_code") or ""
+        mapped_status = map_action_code_to_status(action_code, status_value)
+        success = response.get("success") and mapped_status == TransactionStatus.successful
 
-        amount_value = float(amount_decimal) if amount_decimal is not None else float(getattr(txn, 'amount', 0) or
-                                                                                      getattr(registration, 'price', 0) or
-                                                                                      0)
+        data = build_transaction_data(
+            payload=payload or response,
+            source="refund",
+            status=status_value or None,
+            action_code=action_code or None,
+            transaction_id=str(transaction_id),
+            reason=reason,
+        )
+        data.update(
+            {
+                "currency": currency,
+                "amount": amount_value,
+                "authorization_code": response.get("authorization_code"),
+                "trace_number": response.get("trace_number"),
+                "brand": response.get("brand"),
+                "masked_card": response.get("masked_card"),
+                "eci": response.get("eci"),
+                "antifraud": response.get("antifraud"),
+            }
+        )
 
-        refund_result = refund_transaction(merchant_id=merchant_id,
-                                           transaction_id=str(transaction_id),
-                                           amount=amount_value,
-                                           currency=currency,
-                                           access_token=access_token,
-                                           endpoint=endpoint,
-                                           reason=reason,
-                                           token_refresher=refresh_token)
-
-        payload = refund_result.get('data') or refund_result.get('payload')
-        status = refund_result.get('status')
-        if payload is not None:
-            refund_data['payload'] = payload
-        if status:
-            refund_data['status'] = status
-
-        success = refund_result.get('success') is True
-        summary = (_('Se registró un reembolso de Niubiz.') if success
-                   else _('Niubiz no pudo procesar el reembolso solicitado.'))
-        if not success and refund_result.get('error'):
-            refund_data['error'] = refund_result['error']
-
-        handle_refund(registration,
-                      amount=amount_decimal,
-                      currency=currency,
-                      transaction_id=str(transaction_id),
-                      status=status,
-                      summary=summary,
-                      data=refund_data,
-                      success=success)
+        summary = (
+            _("Se registró un reembolso en Niubiz.")
+            if success
+            else _("Niubiz no pudo procesar el reembolso solicitado.")
+        )
+        handle_refund(
+            registration,
+            amount=amount_decimal,
+            currency=currency,
+            transaction_id=str(transaction_id),
+            status=status_value,
+            summary=summary,
+            data=data,
+            success=bool(success),
+        )
 
         return {
-            'success': success,
-            'status': status,
-            'payload': payload,
-            'error': refund_result.get('error'),
+            "success": bool(success),
+            "status": status_value,
+            "payload": payload,
+            "mapped_status": mapped_status,
+            "error": response.get("error"),
         }
+
+    # ------------------------------------------------------------------
+    # Token helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_transaction_id(payload: Dict[str, object]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("transaction_id", "transactionId", "TRANSACTION_ID", "operationNumber"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        nested = payload.get("payload") or payload.get("data") or payload.get("ORDER") or payload.get("order")
+        if isinstance(nested, dict):
+            return NiubizPaymentPlugin._extract_transaction_id(nested)
+        return None
+
+    @staticmethod
+    def _is_transaction_settled(payload: Dict[str, object]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        values = []
+        for key in ("status", "STATUS", "query_status", "confirmation_status"):
+            value = payload.get(key)
+            if value:
+                values.append(str(value).lower())
+        nested = payload.get("payload")
+        if isinstance(nested, dict):
+            for key in ("STATUS", "status"):
+                value = nested.get(key)
+                if value:
+                    values.append(str(value).lower())
+        return any(value in {"confirmed", "captured", "settled", "paid", "completed"} for value in values)
+
+    def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:
+        if user is None:
+            return []
+        return NiubizStoredToken.query.filter_by(user_id=user.id).order_by(NiubizStoredToken.created_at.desc())
+
+    def store_token(self, user, token: str, payload: Dict[str, object]) -> NiubizStoredToken:
+        stored = NiubizStoredToken(user_id=user.id, token=token)
+        stored.update_from_token_response(payload)
+        from indico.core.db import db
+
+        db.session.add(stored)
+        db.session.flush()
+        return stored
+
+    def delete_token(self, user, token_id: int) -> bool:
+        if user is None:
+            return False
+        stored = NiubizStoredToken.query.filter_by(user_id=user.id, id=token_id).first()
+        if not stored:
+            return False
+        from indico.core.db import db
+
+        db.session.delete(stored)
+        db.session.flush()
+        return True

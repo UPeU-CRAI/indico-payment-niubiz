@@ -1,72 +1,104 @@
-import json
+"""HTTP handlers for the Niubiz payment workflow."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import flash, redirect, render_template, request
-from werkzeug.exceptions import BadRequest
+from flask_pluginengine import current_plugin
+from werkzeug.exceptions import BadRequest, Forbidden
 
+from indico.modules.events.payment.models.transactions import TransactionStatus
 from indico.modules.events.registration.models.registrations import Registration
+from indico.modules.logs.models.entries import LogKind
 from indico.web.flask.util import url_for
 from indico.web.rh import RH
 
 from indico_payment_niubiz import _
-from indico_payment_niubiz.indico_integration import (apply_registration_status, build_transaction_data,
-                                                      handle_failed_payment, handle_successful_payment,
-                                                      parse_amount)
-from indico_payment_niubiz.settings import (get_credentials_for_event, get_endpoint_for_event,
-                                            get_merchant_id_for_event, get_scoped_setting)
-from indico_payment_niubiz.util import (authorize_transaction, create_session_token,
-                                        get_checkout_script_url, get_security_token,
-                                        query_order_status_by_external_id, query_order_status_by_order_id,
-                                        query_transaction_status)
-SUCCESS_ACTION_CODE = '000'
-AUTHORIZED_STATUS_VALUES = {
-    'authorized', 'authorised', 'autorizado', 'autorizada', 'approved', 'completed', 'complete', 'success', 'successful',
-    'paid'
-}
-CANCELLED_STATUS_VALUES = {'cancelled', 'canceled', 'cancelado', 'cancelada'}
-EXPIRED_STATUS_VALUES = {'expired', 'expirada', 'expirado'}
-REJECTED_STATUS_VALUES = {'rejected', 'rechazado', 'rechazada', 'denied', 'not authorized', 'not_authorized',
-                          'notauthorised', 'failed'}
-PENDING_STATUS_VALUES = {'pending', 'pendiente', 'generated', 'generado', 'created', 'in process', 'processing',
-                         'in_progress', 'en proceso'}
+from indico_payment_niubiz.client import NiubizClient
+from indico_payment_niubiz.indico_integration import (
+    build_transaction_data,
+    handle_failed_payment,
+    handle_successful_payment,
+    log_registration_event,
+    parse_amount,
+)
+from indico_payment_niubiz.settings import (
+    get_credentials_for_event,
+    get_endpoint_for_event,
+    get_merchant_id_for_event,
+    get_scoped_setting,
+)
+from indico_payment_niubiz.util import (
+    DEFAULT_CALLBACK_IPS,
+    get_checkout_script_url,
+    ip_in_whitelist,
+    map_action_code_to_status,
+    parse_ip_list,
+)
+
 
 logger = logging.getLogger(__name__)
+
+SUCCESS_CODES = {"000"}
+CANCELLED_STATUS_VALUES = {"cancelled", "canceled", "cancelado", "cancelada"}
+EXPIRED_STATUS_VALUES = {"expired", "expirada", "expirado"}
+
+
+def _sanitize_log_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = {}
+    for key, value in payload.items():
+        if key.lower() in {"token", "accesstoken", "authorization"}:
+            sanitized[key] = "***"
+        elif isinstance(value, dict):
+            sanitized[key] = _sanitize_log_payload(value)
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 class RHNiubizBase(RH):
     CSRF_ENABLED = False
 
     def _process_args(self):
-        self.event_id = request.view_args['event_id']
-        self.reg_form_id = request.view_args['reg_form_id']
+        self.event_id = request.view_args["event_id"]
+        self.reg_form_id = request.view_args["reg_form_id"]
 
-        token = request.args.get('token') or request.form.get('token')
-        reg_id = (request.view_args.get('reg_id') or request.form.get('reg_id') or
-                  request.args.get('reg_id'))
+        token = request.args.get("token") or request.form.get("token")
+        reg_id = (
+            request.view_args.get("reg_id")
+            or request.form.get("reg_id")
+            or request.args.get("reg_id")
+        )
 
-        registration = None
+        registration: Optional[Registration] = None
         if token:
             registration = Registration.query.filter_by(uuid=token).first()
         elif reg_id is not None:
             try:
-                reg_id = int(reg_id)
+                reg_id_int = int(reg_id)
             except (TypeError, ValueError):
                 raise BadRequest
-            registration = Registration.query.get(reg_id)
+            registration = Registration.query.get(reg_id_int)
 
-        if not registration or registration.event_id != self.event_id or \
-                registration.registration_form_id != self.reg_form_id:
+        if not registration or registration.event_id != self.event_id or registration.registration_form_id != self.reg_form_id:
             raise BadRequest
 
         self.registration = registration
         self.event = registration.event
+        self._client: Optional[NiubizClient] = None
 
-    def _get_endpoint(self):
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _get_endpoint(self) -> str:
         return get_endpoint_for_event(self.event)
 
-    def _get_scoped_setting(self, name):
+    def _get_scoped_setting(self, name: str):
         return get_scoped_setting(self.event, name)
 
     def _get_credentials(self):
@@ -79,55 +111,68 @@ class RHNiubizBase(RH):
         return self.registration.price
 
     def _get_currency(self):
-        return self.registration.currency or 'PEN'
+        return self.registration.currency or "PEN"
 
     def _get_purchase_number(self):
-        return f'{self.registration.event_id}-{self.registration.id}'
+        return f"{self.registration.event_id}-{self.registration.id}"
 
     def _get_client_ip(self):
-        forwarded = request.headers.get('X-Forwarded-For', '')
+        forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
-            return forwarded.split(',')[0].strip() or (request.remote_addr or '127.0.0.1')
-        return request.remote_addr or '127.0.0.1'
+            return forwarded.split(",")[0].strip() or (request.remote_addr or "127.0.0.1")
+        return request.remote_addr or "127.0.0.1"
 
     def _get_client_id(self):
-        email = getattr(self.registration, 'email', None)
+        email = getattr(self.registration, "email", None)
         if email:
             return str(email)
-        return f'indico-registration-{self.registration.id}'
+        return f"indico-registration-{self.registration.id}"
 
     def _get_customer_email(self):
-        email = getattr(self.registration, 'email', None)
+        email = getattr(self.registration, "email", None)
         if email:
             return str(email)
-        user = getattr(self.registration, 'user', None)
+        user = getattr(self.registration, "user", None)
         if user is not None:
-            user_email = getattr(user, 'email', None)
+            user_email = getattr(user, "email", None)
             if user_email:
                 return str(user_email)
         return None
 
-    def _get_mdd_context(self) -> Dict[str, Any]:
-        registration = self.registration
-        context: Dict[str, Any] = {
-            'registration_id': getattr(registration, 'id', ''),
-            'registration_uuid': getattr(registration, 'uuid', ''),
-            'event_id': getattr(self.event, 'id', ''),
-            'amount': self._get_amount(),
-            'currency': self._get_currency(),
-        }
+    def _build_client(self) -> NiubizClient:
+        if self._client is None:
+            access_key, secret_key = self._get_credentials()
+            self._client = NiubizClient(
+                merchant_id=self._get_merchant_id(),
+                access_key=access_key,
+                secret_key=secret_key,
+                endpoint=self._get_endpoint(),
+            )
+        return self._client
 
-        for attr, key in (
-            ('email', 'registration_email'),
-            ('phone', 'registration_phone'),
-            ('company', 'registration_company'),
-            ('full_name', 'registration_name'),
-        ):
-            value = getattr(registration, attr, None)
-            if value:
-                context[key] = value
+    def _log_step(self, summary: str, *, payload: Optional[Dict[str, Any]] = None, kind: LogKind = LogKind.change) -> None:
+        log_registration_event(
+            self.registration,
+            summary,
+            kind=kind,
+            data=_sanitize_log_payload(payload or {}),
+        )
 
-        return context
+    def _get_checkout_button_color(self):
+        return self._get_scoped_setting("button_color")
+
+    def _get_merchant_logo_url(self):
+        return self._get_scoped_setting("merchant_logo_url")
+
+    def _get_checkout_script(self):
+        endpoint = self._get_endpoint()
+        return get_checkout_script_url(endpoint)
+
+    def _is_tokenization_enabled(self) -> bool:
+        value = self._get_scoped_setting("enable_tokenization")
+        if isinstance(value, str):
+            return value == "1"
+        return bool(value)
 
     def _load_merchant_defined_data(self, raw_value):
         if not raw_value:
@@ -135,554 +180,282 @@ class RHNiubizBase(RH):
         try:
             parsed = json.loads(raw_value)
         except (TypeError, ValueError):
-            logger.warning('Invalid Niubiz merchant defined data configuration. Value=%s', raw_value)
+            logger.warning("Invalid Niubiz merchant defined data configuration. Value=%s", raw_value)
             return {}
         if not isinstance(parsed, dict):
-            logger.warning('Niubiz merchant defined data configuration must be a JSON object. Value=%s', raw_value)
+            logger.warning("Niubiz merchant defined data configuration must be a JSON object. Value=%s", raw_value)
             return {}
 
-        context = self._get_mdd_context()
+        registration = self.registration
+        context: Dict[str, Any] = {
+            "registration_id": getattr(registration, "id", ""),
+            "registration_uuid": getattr(registration, "uuid", ""),
+            "event_id": getattr(self.event, "id", ""),
+            "amount": self._get_amount(),
+            "currency": self._get_currency(),
+        }
+        for attr, key in (
+            ("email", "registration_email"),
+            ("phone", "registration_phone"),
+            ("company", "registration_company"),
+            ("full_name", "registration_name"),
+        ):
+            value = getattr(registration, attr, None)
+            if value:
+                context[key] = value
 
         class _SafeDict(dict):
             def __missing__(self, key):
-                return ''
+                return ""
 
         result = {}
         for key, value in parsed.items():
-            if value in (None, ''):
+            if value in (None, ""):
                 continue
             key_str = str(key)
             try:
                 formatted = str(value).format_map(_SafeDict(context))
-            except Exception:  # pragma: no cover - defensive formatting guard
-                logger.warning('Could not format Niubiz MDD value for key %s', key_str, exc_info=True)
+            except Exception:
+                logger.warning("Could not format Niubiz MDD value for key %s", key_str, exc_info=True)
                 formatted = str(value)
             formatted = formatted.strip()
             if formatted:
                 result[key_str] = formatted
-
         return result
 
     def _get_merchant_defined_data(self):
-        raw_value = self._get_scoped_setting('merchant_defined_data')
+        raw_value = self._get_scoped_setting("merchant_defined_data")
         return self._load_merchant_defined_data(raw_value)
 
-    def _get_checkout_button_color(self):
-        value = self._get_scoped_setting('button_color')
-        return value
 
-    def _get_merchant_logo_url(self):
-        value = self._get_scoped_setting('merchant_logo_url')
-        return value
-
-    def _get_checkout_script(self):
-        endpoint = self._get_endpoint()
-        return get_checkout_script_url(endpoint)
-
-
-def _apply_status_from_value(registration, status_value):
-    if not registration or not status_value:
-        return False
-    status = str(status_value).strip().lower()
-    currency = getattr(registration, 'currency', None) or 'PEN'
-    amount_decimal = parse_amount(getattr(registration, 'price', None), None)
-    transaction_data = build_transaction_data(source='status-sync', status=status_value)
-    transaction_data['currency'] = currency
-    if amount_decimal is not None:
-        transaction_data['amount'] = float(amount_decimal)
-    event_id = getattr(registration, 'event_id', None)
-    reg_id = getattr(registration, 'id', None)
-    if event_id is not None and reg_id is not None:
-        transaction_data['purchase_number'] = f'{event_id}-{reg_id}'
-
-    if status in AUTHORIZED_STATUS_VALUES:
-        handle_successful_payment(
-            registration,
-            amount=amount_decimal,
-            currency=currency,
-            transaction_id=None,
-            status=status_value,
-            action_code=None,
-            summary=_('Niubiz confirmó el pago durante la sincronización.'),
-            data=transaction_data,
-        )
-        return True
-    if status in CANCELLED_STATUS_VALUES:
-        handle_failed_payment(
-            registration,
-            amount=amount_decimal,
-            currency=currency,
-            transaction_id=None,
-            status=status_value,
-            action_code=None,
-            summary=_('Niubiz indicó que el pago fue cancelado durante la sincronización.'),
-            data=transaction_data,
-            cancelled=True,
-        )
-        return True
-    if status in EXPIRED_STATUS_VALUES:
-        handle_failed_payment(
-            registration,
-            amount=amount_decimal,
-            currency=currency,
-            transaction_id=None,
-            status=status_value,
-            action_code=None,
-            summary=_('El pago de Niubiz aparece como expirado tras la sincronización.'),
-            data=transaction_data,
-            expired=True,
-        )
-        return True
-    if status in REJECTED_STATUS_VALUES:
-        handle_failed_payment(
-            registration,
-            amount=amount_decimal,
-            currency=currency,
-            transaction_id=None,
-            status=status_value,
-            action_code=None,
-            summary=_('Niubiz rechazó el pago tras la sincronización.'),
-            data=transaction_data,
-        )
-        return True
-    return False
-
-
-def _synchronise_registration_with_query(*, registration, event, order_id=None, external_id=None,
-                                         transaction_id=None):
-    if registration is None or event is None:
-        return None
-
-    try:
-        merchant_id = get_merchant_id_for_event(event)
-        access_key, secret_key = get_credentials_for_event(event)
-    except BadRequest:
-        logger.exception('Missing Niubiz credentials while synchronising registration %s',
-                         getattr(registration, 'id', 'unknown'))
-        return None
-
-    endpoint = get_endpoint_for_event(event)
-    token_result = get_security_token(access_key, secret_key, endpoint)
-    if not token_result.get('success'):
-        logger.warning('Could not obtain Niubiz security token to synchronise registration %s: %s',
-                       getattr(registration, 'id', 'unknown'), token_result.get('error'))
-        return token_result
-
-    access_token = token_result['token']
-
-    def refresh_token():
-        logger.info('Refreshing Niubiz security token while querying order information for registration %s',
-                    getattr(registration, 'id', 'unknown'))
-        return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
-
-    query_result = None
-    if order_id:
-        query_result = query_order_status_by_order_id(merchant_id, str(order_id), access_token, endpoint,
-                                                      token_refresher=refresh_token)
-    elif external_id:
-        query_result = query_order_status_by_external_id(merchant_id, str(external_id), access_token, endpoint,
-                                                         token_refresher=refresh_token)
-
-    if (not query_result or not query_result.get('success')) and transaction_id:
-        query_result = query_transaction_status(merchant_id, str(transaction_id), access_token, endpoint,
-                                                token_refresher=refresh_token)
-
-    if query_result and query_result.get('success'):
-        status_value = query_result.get('status')
-        if status_value:
-            logger.info('Synchronised Niubiz status %s for registration %s', status_value,
-                        getattr(registration, 'id', 'unknown'))
-            _apply_status_from_value(registration, status_value)
-    else:
-        logger.info('Niubiz status query did not succeed for registration %s: %s',
-                    getattr(registration, 'id', 'unknown'), query_result)
-
-    return query_result
-
-
-class RHNiubizCallback(RH):
-    CSRF_ENABLED = False
-
+class RHNiubizStart(RHNiubizBase):
     def _process(self):
-        payload = request.get_json(silent=True) or {}
+        redirect_url = url_for("event_registration.display_regform", self.registration.locator.registrant)
+        client = self._build_client()
 
-        event_id = request.view_args['event_id']
-        reg_form_id = request.view_args['reg_form_id']
+        token_result = client.get_security_token()
+        if not token_result.get("success"):
+            flash(token_result.get("error") or _("No se pudo obtener el token de seguridad de Niubiz."), "error")
+            return redirect(redirect_url)
 
-        order_info = payload.get('order') if isinstance(payload.get('order'), dict) else {}
-        external_id = payload.get('externalId')
-        order_id = payload.get('orderId')
-        purchase_number = (order_id or payload.get('purchaseNumber') or
-                           order_info.get('purchaseNumber'))
-        reference_number = purchase_number or external_id
-        status_value = (payload.get('statusOrder') or '').upper()
-        amount_value = payload.get('amount')
-        currency_value = payload.get('currency')
-        transaction_id = (payload.get('transactionId') or order_info.get('transactionId') or
-                          payload.get('operationNumber'))
-
-        logger.info('Received Niubiz callback (externalId=%s, orderId=%s, status=%s, amount=%s, currency=%s)',
-                    external_id, purchase_number, status_value or 'UNKNOWN', amount_value, currency_value)
-        logger.info('Full Niubiz notification payload: %s', payload)
-        registration = None
-        if reference_number:
-            parts = str(reference_number).split('-', 1)
-            if len(parts) == 2:
-                _, reg_part = parts
-                try:
-                    reg_id = int(reg_part)
-                except (TypeError, ValueError):
-                    reg_id = None
-                if reg_id is not None:
-                    registration = (Registration.query
-                                    .filter_by(id=reg_id,
-                                               event_id=event_id,
-                                               registration_form_id=reg_form_id)
-                                    .first())
-
-        status_value = (payload.get('statusOrder') or '').upper()
-        status_lower = status_value.lower()
-        amount_decimal = parse_amount(amount_value, None)
-        if amount_decimal is None and registration is not None:
-            amount_decimal = parse_amount(getattr(registration, 'price', None), None)
-        currency = (currency_value or getattr(registration, 'currency', None) or 'PEN')
-        transaction_data = build_transaction_data(
-            payload=payload,
-            source='notify',
-            status=status_value or None,
-            transaction_id=transaction_id,
-            order_id=order_id or purchase_number,
-            external_id=external_id,
+        self._log_step(
+            _("Token de seguridad de Niubiz obtenido."),
+            payload={"expires_at": token_result.get("expires_at"), "cached": token_result.get("cached")},
+            kind=LogKind.positive,
         )
-        if amount_decimal is not None:
-            transaction_data['amount'] = float(amount_decimal)
-        transaction_data['currency'] = currency
 
-        status_applied = False
-        if registration and status_value:
-            if status_lower in AUTHORIZED_STATUS_VALUES:
-                logger.info('Marking registration %s as paid from Niubiz notification.', registration.id)
-                handle_successful_payment(
-                    registration,
-                    amount=amount_decimal,
-                    currency=currency,
-                    transaction_id=transaction_id,
-                    status=status_value,
-                    action_code=None,
-                    summary=_('Niubiz confirmó el pago mediante notificación.'),
-                    data=transaction_data,
-                )
-                status_applied = True
-            elif status_lower in EXPIRED_STATUS_VALUES:
-                logger.info('Marking registration %s as expired from Niubiz notification.', registration.id)
-                handle_failed_payment(
-                    registration,
-                    amount=amount_decimal,
-                    currency=currency,
-                    transaction_id=transaction_id,
-                    status=status_value,
-                    action_code=None,
-                    summary=_('El pago reportado por Niubiz expiró.'),
-                    data=transaction_data,
-                    expired=True,
-                )
-                status_applied = True
-            elif status_lower in CANCELLED_STATUS_VALUES:
-                logger.info('Marking registration %s as cancelled from Niubiz notification.', registration.id)
-                handle_failed_payment(
-                    registration,
-                    amount=amount_decimal,
-                    currency=currency,
-                    transaction_id=transaction_id,
-                    status=status_value,
-                    action_code=None,
-                    summary=_('El pago de Niubiz fue cancelado mediante notificación.'),
-                    data=transaction_data,
-                    cancelled=True,
-                )
-                status_applied = True
-            elif status_lower in REJECTED_STATUS_VALUES:
-                logger.info('Marking registration %s as rejected from Niubiz notification.', registration.id)
-                handle_failed_payment(
-                    registration,
-                    amount=amount_decimal,
-                    currency=currency,
-                    transaction_id=transaction_id,
-                    status=status_value,
-                    action_code=None,
-                    summary=_('Niubiz rechazó el pago mediante notificación.'),
-                    data=transaction_data,
-                )
-                status_applied = True
-            else:
-                logger.info('Unhandled Niubiz notification status %s for registration %s.',
-                            status_value, registration.id)
-        should_query = registration and (not status_applied and (order_id or external_id or transaction_id))
-        if registration and status_value and status_lower in PENDING_STATUS_VALUES:
-            should_query = True
+        merchant_defined_data = self._get_merchant_defined_data()
+        client_id = self._get_client_id()
 
-        if should_query:
-            logger.info('Attempting to synchronise Niubiz status for registration %s (orderId=%s, externalId=%s).',
-                        registration.id, order_id, external_id)
-            _synchronise_registration_with_query(registration=registration,
-                                                 event=registration.event,
-                                                 order_id=order_id or purchase_number,
-                                                 external_id=external_id,
-                                                 transaction_id=transaction_id)
-        elif reference_number:
-            logger.info('Could not match Niubiz notification to a registration (purchaseNumber=%s).',
-                        reference_number)
-        else:
-            logger.info('Niubiz notification missing reference number. Payload: %s', payload)
+        session_result = client.create_session_token(
+            amount=self._get_amount(),
+            purchase_number=self._get_purchase_number(),
+            currency=self._get_currency(),
+            antifraud_data={"clientIp": self._get_client_ip(), "merchantDefineData": merchant_defined_data} if merchant_defined_data else {"clientIp": self._get_client_ip()},
+            customer_email=self._get_customer_email(),
+            client_id=client_id,
+        )
 
-        return '', 200
+        if not session_result.get("success"):
+            flash(session_result.get("error") or _("No se pudo iniciar el checkout de Niubiz."), "error")
+            return redirect(redirect_url)
+
+        self._log_step(
+            _("Sesión de checkout de Niubiz creada."),
+            payload={"session_key": session_result.get("session_key"), "expiration": session_result.get("expiration_time")},
+        )
+
+        context = {
+            "registration": self.registration,
+            "event": self.event,
+            "amount": self._get_amount(),
+            "amount_value": float(self._get_amount()),
+            "currency": self._get_currency(),
+            "merchant_id": self._get_merchant_id(),
+            "purchase_number": self._get_purchase_number(),
+            "sessionKey": session_result.get("session_key"),
+            "checkout_js_url": self._get_checkout_script(),
+            "merchant_logo_url": self._get_merchant_logo_url(),
+            "checkout_button_color": self._get_checkout_button_color(),
+            "session_expiration": session_result.get("expiration_time"),
+            "cancel_url": url_for(
+                "payment_niubiz.cancel",
+                event_id=self.event.id,
+                reg_form_id=self.registration.registration_form.id,
+                reg_id=self.registration.id,
+            ),
+        }
+        return render_template("payment_niubiz/event_payment_form.html", **context)
 
 
 class RHNiubizSuccess(RHNiubizBase):
     def _process(self):
-        transaction_token = (request.form.get('transactionToken') or
-                             request.args.get('transactionToken'))
+        transaction_token = request.form.get("transactionToken") or request.args.get("transactionToken")
         if not transaction_token and request.is_json:
-            transaction_token = (request.json or {}).get('transactionToken')
+            transaction_token = (request.json or {}).get("transactionToken")
         if not transaction_token:
-            raise BadRequest(_('Missing Niubiz transaction token.'))
+            raise BadRequest(_("Falta el token de transacción de Niubiz."))
 
-        redirect_url = url_for('event_registration.display_regform',
-                               self.registration.locator.registrant)
+        redirect_url = url_for("event_registration.display_regform", self.registration.locator.registrant)
+        client = self._build_client()
 
-        access_key, secret_key = self._get_credentials()
-        endpoint = self._get_endpoint()
-
-        token_result = get_security_token(access_key, secret_key, endpoint)
-        if not token_result.get('success'):
-            flash(token_result.get('error') or _('The Niubiz security token could not be obtained.'), 'error')
-            return redirect(redirect_url)
-
-        access_token = token_result['token']
-
-        authorization = None
-
-        def refresh_token():
-            logger.info('Refreshing Niubiz security token during transaction authorisation.')
-            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
-
-        result = authorize_transaction(
-            self._get_merchant_id(),
-            transaction_token,
-            self._get_purchase_number(),
-            self._get_amount(),
-            self._get_currency(),
-            access_token,
-            endpoint,
-            client_ip=self._get_client_ip(),
-            client_id=self._get_client_id(),
-            token_refresher=refresh_token,
-        )
-
-        if not result.get('success'):
-            flash(result.get('error') or _('The Niubiz payment could not be confirmed. Please try again.'), 'error')
-            return redirect(redirect_url)
-
-        authorization = result['data']
-
-        if authorization is None:
-            flash(_('The Niubiz payment could not be confirmed. Please try again.'), 'error')
-            return redirect(redirect_url)
-
-        payload = authorization if isinstance(authorization, dict) else {}
-        if isinstance(payload.get('data'), dict):
-            auth_data = payload['data']
-        else:
-            auth_data = payload
-
-        action_code = (auth_data.get('ACTION_CODE') or auth_data.get('actionCode') or
-                       payload.get('ACTION_CODE') or payload.get('actionCode'))
-        action_code = str(action_code or '').strip()
-        status_token_raw = (auth_data.get('STATUS') or auth_data.get('status') or
-                             payload.get('STATUS') or payload.get('status') or '')
-        status_token = str(status_token_raw).strip().lower()
-        order_section = auth_data.get('ORDER') or auth_data.get('order') or {}
-        order_id_value = (auth_data.get('ORDER_ID') or payload.get('orderId') or order_section.get('orderId'))
-        external_id_value = (auth_data.get('EXTERNAL_ID') or payload.get('externalId') or
-                             order_section.get('externalId'))
-        transaction_id_value = (auth_data.get('TRANSACTION_ID') or auth_data.get('transactionId') or
-                                payload.get('transactionId') or payload.get('operationNumber') or
-                                order_section.get('transactionId'))
-
-        query_status = None
-        if (status_token in PENDING_STATUS_VALUES or not status_token) and (
-                order_id_value or external_id_value or transaction_id_value):
-            logger.info('Authorisation returned pending status for registration %s. Synchronising with Niubiz.',
-                        self.registration.id)
-            query_result = _synchronise_registration_with_query(
-                registration=self.registration,
-                event=self.event,
-                order_id=order_id_value or self._get_purchase_number(),
-                external_id=external_id_value,
-                transaction_id=transaction_id_value,
-            )
-            if query_result and query_result.get('success'):
-                query_status = query_result.get('status')
-                if query_status:
-                    status_token_raw = query_status
-                    status_token = str(query_status).strip().lower()
-
-        success = (action_code == SUCCESS_ACTION_CODE or status_token in AUTHORIZED_STATUS_VALUES)
-        cancelled = status_token in CANCELLED_STATUS_VALUES
-        expired = status_token in EXPIRED_STATUS_VALUES
-        rejected = status_token in REJECTED_STATUS_VALUES and not success
-        if cancelled or expired:
-            success = False
-
-        description = (auth_data.get('ACTION_DESCRIPTION') or auth_data.get('ACTION_MESSAGE') or
-                        auth_data.get('actionDescription') or auth_data.get('actionMessage') or '')
         amount_decimal = parse_amount(self._get_amount(), None)
         currency = self._get_currency()
-        transaction_data = build_transaction_data(
-            payload=authorization,
-            source='checkout',
-            status=status_token_raw or None,
-            action_code=action_code or None,
-            transaction_id=transaction_id_value,
-            order_id=order_id_value,
-            external_id=external_id_value,
-            message=description or None,
-        )
-        transaction_data['purchase_number'] = self._get_purchase_number()
-        transaction_data['currency'] = currency
-        if amount_decimal is not None:
-            transaction_data['amount'] = float(amount_decimal)
-        else:
-            transaction_data['amount'] = float(self._get_amount())
-        if query_status:
-            transaction_data['query_status'] = query_status
 
-        if cancelled:
-            logger.info('Niubiz transaction for registration %s was cancelled by the user.', self.registration.id)
-            handle_failed_payment(
-                self.registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=transaction_id_value,
-                status=status_token_raw or None,
-                action_code=action_code or None,
-                summary=_('El pago de Niubiz fue cancelado por el usuario.'),
-                data=transaction_data,
-                cancelled=True,
-            )
-        elif expired:
-            logger.info('Niubiz transaction for registration %s expired before completion.', self.registration.id)
-            handle_failed_payment(
-                self.registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=transaction_id_value,
-                status=status_token_raw or None,
-                action_code=action_code or None,
-                summary=_('El pago de Niubiz expiró antes de completarse.'),
-                data=transaction_data,
-                expired=True,
-            )
-        elif rejected:
-            logger.info('Niubiz transaction for registration %s explicitly rejected by Niubiz.',
-                        self.registration.id)
-            handle_failed_payment(
-                self.registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=transaction_id_value,
-                status=status_token_raw or None,
-                action_code=action_code or None,
-                summary=_('Niubiz rechazó el pago.'),
-                data=transaction_data,
-            )
-        elif success:
-            logger.info('Niubiz transaction for registration %s approved with action code %s.',
-                        self.registration.id, action_code or 'unknown')
+        authorization = client.authorize_transaction(
+            transaction_token=transaction_token,
+            purchase_number=self._get_purchase_number(),
+            amount=self._get_amount(),
+            currency=currency,
+            client_ip=self._get_client_ip(),
+            client_id=self._get_client_id(),
+        )
+
+        if not authorization.get("success"):
+            flash(authorization.get("error") or _("Niubiz no pudo confirmar el pago. Inténtalo nuevamente."), "error")
+            return redirect(redirect_url)
+
+        self._log_step(
+            _("Transacción Niubiz autorizada."),
+            payload={
+                "status": authorization.get("status"),
+                "action_code": authorization.get("action_code"),
+                "authorization_code": authorization.get("authorization_code"),
+                "transaction_id": authorization.get("transaction_id"),
+            },
+        )
+
+        transaction_id = authorization.get("transaction_id")
+        confirmation = None
+        confirmation_status = None
+        if transaction_id:
+            confirmation = client.confirm_transaction(transaction_id=transaction_id)
+            if confirmation.get("success"):
+                confirmation_status = confirmation.get("status")
+                self._log_step(
+                    _("Confirmación de Niubiz completada."),
+                    payload={
+                        "status": confirmation_status,
+                        "action_code": confirmation.get("action_code"),
+                        "authorization_code": confirmation.get("authorization_code"),
+                    },
+                    kind=LogKind.positive,
+                )
+            else:
+                self._log_step(
+                    _("La confirmación de Niubiz no se completó."),
+                    payload={"error": confirmation.get("error"), "status": confirmation.get("status")},
+                    kind=LogKind.negative,
+                )
+
+        status_label = confirmation_status or authorization.get("status") or ""
+        action_code = authorization.get("action_code") or ""
+        mapped_status = map_action_code_to_status(action_code, status_label)
+
+        transaction_data = build_transaction_data(
+            payload={
+                "authorization": authorization.get("data"),
+                "confirmation": confirmation.get("data") if isinstance(confirmation, dict) else None,
+            },
+            source="checkout",
+            status=status_label or None,
+            action_code=action_code or None,
+            transaction_id=transaction_id,
+            order_id=self._get_purchase_number(),
+        )
+        transaction_data.update(
+            {
+                "authorization_code": confirmation.get("authorization_code") if confirmation else authorization.get("authorization_code"),
+                "trace_number": confirmation.get("trace_number") if confirmation else authorization.get("trace_number"),
+                "brand": authorization.get("brand"),
+                "masked_card": authorization.get("masked_card"),
+                "eci": authorization.get("eci"),
+                "antifraud": authorization.get("antifraud"),
+                "currency": currency,
+                "amount": float(amount_decimal) if amount_decimal is not None else float(self._get_amount()),
+            }
+        )
+
+        if confirmation_status and confirmation_status.lower() != "confirmed":
+            mapped_status = map_action_code_to_status(action_code, confirmation_status)
+
+        if mapped_status == TransactionStatus.successful:
             handle_successful_payment(
                 self.registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id_value,
-                status=status_token_raw or None,
-                action_code=action_code or None,
-                summary=_('Niubiz confirmó el pago.'),
+                transaction_id=transaction_id,
+                status=status_label,
+                action_code=action_code,
+                summary=_("Niubiz confirmó el pago."),
                 data=transaction_data,
             )
+            flash(_("¡Tu pago ha sido procesado con éxito!"), "success")
         else:
-            logger.info('Niubiz transaction for registration %s rejected with action code %s.',
-                        self.registration.id, action_code or 'unknown')
+            kwargs = {}
+            if mapped_status == TransactionStatus.cancelled:
+                kwargs["cancelled"] = True
+            elif mapped_status == TransactionStatus.expired:
+                kwargs["expired"] = True
             handle_failed_payment(
                 self.registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id_value,
-                status=status_token_raw or None,
-                action_code=action_code or None,
-                summary=_('Niubiz rechazó el pago.'),
+                transaction_id=transaction_id,
+                status=status_label,
+                action_code=action_code,
+                summary=_("Niubiz no pudo procesar el pago."),
                 data=transaction_data,
+                **kwargs,
+            )
+            code_value = action_code or _("desconocido")
+            flash(
+                _("Niubiz rechazó tu pago (código {code}).").format(code=code_value),
+                "error",
             )
 
-        if success:
-            flash(_('¡Tu pago ha sido procesado con éxito!'), 'success')
-        else:
-            code_value = action_code or _('desconocido')
-            message = _('Niubiz rechazó tu pago (código {code}).').format(code=code_value)
-            if description:
-                message = f'{message} {description}'
-            flash(message, 'error')
-
-        card_info = auth_data.get('CARD') or auth_data.get('card')
-        card_brand = None
-        if isinstance(card_info, dict):
-            masked_card = (card_info.get('PAN') or card_info.get('pan') or card_info.get('maskedCard'))
-            card_brand = (card_info.get('BRAND') or card_info.get('brand') or card_info.get('cardBrand'))
-        else:
-            masked_card = card_info
-        if not card_brand:
-            card_brand = (auth_data.get('BRAND') or payload.get('brand') or
-                          payload.get('cardBrand') or auth_data.get('cardBrand'))
-
-        authorization_code = (auth_data.get('AUTHORIZATION_CODE') or auth_data.get('authorizationCode'))
-        transaction_id = (auth_data.get('TRANSACTION_ID') or auth_data.get('transactionId') or
-                          auth_data.get('operationNumber') or payload.get('transactionId'))
-        transaction_date = (auth_data.get('TRANSACTION_DATE') or auth_data.get('transactionDate'))
-
-        if cancelled:
-            status_label = _('Cancelado')
-        elif expired:
-            status_label = _('Expirado')
-        elif status_token in AUTHORIZED_STATUS_VALUES:
-            status_label = _('Autorizado')
-        elif success:
-            status_label = _('Autorizado')
-        elif status_token in REJECTED_STATUS_VALUES:
-            status_label = _('Rechazado')
-        else:
-            status_label = _('Rechazado')
+        store_token_flag = request.form.get("storeToken") or request.args.get("storeToken")
+        if store_token_flag and self._is_tokenization_enabled() and transaction_id:
+            token_result = client.tokenize_card({"transactionId": transaction_id})
+            if token_result.get("success"):
+                token_value = token_result.get("data", {}).get("token") or token_result.get("token")
+                if token_value:
+                    try:
+                        current_plugin.store_token(self.registration.user, token_value, token_result.get("data", {}))  # type: ignore[attr-defined]
+                        self._log_step(
+                            _("Tarjeta tokenizada en Niubiz."),
+                            payload={"token": token_value, "brand": token_result.get("data", {}).get("brand")},
+                            kind=LogKind.positive,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("No se pudo almacenar el token de Niubiz")
+            else:
+                self._log_step(
+                    _("La tokenización de la tarjeta falló."),
+                    payload={"error": token_result.get("error")},
+                    kind=LogKind.negative,
+                )
 
         context = {
-            'registration': self.registration,
-            'event': self.event,
-            'amount': self._get_amount(),
-            'currency': self._get_currency(),
-            'merchant_id': self._get_merchant_id(),
-            'purchase_number': self._get_purchase_number(),
-            'authorization': auth_data,
-            'raw_authorization': payload,
-            'action_code': action_code or None,
-            'status_token': status_token_raw,
-            'authorization_code': authorization_code,
-            'transaction_id': transaction_id,
-            'transaction_date': transaction_date,
-            'masked_card': masked_card,
-            'card_brand': card_brand,
-            'status_label': status_label,
-            'success': success,
-            'standalone': True,
+            "registration": self.registration,
+            "event": self.event,
+            "amount": self._get_amount(),
+            "currency": currency,
+            "merchant_id": self._get_merchant_id(),
+            "purchase_number": self._get_purchase_number(),
+            "authorization": authorization.get("data"),
+            "confirmation": confirmation.get("data") if isinstance(confirmation, dict) else None,
+            "action_code": action_code or None,
+            "status_token": status_label,
+            "authorization_code": transaction_data.get("authorization_code"),
+            "transaction_id": transaction_id,
+            "masked_card": authorization.get("masked_card"),
+            "card_brand": authorization.get("brand"),
+            "status_label": status_label,
+            "success": mapped_status == TransactionStatus.successful,
+            "standalone": True,
         }
-
-        return render_template('payment_niubiz/transaction_details.html', **context)
+        return render_template("payment_niubiz/transaction_details.html", **context)
 
 
 class RHNiubizCancel(RHNiubizBase):
@@ -690,99 +463,192 @@ class RHNiubizCancel(RHNiubizBase):
         amount_decimal = parse_amount(self._get_amount(), None)
         currency = self._get_currency()
         transaction_data = build_transaction_data(
-            source='cancel',
-            status='CANCELLED',
-            message=_('Cancelado por el usuario en el flujo de checkout.'),
+            source="cancel",
+            status="CANCELLED",
+            message=_("Cancelado por el usuario en el flujo de checkout."),
         )
-        transaction_data['purchase_number'] = self._get_purchase_number()
-        transaction_data['currency'] = currency
+        transaction_data["purchase_number"] = self._get_purchase_number()
+        transaction_data["currency"] = currency
         if amount_decimal is not None:
-            transaction_data['amount'] = float(amount_decimal)
+            transaction_data["amount"] = float(amount_decimal)
         else:
-            transaction_data['amount'] = float(self._get_amount())
-        logger.info('Niubiz checkout was cancelled by the user for registration %s.', self.registration.id)
+            transaction_data["amount"] = float(self._get_amount())
         handle_failed_payment(
             self.registration,
             amount=amount_decimal,
             currency=currency,
             transaction_id=None,
-            status='CANCELLED',
+            status="CANCELLED",
             action_code=None,
-            summary=_('El participante canceló el pago de Niubiz.'),
+            summary=_("El participante canceló el pago de Niubiz."),
             data=transaction_data,
             cancelled=True,
         )
-        flash(_('Pago cancelado por el usuario.'), 'info')
-        return redirect(url_for('event_registration.display_regform', self.registration.locator.registrant))
+        flash(_("Pago cancelado por el usuario."), "info")
+        return redirect(url_for("event_registration.display_regform", self.registration.locator.registrant))
 
 
-class RHNiubizStart(RHNiubizBase):
+class RHNiubizCallback(RHNiubizBase):
     def _process(self):
-        redirect_url = url_for('event_registration.display_regform',
-                               self.registration.locator.registrant)
+        if request.scheme != "https" and not request.is_secure:
+            logger.warning("Niubiz callback recibido sin HTTPS. URL=%s", request.url)
+            raise Forbidden
 
-        access_key, secret_key = self._get_credentials()
-        endpoint = self._get_endpoint()
+        remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+        if "," in remote_addr:
+            remote_addr = remote_addr.split(",")[0].strip()
 
-        token_result = get_security_token(access_key, secret_key, endpoint)
-        if not token_result.get('success'):
-            flash(token_result.get('error') or _('The Niubiz security token could not be obtained.'), 'error')
-            return redirect(redirect_url)
+        configured = self._get_scoped_setting("callback_ip_whitelist") or ""
+        configured_ips = [line.strip() for line in configured.splitlines() if line.strip()]
+        networks = parse_ip_list(DEFAULT_CALLBACK_IPS + tuple(configured_ips))
+        if remote_addr and not ip_in_whitelist(remote_addr, networks):
+            logger.warning("Niubiz callback rechazado por IP no autorizada: %s", remote_addr)
+            raise Forbidden
 
-        access_token = token_result['token']
+        expected_token = self._get_scoped_setting("callback_authorization_token")
+        if expected_token:
+            provided = request.headers.get("Authorization", "").strip()
+            if provided.lower().startswith("bearer "):
+                provided = provided[7:].strip()
+            if provided != expected_token:
+                logger.warning("Niubiz callback con token inválido desde %s", remote_addr)
+                raise Forbidden
 
-        session_key = None
-        session_expiration = None
-        merchant_defined_data = self._get_merchant_defined_data()
-        client_id = self._get_client_id()
+        hmac_secret = self._get_scoped_setting("callback_hmac_secret")
+        if hmac_secret:
+            signature = request.headers.get("NBZ-Signature")
+            if not signature:
+                logger.warning("Niubiz callback sin firma HMAC")
+                raise Forbidden
+            body = request.get_data(cache=True) or b""
+            computed = hmac.new(hmac_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            if signature.strip().lower() != computed.lower():
+                logger.warning("Firma HMAC inválida en callback de Niubiz")
+                raise Forbidden
 
-        def refresh_token():
-            logger.info('Refreshing Niubiz security token while starting checkout session.')
-            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
-
-        session_result = create_session_token(
-            self._get_merchant_id(),
-            self._get_amount(),
-            self._get_currency(),
-            access_token,
-            endpoint,
-            client_ip=self._get_client_ip(),
-            client_id=client_id,
-            purchase_number=self._get_purchase_number(),
-            merchant_defined_data=merchant_defined_data,
-            customer_email=self._get_customer_email(),
-            token_refresher=refresh_token,
+        payload = request.get_json(silent=True) or {}
+        order_info = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+        external_id = payload.get("externalId")
+        order_id = payload.get("orderId")
+        purchase_number = (
+            order_id
+            or payload.get("purchaseNumber")
+            or order_info.get("purchaseNumber")
+        )
+        status_value = (payload.get("statusOrder") or "").upper()
+        amount_value = payload.get("amount")
+        currency_value = payload.get("currency")
+        transaction_id = (
+            payload.get("transactionId")
+            or order_info.get("transactionId")
+            or payload.get("operationNumber")
         )
 
-        if not session_result.get('success'):
-            flash(session_result.get('error') or _('The Niubiz checkout could not be started. Please try again.'),
-                  'error')
-            return redirect(redirect_url)
+        logger.info(
+            "Recibido callback de Niubiz (purchase=%s, status=%s, transaction=%s)",
+            purchase_number,
+            status_value or "UNKNOWN",
+            transaction_id,
+        )
+        logger.debug("Payload completo de Niubiz: %s", payload)
 
-        session_key = session_result['session_key']
-        session_expiration = session_result.get('expiration_time')
+        registration = None
+        if purchase_number:
+            parts = str(purchase_number).split("-", 1)
+            if len(parts) == 2:
+                _, reg_part = parts
+                try:
+                    reg_id = int(reg_part)
+                except (TypeError, ValueError):
+                    reg_id = None
+                if reg_id is not None:
+                    registration = (
+                        Registration.query
+                        .filter_by(id=reg_id, event_id=self.event_id, registration_form_id=self.reg_form_id)
+                        .first()
+                    )
 
-        if session_key is None:
-            flash(_('The Niubiz checkout could not be started. Please try again.'), 'error')
-            return redirect(redirect_url)
+        if not registration:
+            logger.warning("No se pudo asociar el callback de Niubiz a una inscripción. purchase=%s", purchase_number)
+            return "", 200
 
-        context = {
-            'registration': self.registration,
-            'event': self.event,
-            'amount': self._get_amount(),
-            'amount_value': float(self._get_amount()),
-            'currency': self._get_currency(),
-            'merchant_id': self._get_merchant_id(),
-            'purchase_number': self._get_purchase_number(),
-            'sessionKey': session_key,
-            'checkout_js_url': self._get_checkout_script(),
-            'merchant_logo_url': self._get_merchant_logo_url(),
-            'checkout_button_color': self._get_checkout_button_color(),
-            'session_expiration': session_expiration,
-            'cancel_url': url_for('payment_niubiz.cancel',
-                                  event_id=self.event.id,
-                                  reg_form_id=self.registration.registration_form.id,
-                                  reg_id=self.registration.id),
-        }
+        amount_decimal = parse_amount(amount_value, None)
+        if amount_decimal is None:
+            amount_decimal = parse_amount(getattr(registration, "price", None), None)
+        currency = currency_value or getattr(registration, "currency", None) or "PEN"
 
-        return render_template('payment_niubiz/event_payment_form.html', **context)
+        transaction_data = build_transaction_data(
+            payload=payload,
+            source="notify",
+            status=status_value or None,
+            transaction_id=transaction_id,
+            order_id=order_id or purchase_number,
+            external_id=external_id,
+        )
+        if amount_decimal is not None:
+            transaction_data["amount"] = float(amount_decimal)
+        transaction_data["currency"] = currency
+
+        status_lower = status_value.lower()
+        if status_lower:
+            if status_lower == "confirmed" or status_lower == "completed":
+                handle_successful_payment(
+                    registration,
+                    amount=amount_decimal,
+                    currency=currency,
+                    transaction_id=transaction_id,
+                    status=status_value,
+                    action_code=None,
+                    summary=_("Niubiz confirmó el pago mediante notificación."),
+                    data=transaction_data,
+                )
+            elif status_lower in CANCELLED_STATUS_VALUES:
+                handle_failed_payment(
+                    registration,
+                    amount=amount_decimal,
+                    currency=currency,
+                    transaction_id=transaction_id,
+                    status=status_value,
+                    action_code=None,
+                    summary=_("El pago reportado por Niubiz fue cancelado."),
+                    data=transaction_data,
+                    cancelled=True,
+                )
+            elif status_lower in EXPIRED_STATUS_VALUES:
+                handle_failed_payment(
+                    registration,
+                    amount=amount_decimal,
+                    currency=currency,
+                    transaction_id=transaction_id,
+                    status=status_value,
+                    action_code=None,
+                    summary=_("El pago reportado por Niubiz expiró."),
+                    data=transaction_data,
+                    expired=True,
+                )
+            else:
+                mapped_status = map_action_code_to_status("", status_lower)
+                if mapped_status == TransactionStatus.successful:
+                    handle_successful_payment(
+                        registration,
+                        amount=amount_decimal,
+                        currency=currency,
+                        transaction_id=transaction_id,
+                        status=status_value,
+                        action_code=None,
+                        summary=_("Niubiz confirmó el pago mediante notificación."),
+                        data=transaction_data,
+                    )
+                else:
+                    handle_failed_payment(
+                        registration,
+                        amount=amount_decimal,
+                        currency=currency,
+                        transaction_id=transaction_id,
+                        status=status_value,
+                        action_code=None,
+                        summary=_("Niubiz reportó un estado no exitoso."),
+                        data=transaction_data,
+                    )
+
+        return "", 200

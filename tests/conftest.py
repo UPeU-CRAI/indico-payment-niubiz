@@ -7,15 +7,15 @@ if ROOT not in sys.path:
 
 import pytest
 
-import indico_payment_niubiz.util as util  # noqa: E402
+import indico_payment_niubiz.client as client_module  # noqa: E402
 import indico_payment_niubiz.controllers as controllers  # noqa: E402
 
-util._ = lambda text: text  # type: ignore
 controllers._ = lambda text: text  # type: ignore
+client_module._ = lambda text: text  # type: ignore
 
 
 @pytest.fixture(autouse=True)
 def _reset_token_cache():
-    util.clear_security_token_cache()
+    client_module.clear_token_cache()
     yield
-    util.clear_security_token_cache()
+    client_module.clear_token_cache()
