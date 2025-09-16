@@ -45,6 +45,11 @@ TRANSACTION_STATUS_ENDPOINTS = {
     'prod': 'https://apiprod.vnforapps.com/api.authorization/v3/authorization/transactions/{merchant_id}/{transaction_id}',
 }
 
+REFUND_ENDPOINTS = {
+    'sandbox': 'https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/refund/{transaction_id}',
+    'prod': 'https://apiprod.vnforapps.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/refund/{transaction_id}',
+}
+
 DEFAULT_TIMEOUT = 30
 
 TOKEN_TTL_SECONDS = 55 * 60
@@ -650,3 +655,56 @@ def query_transaction_status(
         return result
 
     return {'success': False, 'error': _('Failed to query the Niubiz transaction status.')}
+
+
+def refund_transaction(
+    merchant_id: str,
+    transaction_id: str,
+    amount: Any,
+    currency: str,
+    access_token: str,
+    endpoint: str = 'sandbox',
+    *,
+    reason: Optional[str] = None,
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    endpoint_key = _normalize_endpoint(endpoint)
+    url = REFUND_ENDPOINTS[endpoint_key].format(merchant_id=merchant_id, transaction_id=transaction_id)
+    headers = {'Content-Type': 'application/json', 'Authorization': access_token}
+    body: Dict[str, Any] = {'amount': float(amount), 'currency': currency}
+    if reason:
+        body['reason'] = reason
+
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            'POST',
+            url,
+            headers=headers,
+            json=body,
+            error_message=_('Failed to refund the Niubiz transaction.'),
+            allow_token_refresh=True,
+        )
+
+        if result['success']:
+            payload = _safe_json(result['response'])
+            status = _extract_status(payload)
+            logger.info('Niubiz refund for transaction %s completed with status %s',
+                        transaction_id, status or 'UNKNOWN')
+            return {'success': True, 'status': status, 'data': payload, 'access_token': token}
+
+        if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while issuing a refund. Requesting a new token.')
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {
+                    'success': False,
+                    'error': _('Failed to obtain a new Niubiz security token.'),
+                }
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to refund the Niubiz transaction.')}

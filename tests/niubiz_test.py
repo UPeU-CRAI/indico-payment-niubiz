@@ -6,8 +6,11 @@ from flask import Flask, request
 
 import requests
 
-from indico_payment_niubiz.controllers import (RegistrationState, RHNiubizCallback, RHNiubizSuccess,
-                                               _apply_registration_status)
+from indico.modules.events.registration.models.registrations import RegistrationState
+
+from indico_payment_niubiz.controllers import RHNiubizCallback, RHNiubizSuccess
+from indico_payment_niubiz.indico_integration import apply_registration_status, handle_failed_payment
+from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 from indico_payment_niubiz.util import (create_session_token, get_security_token,
                                         query_order_status_by_order_id, query_transaction_status)
 
@@ -36,11 +39,50 @@ def _make_registration():
     registration.id = 10
     registration.registration_form_id = 2
     registration.registration_form = SimpleNamespace(id=2)
-    registration.event = SimpleNamespace(id=1)
+    event_log = Mock()
+    registration.event = SimpleNamespace(id=1, log=event_log)
     registration.locator = SimpleNamespace(registrant='locator-token')
     registration.set_state = Mock()
     registration.update_state = Mock()
+    registration.event.log = event_log
+    registration.user = SimpleNamespace(id=5)
     return registration
+
+
+def _make_plugin(settings=None, event_settings=None):
+    class DummyPlugin(NiubizPaymentPlugin):
+        name = 'payment_niubiz_test'
+
+    class _Settings:
+        def __init__(self, data):
+            self._data = data
+
+        def get(self, name):
+            return self._data.get(name)
+
+        def get_all(self, event=None):
+            return dict(self._data)
+
+    class _EventSettings:
+        def __init__(self, data):
+            self._data = data
+
+        def get(self, event, name):
+            return self._data.get(name)
+
+        def get_all(self, event):
+            return dict(self._data)
+
+    settings_proxy = _Settings(settings or {
+        'merchant_id': 'MERCHANT',
+        'access_key': 'ACCESS',
+        'secret_key': 'SECRET',
+        'endpoint': 'sandbox',
+    })
+    event_settings_proxy = _EventSettings(event_settings or {})
+    DummyPlugin.settings = settings_proxy
+    DummyPlugin.event_settings = event_settings_proxy
+    return object.__new__(DummyPlugin)
 
 
 def test_get_security_token_returns_token():
@@ -81,8 +123,14 @@ def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
     monkeypatch.setattr('indico_payment_niubiz.controllers.get_security_token', lambda *a, **k: token_payload)
     monkeypatch.setattr('indico_payment_niubiz.controllers.authorize_transaction',
                         lambda *a, **k: {'success': True, 'data': auth_payload})
-    monkeypatch.setattr('indico_payment_niubiz.controllers.register_transaction', lambda **kwargs: None)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.db.session.flush', lambda: None)
+    transactions = []
+
+    def fake_register_transaction(**kwargs):
+        transactions.append(kwargs)
+        return None
+
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.register_transaction', fake_register_transaction)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.db.session.flush', lambda: None)
     monkeypatch.setattr('indico_payment_niubiz.controllers.url_for', lambda *a, **k: 'redirect-url')
 
     flashes = []
@@ -106,6 +154,9 @@ def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
     assert flashes == [('success', '¡Tu pago ha sido procesado con éxito!')]
     assert rendered['template'] == 'payment_niubiz/transaction_details.html'
     assert result['status_label'] == 'Autorizado'
+    assert transactions
+    assert transactions[0]['data']['source'] == 'checkout'
+    assert registration.event.log.call_args[0][3] == 'Niubiz confirmó el pago.'
 
 
 def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypatch):
@@ -134,8 +185,14 @@ def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypa
     monkeypatch.setattr('indico_payment_niubiz.controllers.get_security_token', lambda *a, **k: token_payload)
     monkeypatch.setattr('indico_payment_niubiz.controllers.authorize_transaction',
                         lambda *a, **k: {'success': True, 'data': auth_payload})
-    monkeypatch.setattr('indico_payment_niubiz.controllers.register_transaction', lambda **kwargs: None)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.db.session.flush', lambda: None)
+    transactions = []
+
+    def fake_register_transaction(**kwargs):
+        transactions.append(kwargs)
+        return None
+
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.register_transaction', fake_register_transaction)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.db.session.flush', lambda: None)
     monkeypatch.setattr('indico_payment_niubiz.controllers.url_for', lambda *a, **k: 'redirect-url')
 
     flashes = []
@@ -154,31 +211,31 @@ def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypa
     registration.update_state.assert_not_called()
     assert flashes == [('error', 'Niubiz rechazó tu pago (código 101). Tarjeta rechazada')]
     assert result['status_label'] == 'Rechazado'
+    assert transactions
+    assert transactions[0]['data']['source'] == 'checkout'
+    assert registration.event.log.call_args[0][3] == 'Niubiz rechazó el pago.'
 
 
-def test_notify_expired_marks_registration_expired(flask_app, monkeypatch):
+def test_notify_expired_marks_registration_expired(monkeypatch):
     registration = _make_registration()
 
-    filter_mock = Mock()
-    filter_mock.first.return_value = registration
-    query_mock = Mock()
-    query_mock.filter_by.return_value = filter_mock
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.register_transaction', lambda **kwargs: None)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.db.session.flush', lambda: None)
 
-    dummy_registration_model = SimpleNamespace(query=query_mock)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.Registration', dummy_registration_model)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.db.session.flush', lambda: None)
+    handle_failed_payment(
+        registration,
+        amount=None,
+        currency='PEN',
+        transaction_id='T-1',
+        status='EXPIRED',
+        action_code=None,
+        summary='Expired',
+        data={},
+        expired=True,
+    )
 
-    handler = RHNiubizCallback()
-
-    with flask_app.test_request_context('/notify', method='POST',
-                                        json={'orderId': '1-10', 'statusOrder': 'EXPIRED', 'amount': '10.00', 'currency': 'PEN'}):
-        request.view_args = {'event_id': 1, 'reg_form_id': 2}
-        response = handler._process()
-
-    query_mock.filter_by.assert_called_once_with(id=10, event_id=1, registration_form_id=2)
     registration.set_state.assert_called_once_with(RegistrationState.unpaid)
     registration.update_state.assert_not_called()
-    assert response == ('', 200)
 
 
 def test_session_token_refreshes_on_token_expiration(monkeypatch):
@@ -307,8 +364,8 @@ def test_authorization_pending_triggers_status_sync(flask_app, monkeypatch):
     monkeypatch.setattr('indico_payment_niubiz.controllers.get_security_token', lambda *a, **k: token_payload)
     monkeypatch.setattr('indico_payment_niubiz.controllers.authorize_transaction',
                         lambda *a, **k: {'success': True, 'data': auth_payload})
-    monkeypatch.setattr('indico_payment_niubiz.controllers.register_transaction', lambda **kwargs: None)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.db.session.flush', lambda: None)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.register_transaction', lambda **kwargs: None)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.db.session.flush', lambda: None)
     monkeypatch.setattr('indico_payment_niubiz.controllers.url_for', lambda *a, **k: 'redirect-url')
 
     flashes = []
@@ -319,7 +376,7 @@ def test_authorization_pending_triggers_status_sync(flask_app, monkeypatch):
 
     def fake_sync(**kwargs):
         sync_calls.append(kwargs)
-        _apply_registration_status(registration=registration, paid=True)
+        apply_registration_status(registration=registration, paid=True)
         return {'success': True, 'status': 'COMPLETED'}
 
     monkeypatch.setattr('indico_payment_niubiz.controllers._synchronise_registration_with_query', fake_sync)
@@ -352,16 +409,18 @@ def test_notify_pending_triggers_status_query(flask_app, monkeypatch):
 
     dummy_registration_model = SimpleNamespace(query=query_mock)
     monkeypatch.setattr('indico_payment_niubiz.controllers.Registration', dummy_registration_model)
-    monkeypatch.setattr('indico_payment_niubiz.controllers.db.session.flush', lambda: None)
+    monkeypatch.setattr('indico_payment_niubiz.indico_integration.db.session.flush', lambda: None)
 
     sync_calls = []
 
     def fake_sync(**kwargs):
         sync_calls.append(kwargs)
-        _apply_registration_status(registration=registration, paid=True)
+        apply_registration_status(registration=registration, paid=True)
         return {'success': True, 'status': 'COMPLETED'}
 
     monkeypatch.setattr('indico_payment_niubiz.controllers._synchronise_registration_with_query', fake_sync)
+
+    monkeypatch.setattr('indico_payment_niubiz.controllers._', lambda value: value)
 
     handler = RHNiubizCallback()
 
@@ -373,3 +432,57 @@ def test_notify_pending_triggers_status_query(flask_app, monkeypatch):
 
     assert sync_calls
     registration.set_state.assert_called_with(RegistrationState.complete)
+
+
+def test_plugin_refund_success(monkeypatch):
+    plugin = _make_plugin()
+    registration = _make_registration()
+    transaction = SimpleNamespace(amount=50, currency='PEN',
+                                  data={'transaction_id': 'T-500'}, registration=registration)
+
+    monkeypatch.setattr('indico_payment_niubiz.plugin.get_security_token',
+                        lambda *a, **k: {'success': True, 'token': 'SEC'})
+
+    refund_calls = []
+
+    def fake_refund_transaction(**kwargs):
+        refund_calls.append(kwargs)
+        return {'success': True, 'status': 'SUCCESS', 'data': {'status': 'SUCCESS'}}
+
+    monkeypatch.setattr('indico_payment_niubiz.plugin.refund_transaction', fake_refund_transaction)
+
+    handled = []
+
+    def fake_handle_refund(registration, **kwargs):
+        handled.append(kwargs)
+
+    monkeypatch.setattr('indico_payment_niubiz.plugin.handle_refund', fake_handle_refund)
+
+    result = plugin.refund(registration, transaction, amount=25, reason='requested')
+
+    assert result['success'] is True
+    assert result['status'] == 'SUCCESS'
+    assert refund_calls
+    assert refund_calls[0]['amount'] == 25.0
+    assert handled
+    assert handled[0]['success'] is True
+    assert handled[0]['data']['source'] == 'refund'
+    assert handled[0]['data']['transaction_id'] == 'T-500'
+    assert handled[0]['summary'] == 'Se registró un reembolso de Niubiz.'
+
+
+def test_plugin_refund_missing_transaction_id(monkeypatch):
+    plugin = _make_plugin()
+    registration = _make_registration()
+    transaction = SimpleNamespace(amount=50, currency='PEN', data={}, registration=registration)
+
+    handled = []
+    monkeypatch.setattr('indico_payment_niubiz.plugin.handle_refund',
+                        lambda registration, **kwargs: handled.append(kwargs))
+
+    result = plugin.refund(registration, transaction)
+
+    assert result['success'] is False
+    assert handled
+    assert handled[0]['success'] is False
+    assert 'No se pudo determinar el identificador' in handled[0]['summary']

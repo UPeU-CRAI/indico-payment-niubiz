@@ -1,6 +1,10 @@
 from wtforms.fields import SelectField, StringField, TextAreaField
 from wtforms.validators import DataRequired, Optional
 
+import logging
+
+from werkzeug.exceptions import BadRequest
+
 from indico.core.plugins import IndicoPlugin
 from indico.modules.events.payment import (PaymentEventSettingsFormBase, PaymentPluginMixin,
                                            PaymentPluginSettingsFormBase)
@@ -9,6 +13,13 @@ from indico.web.flask.util import url_for
 
 from indico_payment_niubiz import _
 from indico_payment_niubiz.blueprint import blueprint
+from indico_payment_niubiz.indico_integration import build_transaction_data, handle_refund, parse_amount
+from indico_payment_niubiz.settings import (get_credentials_for_event, get_endpoint_for_event,
+                                            get_merchant_id_for_event)
+from indico_payment_niubiz.util import get_security_token, refund_transaction
+
+
+logger = logging.getLogger(__name__)
 
 
 class PluginSettingsForm(PaymentPluginSettingsFormBase):
@@ -138,3 +149,148 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             'cancel_url': url_for('payment_niubiz.cancel', event_id=event.id,
                                   reg_form_id=registration.registration_form.id, reg_id=registration.id),
         })
+
+    def refund(self, registration, transaction=None, amount=None, reason=None, **kwargs):
+        registration = registration or getattr(transaction, 'registration', None)
+        if registration is None:
+            return {'success': False, 'error': _('No se pudo identificar la inscripción a reembolsar.')}
+
+        event = registration.event
+        txn = transaction or getattr(registration, 'transaction', None)
+
+        currency = getattr(txn, 'currency', None) or getattr(registration, 'currency', None) or 'PEN'
+        amount_decimal = parse_amount(amount, None) if amount is not None else None
+        if amount_decimal is None:
+            amount_decimal = parse_amount(getattr(txn, 'amount', None), None)
+        if amount_decimal is None:
+            amount_decimal = parse_amount(getattr(registration, 'price', None), None)
+
+        def _extract_transaction_id(payload):
+            if not isinstance(payload, dict):
+                return None
+            for key in ('transaction_id', 'transactionId', 'TRANSACTION_ID', 'operationNumber'):
+                value = payload.get(key)
+                if value:
+                    return value
+            nested = payload.get('payload') or payload.get('data') or payload.get('ORDER') or payload.get('order')
+            if isinstance(nested, dict):
+                return _extract_transaction_id(nested)
+            return None
+
+        transaction_payload = getattr(txn, 'data', {}) or {}
+        transaction_id = _extract_transaction_id(transaction_payload)
+
+        if transaction_id is None:
+            summary = _('No se pudo determinar el identificador de la transacción de Niubiz para emitir el reembolso.')
+            data = build_transaction_data(source='refund', reason=reason, message=summary)
+            data['currency'] = currency
+            if amount_decimal is not None:
+                data['amount'] = float(amount_decimal)
+            handle_refund(registration,
+                          amount=amount_decimal,
+                          currency=currency,
+                          transaction_id=None,
+                          status=None,
+                          summary=summary,
+                          data=data,
+                          success=False)
+            return {'success': False, 'error': summary}
+
+        try:
+            endpoint = get_endpoint_for_event(event, plugin=self)
+            access_key, secret_key = get_credentials_for_event(event, plugin=self)
+            merchant_id = get_merchant_id_for_event(event, plugin=self)
+        except BadRequest as exc:
+            message = getattr(exc, 'description', str(exc))
+            logger.warning('Cannot issue Niubiz refund for registration %s: %s', getattr(registration, 'id', 'unknown'),
+                           message)
+            data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason,
+                                          message=message)
+            data['currency'] = currency
+            if amount_decimal is not None:
+                data['amount'] = float(amount_decimal)
+            handle_refund(registration,
+                          amount=amount_decimal,
+                          currency=currency,
+                          transaction_id=str(transaction_id),
+                          status=None,
+                          summary=_('El reembolso de Niubiz no se pudo iniciar por una configuración incompleta.'),
+                          data=data,
+                          success=False)
+            return {'success': False, 'error': message}
+
+        token_result = get_security_token(access_key, secret_key, endpoint)
+        if not token_result.get('success'):
+            message = token_result.get('error') or _('No se pudo obtener el token de seguridad de Niubiz.')
+            logger.error('Niubiz refund failed while obtaining security token for registration %s: %s',
+                         getattr(registration, 'id', 'unknown'), message)
+            data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason,
+                                          message=message)
+            data['currency'] = currency
+            if amount_decimal is not None:
+                data['amount'] = float(amount_decimal)
+            handle_refund(registration,
+                          amount=amount_decimal,
+                          currency=currency,
+                          transaction_id=str(transaction_id),
+                          status=None,
+                          summary=_('Niubiz no pudo iniciar el reembolso.'),
+                          data=data,
+                          success=False)
+            return {'success': False, 'error': message}
+
+        access_token = token_result['token']
+
+        refund_data = build_transaction_data(source='refund', transaction_id=str(transaction_id), reason=reason)
+        refund_data['currency'] = currency
+        if amount_decimal is not None:
+            refund_data['amount'] = float(amount_decimal)
+        purchase_number = f"{getattr(registration, 'event_id', '')}-{getattr(registration, 'id', '')}"
+        refund_data['purchase_number'] = purchase_number
+
+        def refresh_token():
+            logger.info('Refreshing Niubiz security token during refund for registration %s.',
+                        getattr(registration, 'id', 'unknown'))
+            return get_security_token(access_key, secret_key, endpoint, force_refresh=True)
+
+        amount_value = float(amount_decimal) if amount_decimal is not None else float(getattr(txn, 'amount', 0) or
+                                                                                      getattr(registration, 'price', 0) or
+                                                                                      0)
+
+        refund_result = refund_transaction(merchant_id=merchant_id,
+                                           transaction_id=str(transaction_id),
+                                           amount=amount_value,
+                                           currency=currency,
+                                           access_token=access_token,
+                                           endpoint=endpoint,
+                                           reason=reason,
+                                           token_refresher=refresh_token)
+
+        payload = refund_result.get('data') or refund_result.get('payload')
+        status = refund_result.get('status')
+        if payload is not None:
+            refund_data['payload'] = payload
+        if status:
+            refund_data['status'] = status
+
+        success = refund_result.get('success') is True
+        summary = (_('Se registró un reembolso de Niubiz.') if success
+                   else _('Niubiz no pudo procesar el reembolso solicitado.'))
+        if not success and refund_result.get('error'):
+            refund_data['error'] = refund_result['error']
+
+        handle_refund(registration,
+                      amount=amount_decimal,
+                      currency=currency,
+                      transaction_id=str(transaction_id),
+                      status=status,
+                      summary=summary,
+                      data=refund_data,
+                      success=success)
+
+        return {
+            'success': success,
+            'status': status,
+            'payload': payload,
+            'error': refund_result.get('error'),
+        }
