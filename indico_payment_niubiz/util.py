@@ -1,5 +1,9 @@
 import base64
 import logging
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import Any, Callable, Dict, Optional
 
 import requests
@@ -26,15 +30,124 @@ CHECKOUT_JS_URLS = {
     'prod': 'https://static-content.vnforapps.com/v2/js/checkout.js',
 }
 
+ORDER_STATUS_ENDPOINTS = {
+    'sandbox': 'https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/{order_id}',
+    'prod': 'https://apiprod.vnforapps.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/{order_id}',
+}
+
+ORDER_EXTERNAL_STATUS_ENDPOINTS = {
+    'sandbox': 'https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/external/{external_id}',
+    'prod': 'https://apiprod.vnforapps.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/external/{external_id}',
+}
+
+TRANSACTION_STATUS_ENDPOINTS = {
+    'sandbox': 'https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/transactions/{merchant_id}/{transaction_id}',
+    'prod': 'https://apiprod.vnforapps.com/api.authorization/v3/authorization/transactions/{merchant_id}/{transaction_id}',
+}
+
 DEFAULT_TIMEOUT = 30
+
+TOKEN_TTL_SECONDS = 55 * 60
+TOKEN_REFRESH_THRESHOLD_SECONDS = 5 * 60
+
+SENSITIVE_KEYS = {
+    'accesskey',
+    'authorization',
+    'card',
+    'cardnumber',
+    'card_number',
+    'cvv',
+    'cvv2',
+    'pan',
+    'secret',
+    'secretkey',
+    'token',
+    'tokenid',
+    'transactiontoken',
+}
 
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _TokenEntry:
+    token: str
+    expires_at: datetime
+
+    def is_valid(self) -> bool:
+        now = datetime.now(timezone.utc)
+        return self.expires_at > now + timedelta(seconds=TOKEN_REFRESH_THRESHOLD_SECONDS)
+
+
+class _NiubizTokenCache:
+    def __init__(self):
+        self._tokens: Dict[tuple, _TokenEntry] = {}
+        self._lock = RLock()
+
+    @staticmethod
+    def _make_key(access_key: str, secret_key: str, endpoint: str) -> tuple:
+        return (endpoint, access_key, secret_key)
+
+    def get(self, access_key: str, secret_key: str, endpoint: str) -> Optional[_TokenEntry]:
+        key = self._make_key(access_key, secret_key, endpoint)
+        with self._lock:
+            entry = self._tokens.get(key)
+            if not entry:
+                return None
+            if entry.is_valid():
+                return entry
+            self._tokens.pop(key, None)
+            return None
+
+    def store(self, access_key: str, secret_key: str, endpoint: str, token: str, expires_at: datetime) -> None:
+        key = self._make_key(access_key, secret_key, endpoint)
+        with self._lock:
+            self._tokens[key] = _TokenEntry(token=token, expires_at=expires_at)
+
+    def invalidate(self, access_key: str, secret_key: str, endpoint: str) -> None:
+        key = self._make_key(access_key, secret_key, endpoint)
+        with self._lock:
+            self._tokens.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._tokens.clear()
+
+
+_TOKEN_CACHE = _NiubizTokenCache()
+
+
 def _normalize_endpoint(endpoint: Optional[str]) -> str:
     endpoint = (endpoint or 'sandbox').lower()
     return 'sandbox' if endpoint == 'sandbox' else 'prod'
+
+
+def _mask_string(value: str) -> str:
+    value = str(value)
+    if len(value) <= 4:
+        return '*' * len(value)
+    if len(value) <= 10:
+        return value[0] + '*' * (len(value) - 2) + value[-1]
+    return f"{value[:6]}{'*' * (len(value) - 10)}{value[-4:]}"
+
+
+def _sanitize_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return payload
+
+    def _sanitize(value: Any, key: Optional[str] = None) -> Any:
+        if isinstance(value, dict):
+            return {k: _sanitize(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_sanitize(item, key) for item in value]
+        if key and key.lower() in SENSITIVE_KEYS:
+            if isinstance(value, str):
+                return _mask_string(value)
+            return '***'
+        return value
+
+    return _sanitize(payload)
 
 
 def _extract_error_message(response: requests.Response) -> str:
@@ -77,6 +190,10 @@ def _perform_request(
     error_message: str,
     allow_token_refresh: bool = False,
 ) -> Dict[str, Any]:
+    sanitized_headers = {k: ('***' if k.lower() == 'authorization' else v) for k, v in headers.items()}
+    sanitized_json = _sanitize_payload(deepcopy(json)) if isinstance(json, dict) else None
+    logger.info('Calling Niubiz API %s %s headers=%s body=%s',
+                method.upper(), url, sanitized_headers, sanitized_json)
     try:
         response = requests.request(method.upper(), url, json=json, headers=headers, timeout=timeout)
         response.raise_for_status()
@@ -106,7 +223,7 @@ def _perform_request(
             formatted = f'{error_message} [HTTP {status_code}] - {message}'
         else:
             formatted = f'{error_message} [HTTP {status_code}]'
-        logger.error('Niubiz API responded with an error: %s', formatted)
+        logger.exception('Niubiz API responded with an error: %s', formatted)
         return {
             'success': False,
             'error': formatted,
@@ -129,7 +246,47 @@ def get_checkout_script_url(endpoint: str = 'sandbox') -> str:
     return CHECKOUT_JS_URLS[endpoint_key]
 
 
-def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbox') -> Dict[str, Any]:
+def invalidate_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbox') -> None:
+    endpoint_key = _normalize_endpoint(endpoint)
+    _TOKEN_CACHE.invalidate(access_key, secret_key, endpoint_key)
+
+
+def clear_security_token_cache() -> None:
+    _TOKEN_CACHE.clear()
+
+
+def _parse_expiration_from_payload(payload: Dict[str, Any]) -> Optional[datetime]:
+    if not isinstance(payload, dict):
+        return None
+    expires_in = payload.get('expiresIn') or payload.get('expires_in')
+    if expires_in:
+        try:
+            seconds = float(expires_in)
+            return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        except (TypeError, ValueError):
+            pass
+    expires_at = payload.get('expiresAt') or payload.get('expirationDate')
+    if isinstance(expires_at, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(expires_at), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+    if isinstance(expires_at, str):
+        try:
+            cleaned = expires_at.replace('Z', '+00:00')
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed
+        except ValueError:
+            return None
+    return None
+
+
+def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbox', *,
+                       force_refresh: bool = False) -> Dict[str, Any]:
     """Generate a security token from the Niubiz security API."""
 
     endpoint_key = _normalize_endpoint(endpoint)
@@ -137,6 +294,19 @@ def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbo
 
     credentials = f'{access_key}:{secret_key}'.encode('utf-8')
     headers = {'Authorization': 'Basic ' + base64.b64encode(credentials).decode('utf-8')}
+
+    if not force_refresh:
+        cached = _TOKEN_CACHE.get(access_key, secret_key, endpoint_key)
+    else:
+        cached = None
+    if cached:
+        logger.info('Using cached Niubiz security token for endpoint %s', endpoint_key)
+        return {
+            'success': True,
+            'token': cached.token,
+            'cached': True,
+            'expires_at': cached.expires_at.isoformat(),
+        }
 
     result = _perform_request('GET', url, headers=headers,
                               error_message=_('Failed to obtain the Niubiz security token.'))
@@ -147,16 +317,20 @@ def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbo
     response = result['response']
 
     token = response.text.strip()
-    if token:
-        logger.info('Niubiz security token obtained successfully for endpoint %s', endpoint_key)
-        return {'success': True, 'token': token}
-
     payload = _safe_json(response)
-    token = payload.get('accessToken', '')
-    if token:
-        logger.info('Niubiz security token obtained successfully for endpoint %s', endpoint_key)
-        return {'success': True, 'token': token, 'payload': payload}
+    if not token:
+        token = payload.get('accessToken') or payload.get('access_token') or ''
 
+    if token:
+        expires_at = _parse_expiration_from_payload(payload) or (datetime.now(timezone.utc) + timedelta(seconds=TOKEN_TTL_SECONDS))
+        _TOKEN_CACHE.store(access_key, secret_key, endpoint_key, token, expires_at)
+        logger.info('Niubiz security token obtained successfully for endpoint %s', endpoint_key)
+        result_payload: Dict[str, Any] = {'success': True, 'token': token, 'expires_at': expires_at.isoformat()}
+        if payload:
+            result_payload['payload'] = payload
+        return result_payload
+
+    invalidate_security_token(access_key, secret_key, endpoint_key)
     logger.error('Niubiz security token response was empty for endpoint %s', endpoint_key)
     return {
         'success': False,
@@ -318,3 +492,161 @@ def authorize_transaction(
         return result
 
     return {'success': False, 'error': _('Failed to authorise the Niubiz transaction.')}
+
+
+def _extract_status(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ''
+    status = payload.get('status') or payload.get('statusOrder')
+    if status:
+        return str(status)
+    order_info = payload.get('order')
+    if isinstance(order_info, dict):
+        status = order_info.get('status')
+        if status:
+            return str(status)
+    data = payload.get('data')
+    if isinstance(data, dict):
+        status = data.get('status') or data.get('STATUS')
+        if status:
+            return str(status)
+    return ''
+
+
+def query_order_status_by_order_id(
+    merchant_id: str,
+    order_id: str,
+    access_token: str,
+    endpoint: str = 'sandbox',
+    *,
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    endpoint_key = _normalize_endpoint(endpoint)
+    url = ORDER_STATUS_ENDPOINTS[endpoint_key].format(merchant_id=merchant_id, order_id=order_id)
+    headers = {'Authorization': access_token, 'Accept': 'application/json'}
+
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            'GET',
+            url,
+            headers=headers,
+            error_message=_('Failed to query the Niubiz order status.'),
+            allow_token_refresh=True,
+        )
+
+        if result['success']:
+            payload = _safe_json(result['response'])
+            status = _extract_status(payload)
+            logger.info('Niubiz order %s status query succeeded with status %s', order_id, status or 'UNKNOWN')
+            return {'success': True, 'status': status, 'payload': payload, 'access_token': token}
+
+        if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while querying order %s. Requesting a new token.', order_id)
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {
+                    'success': False,
+                    'error': _('Failed to obtain a new Niubiz security token.'),
+                }
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to query the Niubiz order status.')}
+
+
+def query_order_status_by_external_id(
+    merchant_id: str,
+    external_id: str,
+    access_token: str,
+    endpoint: str = 'sandbox',
+    *,
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    endpoint_key = _normalize_endpoint(endpoint)
+    url = ORDER_EXTERNAL_STATUS_ENDPOINTS[endpoint_key].format(merchant_id=merchant_id, external_id=external_id)
+    headers = {'Authorization': access_token, 'Accept': 'application/json'}
+
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            'GET',
+            url,
+            headers=headers,
+            error_message=_('Failed to query the Niubiz order status.'),
+            allow_token_refresh=True,
+        )
+
+        if result['success']:
+            payload = _safe_json(result['response'])
+            status = _extract_status(payload)
+            logger.info('Niubiz order (external %s) status query succeeded with status %s',
+                        external_id, status or 'UNKNOWN')
+            return {'success': True, 'status': status, 'payload': payload, 'access_token': token}
+
+        if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while querying order %s (external). Requesting a new token.',
+                        external_id)
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {
+                    'success': False,
+                    'error': _('Failed to obtain a new Niubiz security token.'),
+                }
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to query the Niubiz order status.')}
+
+
+def query_transaction_status(
+    merchant_id: str,
+    transaction_id: str,
+    access_token: str,
+    endpoint: str = 'sandbox',
+    *,
+    token_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    endpoint_key = _normalize_endpoint(endpoint)
+    url = TRANSACTION_STATUS_ENDPOINTS[endpoint_key].format(merchant_id=merchant_id, transaction_id=transaction_id)
+    headers = {'Authorization': access_token, 'Accept': 'application/json'}
+
+    token = access_token
+    for attempt in range(2):
+        headers['Authorization'] = token
+        result = _perform_request(
+            'GET',
+            url,
+            headers=headers,
+            error_message=_('Failed to query the Niubiz transaction status.'),
+            allow_token_refresh=True,
+        )
+
+        if result['success']:
+            payload = _safe_json(result['response'])
+            status = _extract_status(payload)
+            logger.info('Niubiz transaction %s status query succeeded with status %s',
+                        transaction_id, status or 'UNKNOWN')
+            return {'success': True, 'status': status, 'payload': payload, 'access_token': token}
+
+        if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while querying transaction %s. Requesting a new token.',
+                        transaction_id)
+            refreshed = token_refresher()
+            if not refreshed or not refreshed.get('success'):
+                return refreshed or {
+                    'success': False,
+                    'error': _('Failed to obtain a new Niubiz security token.'),
+                }
+            token = refreshed['token']
+            continue
+
+        return result
+
+    return {'success': False, 'error': _('Failed to query the Niubiz transaction status.')}
