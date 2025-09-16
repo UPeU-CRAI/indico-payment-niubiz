@@ -7,7 +7,7 @@ from werkzeug.exceptions import BadRequest
 from indico.core.db import db
 from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.payment.util import register_transaction
-from indico.modules.events.registration.models.registrations import Registration
+from indico.modules.events.registration.models.registrations import Registration, RegistrationState
 from indico.web.flask.util import url_for
 from indico.web.rh import RH
 
@@ -95,18 +95,32 @@ def _apply_registration_status(*, registration, paid=None, cancelled=False, expi
 
     changed = False
 
-    if cancelled:
-        registration.update_state(withdrawn=True, paid=False)
-        changed = True
-    elif expired:
-        registration.update_state(paid=False)
-        changed = True
-    elif paid is True:
-        registration.update_state(paid=True)
-        changed = True
-    elif paid is False:
-        registration.update_state(paid=False)
-        changed = True
+    if hasattr(registration, 'set_state'):
+        if cancelled:
+            registration.set_state(RegistrationState.withdrawn)
+            changed = True
+        elif expired:
+            registration.set_state(RegistrationState.unpaid)
+            changed = True
+        elif paid is True:
+            registration.set_state(RegistrationState.complete)
+            changed = True
+        elif paid is False:
+            registration.set_state(RegistrationState.rejected)
+            changed = True
+    else:
+        if cancelled:
+            registration.update_state(withdrawn=True, paid=False)
+            changed = True
+        elif expired:
+            registration.update_state(paid=False)
+            changed = True
+        elif paid is True:
+            registration.update_state(paid=True)
+            changed = True
+        elif paid is False:
+            registration.update_state(paid=False)
+            changed = True
 
     if changed:
         db.session.flush()
@@ -117,15 +131,23 @@ class RHNiubizCallback(RH):
 
     def _process(self):
         payload = request.get_json(silent=True) or {}
-        logger.info('Received Niubiz callback notification: %s', payload)
 
         event_id = request.view_args['event_id']
         reg_form_id = request.view_args['reg_form_id']
 
         order_info = payload.get('order') if isinstance(payload.get('order'), dict) else {}
-        purchase_number = (payload.get('orderId') or payload.get('purchaseNumber') or
+        external_id = payload.get('externalId')
+        order_id = payload.get('orderId')
+        purchase_number = (order_id or payload.get('purchaseNumber') or
                            order_info.get('purchaseNumber'))
-        reference_number = purchase_number or payload.get('externalId')
+        reference_number = purchase_number or external_id
+        status_value = (payload.get('statusOrder') or '').upper()
+        amount_value = payload.get('amount')
+        currency_value = payload.get('currency')
+
+        logger.info('Received Niubiz callback (externalId=%s, orderId=%s, status=%s, amount=%s, currency=%s)',
+                    external_id, purchase_number, status_value or 'UNKNOWN', amount_value, currency_value)
+        logger.info('Full Niubiz notification payload: %s', payload)
         registration = None
         if reference_number:
             parts = str(reference_number).split('-', 1)
@@ -159,6 +181,8 @@ class RHNiubizCallback(RH):
         elif reference_number:
             logger.info('Could not match Niubiz notification to a registration (purchaseNumber=%s).',
                         reference_number)
+        else:
+            logger.info('Niubiz notification missing reference number. Payload: %s', payload)
 
         return '', 204
 

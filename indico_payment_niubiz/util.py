@@ -106,6 +106,7 @@ def _perform_request(url: str, *, headers: Dict[str, str], json: Optional[Dict[s
             'error': _('Could not communicate with Niubiz. Please try again later.'),
         }
 
+    logger.info('Niubiz API call to %s succeeded with status %s', url, response.status_code)
     return {'success': True, 'response': response}
 
 
@@ -129,11 +130,13 @@ def get_security_token(access_key: str, secret_key: str, endpoint: str = 'sandbo
 
     token = response.text.strip()
     if token:
+        logger.info('Niubiz security token obtained successfully for endpoint %s', endpoint_key)
         return {'success': True, 'token': token}
 
     payload = _safe_json(response)
     token = payload.get('accessToken', '')
     if token:
+        logger.info('Niubiz security token obtained successfully for endpoint %s', endpoint_key)
         return {'success': True, 'token': token, 'payload': payload}
 
     logger.exception('Niubiz security token response was empty.')
@@ -182,15 +185,18 @@ def create_session_token(
             payload = _safe_json(result['response'])
             session_key = payload.get('sessionKey')
             if session_key:
+                logger.info('Niubiz checkout session created successfully for merchant %s', merchant_id)
                 return {'success': True, 'session_key': session_key, 'payload': payload, 'access_token': token}
             logger.exception('Niubiz session token response did not include a sessionKey.')
             return {'success': False, 'error': _('The Niubiz session response was invalid.'), 'payload': payload}
 
         if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while creating a session. Requesting a new token.')
             refreshed = token_refresher()
             if not refreshed or not refreshed.get('success'):
                 return refreshed or {'success': False,
                                      'error': _('Failed to obtain a new Niubiz security token.')}  # pragma: no cover
+            logger.info('New Niubiz security token obtained successfully. Retrying session creation.')
             token = refreshed['token']
             continue
 
@@ -243,13 +249,16 @@ def authorize_transaction(
 
         if result['success']:
             payload = _safe_json(result['response'])
+            logger.info('Niubiz transaction authorised successfully for purchase %s', purchase_number)
             return {'success': True, 'data': payload, 'access_token': token}
 
         if result.get('token_expired') and token_refresher:
+            logger.info('Niubiz security token expired while authorising a transaction. Requesting a new token.')
             refreshed = token_refresher()
             if not refreshed or not refreshed.get('success'):
                 return refreshed or {'success': False,
                                      'error': _('Failed to obtain a new Niubiz security token.')}  # pragma: no cover
+            logger.info('New Niubiz security token obtained successfully. Retrying transaction authorisation.')
             token = refreshed['token']
             continue
 

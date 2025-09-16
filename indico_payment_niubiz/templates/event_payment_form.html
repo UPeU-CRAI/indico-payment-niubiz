@@ -14,7 +14,7 @@
       </form>
     {% else %}
       <p>
-        {% trans amount=format_currency(amount, currency or 'PEN', locale=session.lang) %}You are about to pay {{ amount }} using Niubiz.{% endtrans %}
+        {% trans amount=format_currency(amount, currency or 'PEN', locale=session.lang) %}Estás a punto de pagar {{ amount }} con Niubiz.{% endtrans %}
       </p>
       <div class="d-flex flex-column flex-sm-row gap-2">
         <button type="button" class="btn btn-primary" onclick="launchNiubizCheckout()">
@@ -67,7 +67,7 @@
           }
 
           function handleCheckoutError(error) {
-            const fallback = {{ _('The Niubiz checkout could not be started. Please try again.')|tojson }};
+            const fallback = {{ _('No fue posible iniciar el checkout de Niubiz. Vuelve a intentarlo.')|tojson }};
             const message = buildErrorMessage(error, fallback);
             showCheckoutError(message);
           }
@@ -79,15 +79,15 @@
             const data = response.data || response;
             if (data.error || response.error || data.success === false) {
               const errorMessage = data.error && (data.error.userMessage || data.error.errorMessage || data.error.message);
-              const message = errorMessage || buildErrorMessage(response.error, {{ _('The Niubiz checkout reported an unexpected error. Please try again.')|tojson }});
+              const message = errorMessage || buildErrorMessage(response.error, {{ _('El checkout de Niubiz reportó un error inesperado. Vuelve a intentarlo.')|tojson }});
               showCheckoutError(message);
               return;
             }
             const code = data.ACTION_CODE || data.actionCode;
             if (code && code !== '000') {
               const description = data.ACTION_DESCRIPTION || data.ACTION_MESSAGE || data.actionDescription || data.actionMessage;
-              let message = {{ _('The payment was rejected by Niubiz. Please try again or contact support if the problem persists.')|tojson }};
-              message += ' (code ' + code + ')';
+              let message = {{ _('Niubiz rechazó el pago. Vuelve a intentarlo o contacta al soporte si el problema persiste.')|tojson }};
+              message += ' (código ' + code + ')';
               if (description) {
                 message += ' - ' + description;
               }
@@ -98,7 +98,7 @@
           function launchNiubizCheckout() {
             clearCheckoutError();
             if (typeof VisanetCheckout === 'undefined' || typeof VisanetCheckout.configure !== 'function') {
-              showCheckoutError({{ _('The Niubiz checkout library is not available at the moment.')|tojson }});
+              showCheckoutError({{ _('La librería de checkout de Niubiz no está disponible en este momento.')|tojson }});
               return;
             }
 
@@ -111,7 +111,7 @@
               VisanetCheckout.configure(config);
               const opened = VisanetCheckout.open();
               if (opened === false) {
-                showCheckoutError({{ _('The Niubiz checkout could not be opened. Please try again.')|tojson }});
+                showCheckoutError({{ _('No se pudo abrir el checkout de Niubiz. Vuelve a intentarlo.')|tojson }});
               }
             } catch (error) {
               handleCheckoutError(error);

@@ -4,8 +4,10 @@ from unittest.mock import Mock, patch
 import pytest
 from flask import Flask, request
 
-from indico_payment_niubiz.controllers import RHNiubizCallback, RHNiubizSuccess
-from indico_payment_niubiz.util import get_security_token
+import requests
+
+from indico_payment_niubiz.controllers import RegistrationState, RHNiubizCallback, RHNiubizSuccess
+from indico_payment_niubiz.util import create_session_token, get_security_token
 
 
 def _build_response(*, text='', json_payload=None, status_code=200):
@@ -34,6 +36,8 @@ def _make_registration():
     registration.registration_form = SimpleNamespace(id=2)
     registration.event = SimpleNamespace(id=1)
     registration.locator = SimpleNamespace(registrant='locator-token')
+    registration.set_state = Mock()
+    registration.update_state = Mock()
     return registration
 
 
@@ -51,7 +55,6 @@ def test_get_security_token_returns_token():
 
 def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
     registration = _make_registration()
-    registration.update_state = Mock()
     handler = RHNiubizSuccess()
     handler.registration = registration
     handler.event = registration.event
@@ -96,7 +99,8 @@ def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
                                         environ_overrides={'REMOTE_ADDR': '198.51.100.10'}):
         result = handler._process()
 
-    registration.update_state.assert_called_once_with(paid=True)
+    registration.set_state.assert_called_once_with(RegistrationState.complete)
+    registration.update_state.assert_not_called()
     assert flashes == [('success', 'Tu pago fue autorizado correctamente.')]
     assert rendered['template'] == 'payment_niubiz/transaction_details.html'
     assert result['status_label'] == 'Éxito'
@@ -104,7 +108,6 @@ def test_authorization_success_marks_registration_paid(flask_app, monkeypatch):
 
 def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypatch):
     registration = _make_registration()
-    registration.update_state = Mock()
     handler = RHNiubizSuccess()
     handler.registration = registration
     handler.event = registration.event
@@ -145,14 +148,14 @@ def test_authorization_rejection_marks_registration_rejected(flask_app, monkeypa
                                         environ_overrides={'REMOTE_ADDR': '198.51.100.10'}):
         result = handler._process()
 
-    registration.update_state.assert_called_once_with(paid=False)
+    registration.set_state.assert_called_once_with(RegistrationState.rejected)
+    registration.update_state.assert_not_called()
     assert flashes == [('error', 'Niubiz rechazó tu pago (código 101). Tarjeta rechazada')]
     assert result['status_label'] == 'Rechazado'
 
 
 def test_notify_expired_marks_registration_expired(flask_app, monkeypatch):
     registration = _make_registration()
-    registration.update_state = Mock()
 
     filter_mock = Mock()
     filter_mock.first.return_value = registration
@@ -171,5 +174,31 @@ def test_notify_expired_marks_registration_expired(flask_app, monkeypatch):
         response = handler._process()
 
     query_mock.filter_by.assert_called_once_with(id=10, event_id=1, registration_form_id=2)
-    registration.update_state.assert_called_once_with(paid=False)
+    registration.set_state.assert_called_once_with(RegistrationState.unpaid)
+    registration.update_state.assert_not_called()
     assert response == ('', 204)
+
+
+def test_session_token_refreshes_on_token_expiration(monkeypatch):
+    expired_response = _build_response(json_payload={'errorMessage': 'token expired'}, status_code=401)
+    expired_error = requests.exceptions.HTTPError(response=expired_response)
+    expired_response.raise_for_status.side_effect = expired_error
+
+    success_response = _build_response(json_payload={'sessionKey': 'SESSION123'})
+
+    post_mock = Mock(side_effect=[expired_response, success_response])
+    monkeypatch.setattr('indico_payment_niubiz.util.requests.post', post_mock)
+
+    refreshed_tokens = []
+
+    def refresher():
+        refreshed_tokens.append(True)
+        return {'success': True, 'token': 'NEW_TOKEN'}
+
+    result = create_session_token('MERCHANT', 10, 'PEN', 'OLD_TOKEN', 'sandbox', token_refresher=refresher)
+
+    assert result['success'] is True
+    assert result['session_key'] == 'SESSION123'
+    assert len(refreshed_tokens) == 1
+    assert post_mock.call_count == 2
+    assert post_mock.call_args_list[-1][1]['headers']['Authorization'] == 'NEW_TOKEN'

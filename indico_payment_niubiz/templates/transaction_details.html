@@ -67,11 +67,11 @@
     {% else %}
         {% set status_text = base_status_text %}
     {% endif %}
-    <dt>{% trans %}Estado de la operación{% endtrans %}</dt>
+    <dt>{% trans %}Estado final{% endtrans %}</dt>
     <dd>
         {{ status_text }}
         {% if action_code_value %}
-            <span class="text-muted">({% trans code=action_code_value %}code {{ code }}{% endtrans %})</span>
+            <span class="text-muted">({% trans code=action_code_value %}código {{ code }}{% endtrans %})</span>
         {% endif %}
     </dd>
 {% endblock %}
