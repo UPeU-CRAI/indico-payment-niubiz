@@ -1,133 +1,66 @@
-# Niubiz Payment Plugin
+# Plugin de pagos Niubiz para Indico
 
-The Niubiz payment plugin adds support for processing Indico registration fees
-through the [Niubiz web checkout](https://niubiz.com.pe/). It is a refactor of
-the original PayPal plugin and exposes the Niubiz security, session and
-authorization APIs required for credit and debit card payments (phase 1).
+## 📖 Descripción
+Este plugin permite integrar la pasarela de pagos Niubiz con Indico para procesar pagos en línea con tarjetas de débito y crédito. Una vez instalado, los formularios de inscripción pueden mostrar el botón **Pagar con Niubiz** y registrar automáticamente el estado de cada transacción.
 
-## Prerequisites
+## ⚙️ Requisitos
+- Una instancia de Indico instalada y en funcionamiento.
+- Credenciales de comercio Niubiz (sandbox y/o producción): `merchant_id`, `access_key` y `secret_key`.
+- Certificado SSL/TLS habilitado en el servidor que ejecuta Indico para proteger las notificaciones y el checkout.
 
-Before installing the plugin make sure you have the following:
-
-* Niubiz sandbox credentials (merchant ID, access key and secret key).
-* Access to the Niubiz portal in order to rotate the credentials when needed.
-* An Indico instance where you can install third-party plugins.
-
-## Installation
-
-1. Clone the repository inside the Indico plugin folder (usually
-   `$INDICO_SOURCE/plugins/`).
-2. Install the package in the same virtual environment that runs Indico:
-
+## 🛠 Instalación
+1. Ubícate en la carpeta `indico-plugins/` dentro del entorno donde corre Indico.
+2. Clona el repositorio del plugin:
+   ```bash
+   git clone https://github.com/UPeU-CRAI/indico-payment-niubiz.git
+   ```
+3. Instala el paquete en el entorno virtual de Indico:
    ```bash
    pip install -e indico-payment-niubiz
+   indico setup plugins
    ```
+4. Reinicia los procesos de Indico (web workers, Celery, etc.) para que la nueva extensión quede registrada.
 
-3. Restart the Indico web workers after the installation.
+## 🔑 Configuración en Indico
+1. Ingresa como administrador a **Administración → Plugins → Niubiz**.
+2. Completa los campos requeridos:
+   - `merchant_id`
+   - `access_key`
+   - `secret_key`
+   - `endpoint` (elige `sandbox` o `prod`)
+3. Guarda los cambios. De ser necesario, estos valores pueden sobreescribirse por evento desde **Gestión del evento → Pagos → Niubiz**.
 
-## Configuration
+## 🧪 Pruebas en Sandbox
+1. Activa el plugin en modo sandbox.
+2. Crea un formulario de inscripción con un monto mínimo de 10.00 PEN.
+3. Utiliza los datos de prueba proporcionados por Niubiz:
+   - Tarjeta: `4111111111111111`
+   - Fecha de expiración: cualquier fecha futura
+   - CVV: `123`
+4. Realiza el pago desde el checkout de Niubiz. Un pago exitoso devuelve `ACTION_CODE == "000"` y la inscripción se marca como pagada.
+5. Consulta el historial en Indico para verificar que se registró la transacción y el estado correspondiente.
 
-### Global configuration
+Errores comunes:
+- **401 Unauthorized** → credenciales inválidas.
+- **Token expirado** → el plugin solicita un nuevo token automáticamente y reintenta la operación.
+- **ACTION_CODE != "000"** → transacción rechazada por Niubiz.
 
-Open **Administration → Customisation → Plugins → Niubiz** and fill in the
-credentials provided by Niubiz:
+## 📌 Estados de pago
+- **Pagado** → cuando `ACTION_CODE == "000"` o el callback `/notify` informa `statusOrder == "COMPLETED"`.
+- **Rechazado** → cuando Niubiz devuelve un `ACTION_CODE` distinto de `000`.
+- **Cancelado** → cuando el usuario cancela el proceso de pago desde el checkout.
+- **Expirado** → cuando Niubiz envía un callback con `statusOrder == "EXPIRED"`.
 
-* **Merchant ID** (`merchant_id`) – The store identifier assigned by Niubiz.
-* **Access key** (`access_key`) – Used when requesting a security token.
-* **Secret key** (`secret_key`) – The shared secret associated with the access
-  key.
-* **Environment** (`endpoint`) – Choose *Sandbox* (`apisandbox.vnforappstest.com`)
-  while testing or *Production* (`apiprod.vnforapps.com`) for live payments.
-
-All sensitive fields use masked password widgets. The values are stored in the
-plugin settings and can be overridden per event if necessary.
-
-### Event configuration
-
-Navigate to **Management → Payments** inside the event, enable **Niubiz** and
-specify the credentials that should be used for that specific registration
-form. The per-event form allows overriding the four fields mentioned above. If
-an override is left empty the value from the global plugin configuration is
-used instead.
-
-### Callback configuration
-
-The plugin exposes a webhook endpoint at:
-
+## 📡 Notificaciones de Niubiz
+Configura en el portal de Niubiz la URL del webhook:
 ```
 /event/<event_id>/registrations/<reg_form_id>/payment/response/niubiz/notify
 ```
+El endpoint recibe JSON con `externalId`, `orderId`, `statusOrder`, `amount` y `currency`. Cada notificación se registra en los logs y actualiza el estado de la inscripción en Indico para mantener la trazabilidad.
 
-Configure this URL in the Niubiz dashboard so that asynchronous status updates
-(`COMPLETED`, `EXPIRED`, `CANCELLED`, …) are propagated back to Indico. The
-endpoint expects JSON payloads with `externalId`, `orderId`, `statusOrder`,
-`amount` and `currency` fields and logs every notification for traceability.
-
-## Payment flow
-
-1. The registrant clicks **Pay with Niubiz** on the payment page.
-2. The plugin calls the Niubiz security API to obtain an access token and then
-   requests a session token for the registration purchase.
-3. A Niubiz checkout session is launched client-side using the token and the
-   registrant completes the card payment.
-4. After the checkout returns a `transactionToken`, the plugin authorises the
-   transaction via the Niubiz authorization API. If the response contains
-   `ACTION_CODE = 000` the registration fee is marked as paid in Indico.
-5. The registrant is shown the transaction details (transaction number, amount,
-   currency, status and masked card).
-
-## Sandbox testing workflow
-
-Use the sandbox environment to validate the integration before going live. The
-plugin automatically points to the following Niubiz endpoints when the sandbox
-option is selected:
-
-* Security token – `https://apisandbox.vnforappstest.com/api.security/v1/security`
-* Session token – `https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/token/session/{merchantId}`
-* Authorization – `https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/ecommerce/{merchantId}`
-
-The checkout JavaScript is loaded from `https://static-content-qas.vnforapps.com/v2/js/checkout.js`
-in sandbox and from `https://static-content.vnforapps.com/v2/js/checkout.js` in
-production.
-
-### Recommended test flow
-
-1. Configure the plugin in sandbox mode and verify that Indico can request a
-   security token successfully.
-2. Start a registration payment using the **Pay with Niubiz** button. The
-   plugin will create a `sessionToken` and launch the Niubiz checkout.
-3. Use the test card `4111111111111111` with any future expiry date and a
-   three digit CVV (for example `123`).
-4. Use an amount of at least **10.00 PEN** to avoid antifraud rejections in the
-   sandbox environment.
-5. Complete the checkout. A successful authorization returns
-   `ACTION_CODE == "000"` and marks the registration as paid in Indico. Any
-   other value (for example `129` or `400`) is treated as a rejection and the
-   registration remains unpaid.
-6. The confirmation page shows the order number (`purchaseNumber`), transaction
-   ID, authorization code, masked card, amount, currency and the status of the
-   operation (Éxito, Rechazado, Cancelado o Expirado).
-
-### Status codes
-
-| ACTION_CODE | Meaning in Indico | Resulting state |
-|-------------|-------------------|-----------------|
-| `000`       | Éxito              | Registration marked as paid |
-| Other       | Rechazado         | Registration remains unpaid |
-
-The cancellation flow updates the registration to *Cancelado* (withdrawn) and
-the asynchronous notifications mark it as *Expirado* when Niubiz sends an
-`EXPIRED` status.
-
-### Common errors
-
-* **Invalid credentials (HTTP 401)** – The security token request is rejected
-  when the access key or secret key are wrong. Double check the values in the
-  plugin settings.
-* **Expired security token** – Niubiz tokens are short lived. The plugin
-  automatically refreshes the token and retries the request, but repeated
-  failures can indicate that the system clock is out of sync or that the
-  credentials were rotated. Regenerate the token if needed.
-* **Purchase rejected / Acción denegada (`ACTION_CODE` ≠ `000`)** – The payment
-  was denied by Niubiz. The plugin displays the rejection message returned by
-  Niubiz so the registrant can retry the payment or contact support.
+## ✅ Verificación
+Ejecuta la suite de pruebas automatizadas después de realizar cambios:
+```bash
+pytest
+```
+Las pruebas incluyen mocks de las llamadas a la API de Niubiz y validan el marcado de inscripciones como pagadas, rechazadas o expiradas.
