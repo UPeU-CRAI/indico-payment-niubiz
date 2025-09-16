@@ -50,6 +50,19 @@ form. The per-event form allows overriding the four fields mentioned above. If
 an override is left empty the value from the global plugin configuration is
 used instead.
 
+### Callback configuration
+
+The plugin exposes a webhook endpoint at:
+
+```
+/event/<event_id>/registrations/<reg_form_id>/payment/response/niubiz/notify
+```
+
+Configure this URL in the Niubiz dashboard so that asynchronous status updates
+(`COMPLETED`, `EXPIRED`, `CANCELLED`, …) are propagated back to Indico. The
+endpoint expects JSON payloads with `externalId`, `orderId`, `statusOrder`,
+`amount` and `currency` fields and logs every notification for traceability.
+
 ## Payment flow
 
 1. The registrant clicks **Pay with Niubiz** on the payment page.
@@ -88,10 +101,23 @@ production.
 4. Use an amount of at least **10.00 PEN** to avoid antifraud rejections in the
    sandbox environment.
 5. Complete the checkout. A successful authorization returns
-   `ACTION_CODE == "000"` and marks the registration as paid in Indico.
+   `ACTION_CODE == "000"` and marks the registration as paid in Indico. Any
+   other value (for example `129` or `400`) is treated as a rejection and the
+   registration remains unpaid.
 6. The confirmation page shows the order number (`purchaseNumber`), transaction
    ID, authorization code, masked card, amount, currency and the status of the
-   operation (Éxito, Denegado o Cancelado).
+   operation (Éxito, Rechazado, Cancelado o Expirado).
+
+### Status codes
+
+| ACTION_CODE | Meaning in Indico | Resulting state |
+|-------------|-------------------|-----------------|
+| `000`       | Éxito              | Registration marked as paid |
+| Other       | Rechazado         | Registration remains unpaid |
+
+The cancellation flow updates the registration to *Cancelado* (withdrawn) and
+the asynchronous notifications mark it as *Expirado* when Niubiz sends an
+`EXPIRED` status.
 
 ### Common errors
 
@@ -102,6 +128,6 @@ production.
   automatically refreshes the token and retries the request, but repeated
   failures can indicate that the system clock is out of sync or that the
   credentials were rotated. Regenerate the token if needed.
-* **Purchase rejected (`ACTION_CODE` ≠ `000`)** – The payment was denied by
-  Niubiz. The plugin displays the rejection message returned by Niubiz so the
-  registrant can retry the payment or contact support.
+* **Purchase rejected / Acción denegada (`ACTION_CODE` ≠ `000`)** – The payment
+  was denied by Niubiz. The plugin displays the rejection message returned by
+  Niubiz so the registrant can retry the payment or contact support.
