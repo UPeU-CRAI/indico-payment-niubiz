@@ -5,6 +5,14 @@ through the [Niubiz web checkout](https://niubiz.com.pe/). It is a refactor of
 the original PayPal plugin and exposes the Niubiz security, session and
 authorization APIs required for credit and debit card payments (phase 1).
 
+## Prerequisites
+
+Before installing the plugin make sure you have the following:
+
+* Niubiz sandbox credentials (merchant ID, access key and secret key).
+* Access to the Niubiz portal in order to rotate the credentials when needed.
+* An Indico instance where you can install third-party plugins.
+
 ## Installation
 
 1. Clone the repository inside the Indico plugin folder (usually
@@ -17,7 +25,9 @@ authorization APIs required for credit and debit card payments (phase 1).
 
 3. Restart the Indico web workers after the installation.
 
-## Global configuration
+## Configuration
+
+### Global configuration
 
 Open **Administration → Customisation → Plugins → Niubiz** and fill the
 following fields:
@@ -31,7 +41,7 @@ following fields:
 All sensitive fields use masked password widgets. The values are stored in the
 plugin settings and can be overridden per event if necessary.
 
-## Event configuration
+### Event configuration
 
 Navigate to **Management → Payments** inside the event, enable the Niubiz
 payment method and optionally override the following settings for that specific
@@ -57,11 +67,11 @@ When no event override is provided the global configuration is used.
 5. The registrant is shown the transaction details (transaction number, amount,
    currency, status and masked card).
 
-## Sandbox testing
+## Sandbox testing workflow
 
 Use the sandbox environment to validate the integration before going live. The
-plugin automatically points to the following Niubiz endpoints when the
-sandbox option is selected:
+plugin automatically points to the following Niubiz endpoints when the sandbox
+option is selected:
 
 * Security token – `https://apisandbox.vnforappstest.com/api.security/v1/security`
 * Session token – `https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/token/session/{merchantId}`
@@ -70,3 +80,32 @@ sandbox option is selected:
 The checkout JavaScript is loaded from `https://static-content-qas.vnforapps.com/v2/js/checkout.js`
 in sandbox and from `https://static-content.vnforapps.com/v2/js/checkout.js` in
 production.
+
+### Recommended test flow
+
+1. Configure the plugin in sandbox mode and verify that Indico can request a
+   security token successfully.
+2. Start a registration payment using the **Pay with Niubiz** button. The
+   plugin will create a `sessionToken` and launch the Niubiz checkout.
+3. Use the test card `4111111111111111` with any future expiry date and CVV
+   `123` (or any other value accepted by the sandbox).
+4. Use an amount of at least **10.00 PEN**. Smaller amounts can be rejected by
+   antifraud rules in the sandbox.
+5. Complete the checkout. The Niubiz callback should return
+   `ACTION_CODE == "000"` for a successful authorization.
+6. The registration is marked as paid and the transaction details page displays
+   the purchase number, transaction ID, authorization code, masked card, amount
+   and the final status.
+
+### Common errors
+
+* **Invalid credentials (HTTP 401)** – The security token request is rejected
+  when the access key or secret key are wrong. Double check the values in the
+  plugin settings.
+* **Expired security token** – Niubiz tokens are short lived. The plugin
+  automatically refreshes the token and retries the request, but repeated
+  failures can indicate that the system clock is out of sync or that the
+  credentials were rotated.
+* **Purchase rejected (`ACTION_CODE` ≠ `000`)** – The payment was denied by
+  Niubiz. Check the action description returned in the response for details and
+  ensure the test amount and card number are correct.
