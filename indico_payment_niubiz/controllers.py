@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from flask import flash, redirect, render_template, request
 from flask_pluginengine import current_plugin
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 def _sanitize_log_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize sensitive keys before logging (tokens, keys, etc)."""
     sanitized = {}
     for key, value in payload.items():
         if key.lower() in {"token", "accesstoken", "authorization"}:
@@ -56,11 +57,14 @@ def _sanitize_log_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             sanitized[key] = value
     return sanitized
-
+    
 
 class RHNiubizBase(RH):
     CSRF_ENABLED = False
 
+    # ------------------------------------------------------------------
+    # Argumentos iniciales
+    # ------------------------------------------------------------------
     def _process_args(self):
         self.event_id = request.view_args["event_id"]
         self.reg_form_id = request.view_args["reg_form_id"]
@@ -299,6 +303,7 @@ class RHNiubizSuccess(RHNiubizBase):
         amount_decimal = parse_amount(self._get_amount(), None)
         currency = self._get_currency()
 
+        # 1. Autorizar la transacción
         authorization = client.authorize_transaction(
             transaction_token=transaction_token,
             purchase_number=self._get_purchase_number(),
@@ -322,6 +327,7 @@ class RHNiubizSuccess(RHNiubizBase):
             },
         )
 
+        # 2. Confirmar la transacción
         transaction_id = authorization.get("transaction_id")
         confirmation = None
         confirmation_status = None
@@ -345,11 +351,13 @@ class RHNiubizSuccess(RHNiubizBase):
                     kind=LogKind.negative,
                 )
 
+        # 3. Mapear estado final
         status_label = confirmation_status or authorization.get("status") or ""
         action_code = authorization.get("action_code") or ""
         mapped_details = map_niubiz_status(status=status_label, action_code=action_code)
         mapped_status = mapped_details.status
 
+        # 4. Preparar datos de transacción
         transaction_data = build_transaction_data(
             payload={
                 "authorization": authorization.get("data"),
@@ -379,6 +387,7 @@ class RHNiubizSuccess(RHNiubizBase):
         if confirmation_status and confirmation_status.lower() != "confirmed":
             mapped_status = map_niubiz_status(status=confirmation_status, action_code=action_code).status
 
+        # 5. Actualizar estado en Indico
         if mapped_status == TransactionStatus.successful:
             handle_successful_payment(
                 self.registration,
@@ -414,6 +423,7 @@ class RHNiubizSuccess(RHNiubizBase):
                 "error",
             )
 
+        # 6. Tokenización opcional
         store_token_flag = request.form.get("storeToken") or request.args.get("storeToken")
         if store_token_flag and self._is_tokenization_enabled() and transaction_id:
             token_result = client.tokenize_card({"transactionId": transaction_id})
@@ -427,7 +437,7 @@ class RHNiubizSuccess(RHNiubizBase):
                             payload={"token": token_value, "brand": token_result.get("data", {}).get("brand")},
                             kind=LogKind.positive,
                         )
-                    except Exception:  # pragma: no cover - defensive
+                    except Exception:  # pragma: no cover - defensivo
                         logger.exception("No se pudo almacenar el token de Niubiz")
             else:
                 self._log_step(
@@ -436,6 +446,7 @@ class RHNiubizSuccess(RHNiubizBase):
                     kind=LogKind.negative,
                 )
 
+        # 7. Renderizar vista de confirmación
         context = {
             "registration": self.registration,
             "event": self.event,
@@ -456,8 +467,6 @@ class RHNiubizSuccess(RHNiubizBase):
             "standalone": True,
         }
         return render_template("payment_niubiz/transaction_details.html", **context)
-
-
 class RHNiubizCancel(RHNiubizBase):
     def _process(self):
         amount_decimal = parse_amount(self._get_amount(), None)
@@ -473,6 +482,7 @@ class RHNiubizCancel(RHNiubizBase):
             transaction_data["amount"] = float(amount_decimal)
         else:
             transaction_data["amount"] = float(self._get_amount())
+
         handle_failed_payment(
             self.registration,
             amount=amount_decimal,
@@ -508,13 +518,11 @@ class RHNiubizCallback(RHNiubizBase):
             reg_id = int(parts[1])
         except (TypeError, ValueError):
             return None
-        return (
-            Registration.query.filter_by(
-                id=reg_id,
-                event_id=self.event_id,
-                registration_form_id=self.reg_form_id,
-            ).first()
-        )
+        return Registration.query.filter_by(
+            id=reg_id,
+            event_id=self.event_id,
+            registration_form_id=self.reg_form_id,
+        ).first()
 
     @staticmethod
     def _detect_callback_type(details: Dict[str, Optional[Any]]) -> str:
@@ -524,9 +532,10 @@ class RHNiubizCallback(RHNiubizBase):
             return "pagoefectivo"
         return "pagolink"
 
+
     @staticmethod
-    def _validate_required_fields(details: Dict[str, Optional[Any]], callback_type: str) -> list[str]:
-        missing: list[str] = []
+    def _validate_required_fields(details: Dict[str, Optional[Any]], callback_type: str) -> List[str]:
+        missing: List[str] = []    
         if callback_type == "pagoefectivo":
             if not details.get("cip"):
                 missing.append("cip")
@@ -579,7 +588,7 @@ class RHNiubizCallback(RHNiubizBase):
             return secret
         try:
             _, secret_key = self._get_credentials()
-        except BadRequest:
+        except Exception:
             return None
         return secret_key
 
@@ -610,15 +619,10 @@ class RHNiubizCallback(RHNiubizBase):
         amount_decimal = parse_amount(details.get("amount"), None)
         if amount_decimal is None:
             amount_decimal = parse_amount(getattr(registration, "price", None), None)
-        currency = (
-            details.get("currency")
-            or getattr(registration, "currency", None)
-            or "PEN"
-        )
-
+        currency = details.get("currency") or getattr(registration, "currency", None) or "PEN"
         transaction_id = details.get("transaction_id") or details.get("operation_number")
 
-        # Validate IP whitelist once we have the event context
+        # Validar whitelist de IPs
         remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
         if "," in remote_addr:
             remote_addr = remote_addr.split(",")[0].strip()
@@ -629,6 +633,7 @@ class RHNiubizCallback(RHNiubizBase):
             logger.warning("Niubiz callback rechazado por IP no autorizada: %s", remote_addr)
             raise Forbidden
 
+        # Validar token de autorización
         expected_token = self._get_scoped_setting("callback_authorization_token")
         if expected_token:
             provided = request.headers.get("Authorization", "").strip()
@@ -648,6 +653,7 @@ class RHNiubizCallback(RHNiubizBase):
                 logger.warning("Token inválido en callback de Niubiz desde %s", remote_addr)
                 return "", 401
 
+        # Validar firma HMAC
         signature = request.headers.get("NBZ-Signature")
         secret = self._get_callback_secret()
         if secret and not signature:
@@ -678,6 +684,7 @@ class RHNiubizCallback(RHNiubizBase):
                 logger.warning("Firma HMAC inválida en callback de Niubiz")
                 return "", 401
 
+        # Validar campos requeridos
         callback_type = self._detect_callback_type(details)
         missing = self._validate_required_fields(details, callback_type)
         if missing:
@@ -695,7 +702,7 @@ class RHNiubizCallback(RHNiubizBase):
             self._log_callback_event(summary, LogKind.warning, log_data)
             logger.warning("Niubiz callback con campos faltantes: %s", ", ".join(missing))
             return "", 400
-
+        # Extraer valores de estado
         status_value = details.get("status") or details.get("status_order") or ""
         action_code = details.get("action_code")
         action_description = details.get("action_description")
@@ -713,6 +720,7 @@ class RHNiubizCallback(RHNiubizBase):
         order_id = payload.get("orderId") or details.get("purchase_number")
         external_id = payload.get("externalId")
 
+        # Construcción de datos de transacción
         transaction_data = build_transaction_data(
             payload=payload,
             source="notify",
@@ -750,6 +758,7 @@ class RHNiubizCallback(RHNiubizBase):
         if mapped.manual_confirmation:
             transaction_data["manual_confirmation"] = True
 
+        # Logging del callback
         summary = _("Niubiz callback recibido — mapeado a {status}.").format(
             status=mapped.status.name
         )
@@ -779,6 +788,7 @@ class RHNiubizCallback(RHNiubizBase):
             mapped.status.name,
         )
 
+        # Procesamiento final según estado mapeado
         if mapped.status == TransactionStatus.successful:
             success_summary = _("Niubiz confirmó el pago mediante notificación.")
             if mapped.manual_confirmation:
