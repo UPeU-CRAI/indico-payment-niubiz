@@ -16,7 +16,6 @@ from indico.modules.events.payment import (
     PaymentPluginMixin,
     PaymentPluginSettingsFormBase,
 )
-from indico.modules.events.payment.models.transactions import TransactionStatus
 from indico.web.forms.fields import IndicoPasswordField
 from indico.web.flask.util import url_for
 
@@ -34,7 +33,6 @@ from indico_payment_niubiz.settings import (
     get_endpoint_for_event,
     get_merchant_id_for_event,
 )
-from indico_payment_niubiz.util import map_action_code_to_status
 
 
 logger = logging.getLogger(__name__)
@@ -335,7 +333,6 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         if registration is None:
             return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
 
-        event = registration.event
         txn = transaction or getattr(registration, "transaction", None)
         currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
         amount_decimal = parse_amount(amount, None) if amount is not None else None
@@ -347,122 +344,37 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         transaction_payload = getattr(txn, "data", {}) or {}
         transaction_id = self._extract_transaction_id(transaction_payload)
 
-        if transaction_id is None:
-            summary = _("No se encontró el identificador de la transacción de Niubiz.")
-            data = build_transaction_data(source="refund", reason=reason, message=summary)
-            data["currency"] = currency
-            if amount_decimal is not None:
-                data["amount"] = float(amount_decimal)
-            handle_refund(
-                registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=None,
-                status=None,
-                summary=summary,
-                data=data,
-                success=False,
-            )
-            return {"success": False, "error": summary}
-
-        try:
-            client = self._build_client(event)
-        except BadRequest as exc:
-            message = getattr(exc, "description", str(exc))
-            logger.warning("No se pudo emitir el reembolso de Niubiz: %s", message)
-            data = build_transaction_data(
-                source="refund",
-                transaction_id=str(transaction_id),
-                reason=reason,
-                message=message,
-            )
-            data["currency"] = currency
-            if amount_decimal is not None:
-                data["amount"] = float(amount_decimal)
-            handle_refund(
-                registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=str(transaction_id),
-                status=None,
-                summary=_("No fue posible iniciar el reembolso de Niubiz."),
-                data=data,
-                success=False,
-            )
-            return {"success": False, "error": message}
-
-        amount_value = float(amount_decimal) if amount_decimal is not None else float(
-            getattr(txn, "amount", 0) or getattr(registration, "price", 0) or 0
-        )
-
-        settled = self._is_transaction_settled(transaction_payload)
+        summary = _("Refund requested — not yet implemented")
         logger.info(
-            "Emitiendo %s de Niubiz para la inscripción %s (transaction_id=%s, amount=%s)",
-            "reversal" if not settled else "refund",
+            "Refund requested for Niubiz transaction %s on registration %s",
+            transaction_id or "unknown",
             getattr(registration, "id", "?"),
-            transaction_id,
-            amount_value,
         )
-
-        if not settled:
-            response = client.reverse_transaction(
-                transaction_id=str(transaction_id), amount=amount_value, currency=currency
-            )
-        else:
-            response = client.refund_transaction(
-                transaction_id=str(transaction_id), amount=amount_value, currency=currency, reason=reason
-            )
-
-        payload = response.get("data") or {}
-        status_value = response.get("status") or ""
-        action_code = response.get("action_code") or ""
-        mapped_status = map_action_code_to_status(action_code, status_value)
-        success = response.get("success") and mapped_status == TransactionStatus.successful
 
         data = build_transaction_data(
-            payload=payload or response,
+            payload=transaction_payload or None,
             source="refund",
-            status=status_value or None,
-            action_code=action_code or None,
-            transaction_id=str(transaction_id),
+            transaction_id=str(transaction_id) if transaction_id else None,
             reason=reason,
+            message=summary,
+            status="NOT_IMPLEMENTED",
         )
-        data.update(
-            {
-                "currency": currency,
-                "amount": amount_value,
-                "authorization_code": response.get("authorization_code"),
-                "trace_number": response.get("trace_number"),
-                "brand": response.get("brand"),
-                "masked_card": response.get("masked_card"),
-                "eci": response.get("eci"),
-                "antifraud": response.get("antifraud"),
-            }
-        )
+        data["currency"] = currency
+        if amount_decimal is not None:
+            data["amount"] = float(amount_decimal)
 
-        summary = (
-            _("Se registró un reembolso en Niubiz.")
-            if success
-            else _("Niubiz no pudo procesar el reembolso solicitado.")
-        )
         handle_refund(
             registration,
             amount=amount_decimal,
             currency=currency,
-            transaction_id=str(transaction_id),
-            status=status_value,
+            transaction_id=str(transaction_id) if transaction_id else None,
+            status="NOT_IMPLEMENTED",
             summary=summary,
             data=data,
-            success=bool(success),
+            success=False,
         )
 
-        return {
-            "success": bool(success),
-            "status": status_value,
-            "payload": payload,
-            "mapped_status": mapped_status,
-            "error": response.get("error"),
-        }
+        return {"success": False, "error": summary}
 
     # ------------------------------------------------------------------
     # Token helpers
@@ -479,23 +391,6 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         if isinstance(nested, dict):
             return NiubizPaymentPlugin._extract_transaction_id(nested)
         return None
-
-    @staticmethod
-    def _is_transaction_settled(payload: Dict[str, object]) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        values = []
-        for key in ("status", "STATUS", "query_status", "confirmation_status"):
-            value = payload.get(key)
-            if value:
-                values.append(str(value).lower())
-        nested = payload.get("payload")
-        if isinstance(nested, dict):
-            for key in ("STATUS", "status"):
-                value = nested.get(key)
-                if value:
-                    values.append(str(value).lower())
-        return any(value in {"confirmed", "captured", "settled", "paid", "completed"} for value in values)
 
     def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:
         if user is None:

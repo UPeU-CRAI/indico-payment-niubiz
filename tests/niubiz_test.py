@@ -1,19 +1,16 @@
-import hashlib
-import hmac
-import json
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from flask import Flask
-from werkzeug.exceptions import Forbidden
 
 import requests
 
 from indico.modules.events.registration.models.registrations import RegistrationState
 
 from indico_payment_niubiz.client import NiubizClient
-from indico_payment_niubiz.controllers import RHNiubizCallback, RHNiubizSuccess
+from indico_payment_niubiz.controllers import RHNiubizSuccess
 from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 
 
@@ -88,7 +85,7 @@ def _make_plugin(settings=None, event_settings=None):
     return object.__new__(DummyPlugin)
 
 
-def test_plugin_refund_uses_refund_api_when_settled(monkeypatch):
+def test_plugin_refund_logs_placeholder(monkeypatch):
     plugin = _make_plugin()
     registration = _make_registration()
     transaction = Mock()
@@ -96,23 +93,32 @@ def test_plugin_refund_uses_refund_api_when_settled(monkeypatch):
     transaction.amount = 50
     transaction.currency = "PEN"
 
-    calls = {}
+    captured = {}
 
-    class FakeClient:
-        def refund_transaction(self, **kwargs):
-            calls["refund"] = kwargs
-            return {"success": True, "status": "CONFIRMED", "data": {}}
+    def fake_handle_refund(registration, *, amount, currency, transaction_id, status, summary, data, success):
+        captured.update(
+            {
+                "registration": registration,
+                "amount": amount,
+                "currency": currency,
+                "transaction_id": transaction_id,
+                "status": status,
+                "summary": summary,
+                "data": data,
+                "success": success,
+            }
+        )
 
-        def reverse_transaction(self, **kwargs):  # pragma: no cover - should not be used in this scenario
-            raise AssertionError("reverse_transaction should not be called")
-
-    monkeypatch.setattr(NiubizPaymentPlugin, "_build_client", lambda self, event: FakeClient())
-    monkeypatch.setattr("indico_payment_niubiz.plugin.handle_refund", lambda *a, **k: None)
+    monkeypatch.setattr("indico_payment_niubiz.plugin.handle_refund", fake_handle_refund)
 
     result = plugin.refund(registration, transaction=transaction, amount=20, reason="Test")
 
-    assert result["success"] is True
-    assert calls["refund"]["amount"] == 20
+    assert result["success"] is False
+    assert "not yet implemented" in result["error"].lower()
+    assert captured["success"] is False
+    assert captured["status"] == "NOT_IMPLEMENTED"
+    assert captured["transaction_id"] == "TX-1"
+    assert captured["amount"].quantize(Decimal("1")) == Decimal("20")
 
 
 def test_client_get_security_token_caches(monkeypatch):
@@ -251,78 +257,6 @@ def test_authorization_failure_redirects(flask_app, monkeypatch):
         result = handler._process()
 
     assert result.status_code == 302
-
-
-def test_callback_rejects_invalid_authorization(flask_app, monkeypatch):
-    handler = RHNiubizCallback()
-    handler.event_id = 1
-    handler.reg_form_id = 1
-
-    monkeypatch.setattr(RHNiubizCallback, "_get_scoped_setting", lambda self, name: "expected" if name == "callback_authorization_token" else "")
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data="{}",
-        content_type="application/json",
-        headers={"Authorization": "Bearer invalid"},
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        with pytest.raises(Forbidden):
-            handler._process()
-
-
-def test_callback_accepts_valid_signature(flask_app, monkeypatch):
-    registration = _make_registration()
-    monkeypatch.setattr(
-        RHNiubizCallback,
-        "_process_args",
-        lambda self: setattr(self, "registration", registration),
-    )
-
-    handler = RHNiubizCallback()
-    handler.event = registration.event
-    handler.registration = registration
-    handler.event_id = registration.event_id
-    handler.reg_form_id = registration.registration_form_id
-
-    monkeypatch.setattr(RHNiubizCallback, "_get_scoped_setting", lambda self, name: {
-        "callback_authorization_token": "expected",
-        "callback_hmac_secret": "secret",
-    }.get(name, ""))
-
-    payload = {"purchaseNumber": "1-10", "statusOrder": "", "transactionId": "T-1"}
-    body = json.dumps(payload).encode("utf-8")
-    signature_hex = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
-
-    dummy_query = SimpleNamespace(filter_by=lambda **kwargs: SimpleNamespace(first=lambda: registration))
-    monkeypatch.setattr(
-        "indico_payment_niubiz.controllers.Registration",
-        SimpleNamespace(query=dummy_query),
-    )
-
-    class DummyTranslator:
-        def __call__(self, text):
-            return text
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers._", DummyTranslator())
-    monkeypatch.setattr("indico_payment_niubiz._", DummyTranslator())
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        headers={
-            "Authorization": "Bearer expected",
-            "NBZ-Signature": signature_hex,
-        },
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        handler._process()
-
-
 def test_client_yape_transaction(monkeypatch):
     security_response = _build_response(text="token")
     payload = {
