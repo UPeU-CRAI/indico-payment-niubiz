@@ -31,21 +31,41 @@
         {% set masked_card_value = card_payload %}
     {% endif %}
     {% set transaction_date_value = transaction_date or payload.get('TRANSACTION_DATE') or payload.get('transactionDate') %}
-    <dt>{% trans %}Purchase number{% endtrans %}</dt>
+    <dt>{% trans %}Número de pedido{% endtrans %}</dt>
     <dd>{{ purchase_number_value or '-' }}</dd>
-    <dt>{% trans %}Transaction ID{% endtrans %}</dt>
+    <dt>{% trans %}ID de transacción{% endtrans %}</dt>
     <dd>{{ transaction_id_value or '-' }}</dd>
-    <dt>{% trans %}Authorization code{% endtrans %}</dt>
+    <dt>{% trans %}Código de autorización{% endtrans %}</dt>
     <dd>{{ authorization_code_value or '-' }}</dd>
-    <dt>{% trans %}Masked card{% endtrans %}</dt>
+    <dt>{% trans %}Tarjeta enmascarada{% endtrans %}</dt>
     <dd>{{ masked_card_value or '-' }}</dd>
-    <dt>{% trans %}Date and time{% endtrans %}</dt>
+    <dt>{% trans %}Fecha y hora{% endtrans %}</dt>
     <dd>{{ transaction_date_value or '-' }}</dd>
-    <dt>{% trans %}Amount{% endtrans %}</dt>
-    <dd>{{ format_currency(amount_value, currency_value, locale=session.lang) }}</dd>
-    <dt>{% trans %}Currency{% endtrans %}</dt>
-    <dd>{{ currency_value }}</dd>
-    <dt>{% trans %}Status{% endtrans %}</dt>
+    <dt>{% trans %}Monto y moneda{% endtrans %}</dt>
+    <dd>
+        {{ format_currency(amount_value, currency_value, locale=session.lang) }}
+        <span class="text-muted">({{ currency_value }})</span>
+    </dd>
+    {% set base_status_text = _('Denegado') %}
+    {% if status_label is defined and status_label %}
+        {% set status_text = status_label %}
+    {% elif status_token %}
+        {% set status_lower = status_token.lower() %}
+        {% if status_lower in ('cancelled', 'canceled') %}
+            {% set status_text = _('Cancelado') %}
+        {% elif status_lower in ('expired', 'expirada') %}
+            {% set status_text = _('Expirado') %}
+        {% elif status_lower in ('completed', 'complete', 'success', 'successful') %}
+            {% set status_text = _('Éxito') %}
+        {% else %}
+            {% set status_text = base_status_text %}
+        {% endif %}
+    {% elif success_value %}
+        {% set status_text = _('Éxito') %}
+    {% else %}
+        {% set status_text = base_status_text %}
+    {% endif %}
+    <dt>{% trans %}Estado de la operación{% endtrans %}</dt>
     <dd>
         {{ status_text }}
         {% if action_code_value %}

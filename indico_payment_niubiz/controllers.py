@@ -4,6 +4,7 @@ from flask import flash, redirect, render_template, request
 from flask_pluginengine import current_plugin
 from werkzeug.exceptions import BadRequest
 
+from indico.core.db import db
 from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.payment.util import register_transaction
 from indico.modules.events.registration.models.registrations import Registration
@@ -11,9 +12,7 @@ from indico.web.flask.util import url_for
 from indico.web.rh import RH
 
 from indico_payment_niubiz import _
-from indico_payment_niubiz.util import (NiubizAPIError, NiubizTokenExpired,
-                                        authorize_transaction, create_session_token,
-                                        get_security_token)
+from indico_payment_niubiz.util import authorize_transaction, create_session_token, get_security_token
 
 CANCEL_ACTION = getattr(TransactionAction, 'cancel', TransactionAction.reject)
 SUCCESS_ACTION_CODE = '000'
@@ -90,11 +89,70 @@ class RHNiubizBase(RH):
                 else 'https://static-content.vnforapps.com/v2/js/checkout.js')
 
 
-class RHNiubizCallback(RHNiubizBase):
+def _apply_registration_status(*, registration, paid=None, cancelled=False, expired=False):
+    if registration is None:
+        return
+
+    if cancelled:
+        registration.update_state(withdrawn=True)
+    elif expired:
+        registration.update_state(paid=False)
+    elif paid is True:
+        registration.update_state(paid=True)
+    elif paid is False:
+        registration.update_state(paid=False)
+
+    db.session.flush()
+
+
+class RHNiubizCallback(RH):
+    CSRF_ENABLED = False
+
     def _process(self):
         payload = request.get_json(silent=True) or {}
         logger.info('Received Niubiz callback notification: %s', payload)
-        # Future work: handle asynchronous confirmations (e.g. PagoEfectivo) here.
+
+        event_id = request.view_args['event_id']
+        reg_form_id = request.view_args['reg_form_id']
+
+        order_info = payload.get('order') if isinstance(payload.get('order'), dict) else {}
+        purchase_number = (payload.get('orderId') or payload.get('purchaseNumber') or
+                           order_info.get('purchaseNumber'))
+        reference_number = purchase_number or payload.get('externalId')
+        registration = None
+        if reference_number:
+            parts = str(reference_number).split('-', 1)
+            if len(parts) == 2:
+                _, reg_part = parts
+                try:
+                    reg_id = int(reg_part)
+                except (TypeError, ValueError):
+                    reg_id = None
+                if reg_id is not None:
+                    registration = (Registration.query
+                                    .filter_by(id=reg_id,
+                                               event_id=event_id,
+                                               registration_form_id=reg_form_id)
+                                    .first())
+
+        status_value = (payload.get('statusOrder') or '').upper()
+        if registration and status_value:
+            if status_value == 'COMPLETED':
+                logger.info('Marking registration %s as paid from Niubiz notification.', registration.id)
+                _apply_registration_status(registration=registration, paid=True)
+            elif status_value == 'EXPIRED':
+                logger.info('Marking registration %s as expired from Niubiz notification.', registration.id)
+                _apply_registration_status(registration=registration, expired=True)
+            elif status_value in {'CANCELLED', 'CANCELED'}:
+                logger.info('Marking registration %s as cancelled from Niubiz notification.', registration.id)
+                _apply_registration_status(registration=registration, cancelled=True)
+            else:
+                logger.info('Unhandled Niubiz notification status %s for registration %s.',
+                            status_value, registration.id)
+        elif reference_number:
+            logger.info('Could not match Niubiz notification to a registration (purchaseNumber=%s).',
+                        reference_number)
+
         return '', 204
 
 
@@ -110,40 +168,39 @@ class RHNiubizSuccess(RHNiubizBase):
         redirect_url = url_for('event_registration.display_regform',
                                self.registration.locator.registrant)
 
-        try:
-            access_key, secret_key = self._get_credentials()
-            endpoint = self._get_endpoint()
-            access_token = get_security_token(access_key, secret_key, endpoint)
-        except BadRequest:
-            raise
-        except NiubizAPIError as exc:
-            flash(exc.message, 'error')
+        access_key, secret_key = self._get_credentials()
+        endpoint = self._get_endpoint()
+
+        token_result = get_security_token(access_key, secret_key, endpoint)
+        if not token_result.get('success'):
+            flash(token_result.get('error') or _('The Niubiz security token could not be obtained.'), 'error')
             return redirect(redirect_url)
 
+        access_token = token_result['token']
+
         authorization = None
-        for _ in range(2):
-            try:
-                authorization = authorize_transaction(
-                    self._get_merchant_id(),
-                    transaction_token,
-                    self._get_purchase_number(),
-                    self._get_amount(),
-                    self._get_currency(),
-                    access_token,
-                    endpoint,
-                    client_ip=self._get_client_ip(),
-                )
-                break
-            except NiubizTokenExpired:
-                logger.info('Niubiz security token expired while authorising transaction; refreshing token.')
-                try:
-                    access_token = get_security_token(access_key, secret_key, endpoint)
-                except NiubizAPIError as exc:
-                    flash(exc.message, 'error')
-                    return redirect(redirect_url)
-            except NiubizAPIError as exc:
-                flash(exc.message, 'error')
-                return redirect(redirect_url)
+
+        def refresh_token():
+            logger.info('Refreshing Niubiz security token during transaction authorisation.')
+            return get_security_token(access_key, secret_key, endpoint)
+
+        result = authorize_transaction(
+            self._get_merchant_id(),
+            transaction_token,
+            self._get_purchase_number(),
+            self._get_amount(),
+            self._get_currency(),
+            access_token,
+            endpoint,
+            client_ip=self._get_client_ip(),
+            token_refresher=refresh_token,
+        )
+
+        if not result.get('success'):
+            flash(result.get('error') or _('The Niubiz payment could not be confirmed. Please try again.'), 'error')
+            return redirect(redirect_url)
+
+        authorization = result['data']
 
         if authorization is None:
             flash(_('The Niubiz payment could not be confirmed. Please try again.'), 'error')
@@ -162,7 +219,11 @@ class RHNiubizSuccess(RHNiubizBase):
         success = action_code == SUCCESS_ACTION_CODE
         status_token = (auth_data.get('STATUS') or auth_data.get('status') or '').lower()
 
-        action = TransactionAction.complete if success else TransactionAction.reject
+        status_token = (auth_data.get('STATUS') or auth_data.get('status') or '').lower()
+        cancelled = status_token in {'cancelled', 'canceled'}
+        expired = status_token in {'expired', 'expirada'}
+        action = (TransactionAction.complete if success else
+                  (CANCEL_ACTION if cancelled else TransactionAction.reject))
 
         register_transaction(registration=self.registration,
                              amount=self._get_amount(),
@@ -170,6 +231,15 @@ class RHNiubizSuccess(RHNiubizBase):
                              action=action,
                              provider='niubiz',
                              data=authorization)
+
+        if cancelled:
+            _apply_registration_status(registration=self.registration, cancelled=True)
+        elif expired:
+            _apply_registration_status(registration=self.registration, expired=True)
+        elif success:
+            _apply_registration_status(registration=self.registration, paid=True)
+        else:
+            _apply_registration_status(registration=self.registration, paid=False)
 
         description = (auth_data.get('ACTION_DESCRIPTION') or auth_data.get('ACTION_MESSAGE') or
                         auth_data.get('actionDescription') or auth_data.get('actionMessage') or '')
@@ -193,12 +263,14 @@ class RHNiubizSuccess(RHNiubizBase):
                           auth_data.get('operationNumber') or payload.get('transactionId'))
         transaction_date = (auth_data.get('TRANSACTION_DATE') or auth_data.get('transactionDate'))
 
-        if status_token in {'cancelled', 'canceled'}:
-            status_label = _('Cancelled')
+        if cancelled:
+            status_label = _('Cancelado')
+        elif expired:
+            status_label = _('Expirado')
         elif success:
-            status_label = _('Successful')
+            status_label = _('Éxito')
         else:
-            status_label = _('Declined')
+            status_label = _('Denegado')
 
         context = {
             'registration': self.registration,
@@ -230,6 +302,7 @@ class RHNiubizCancel(RHNiubizBase):
                              action=CANCEL_ACTION,
                              provider='niubiz',
                              data={'status': 'cancelled'})
+        _apply_registration_status(registration=self.registration, cancelled=True)
         flash(_('Pago cancelado por el usuario.'), 'info')
         return redirect(url_for('event_registration.display_regform', self.registration.locator.registrant))
 
@@ -239,39 +312,39 @@ class RHNiubizStart(RHNiubizBase):
         redirect_url = url_for('event_registration.display_regform',
                                self.registration.locator.registrant)
 
-        try:
-            access_key, secret_key = self._get_credentials()
-            endpoint = self._get_endpoint()
-            access_token = get_security_token(access_key, secret_key, endpoint)
-        except BadRequest:
-            raise
-        except NiubizAPIError as exc:
-            flash(exc.message, 'error')
+        access_key, secret_key = self._get_credentials()
+        endpoint = self._get_endpoint()
+
+        token_result = get_security_token(access_key, secret_key, endpoint)
+        if not token_result.get('success'):
+            flash(token_result.get('error') or _('The Niubiz security token could not be obtained.'), 'error')
             return redirect(redirect_url)
 
+        access_token = token_result['token']
+
         session_key = None
-        for _ in range(2):
-            try:
-                session_key = create_session_token(
-                    self._get_merchant_id(),
-                    self._get_amount(),
-                    self._get_currency(),
-                    access_token,
-                    endpoint,
-                    client_ip=self._get_client_ip(),
-                    client_id=f'indico-registration-{self.registration.id}',
-                )
-                break
-            except NiubizTokenExpired:
-                logger.info('Niubiz security token expired while starting checkout; refreshing token.')
-                try:
-                    access_token = get_security_token(access_key, secret_key, endpoint)
-                except NiubizAPIError as exc:
-                    flash(exc.message, 'error')
-                    return redirect(redirect_url)
-            except NiubizAPIError as exc:
-                flash(exc.message, 'error')
-                return redirect(redirect_url)
+
+        def refresh_token():
+            logger.info('Refreshing Niubiz security token while starting checkout session.')
+            return get_security_token(access_key, secret_key, endpoint)
+
+        session_result = create_session_token(
+            self._get_merchant_id(),
+            self._get_amount(),
+            self._get_currency(),
+            access_token,
+            endpoint,
+            client_ip=self._get_client_ip(),
+            client_id=f'indico-registration-{self.registration.id}',
+            token_refresher=refresh_token,
+        )
+
+        if not session_result.get('success'):
+            flash(session_result.get('error') or _('The Niubiz checkout could not be started. Please try again.'),
+                  'error')
+            return redirect(redirect_url)
+
+        session_key = session_result['session_key']
 
         if session_key is None:
             flash(_('The Niubiz checkout could not be started. Please try again.'), 'error')
