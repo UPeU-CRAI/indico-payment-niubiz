@@ -1,14 +1,24 @@
-import hmac
 import hashlib
-import logging
+import hmac
 import ipaddress
-from flask import request, jsonify
-from werkzeug.exceptions import Forbidden, BadRequest
+import logging
+from typing import TYPE_CHECKING
+
+from flask import Blueprint, jsonify, request
+from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.web.rh import RH
-from indico_payment_niubiz.plugin import NiubizPaymentPlugin
+
+if TYPE_CHECKING:  # pragma: no cover - only for type checkers
+    from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 
 logger = logging.getLogger(__name__)
+
+
+def _get_plugin() -> "NiubizPaymentPlugin":
+    from indico_payment_niubiz.plugin import NiubizPaymentPlugin
+
+    return NiubizPaymentPlugin.instance
 
 
 class RHNiubizCallback(RH):
@@ -23,7 +33,7 @@ class RHNiubizCallback(RH):
         if not payload:
             raise BadRequest("No se recibió un JSON válido en el callback de Niubiz.")
 
-        plugin = NiubizPaymentPlugin.instance
+        plugin = _get_plugin()
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
@@ -105,3 +115,12 @@ class RHNiubizCallback(RH):
                     return
             logger.warning("Callback desde IP no autorizada: %s", remote_ip)
             raise Forbidden("IP not allowed")
+
+
+blueprint = Blueprint("payment_niubiz", __name__)
+blueprint.add_url_rule(
+    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/response/niubiz/notify",
+    "callback",
+    RHNiubizCallback,
+    methods=("POST",),
+)

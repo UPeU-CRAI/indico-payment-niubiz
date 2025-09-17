@@ -24,16 +24,37 @@ Este proyecto integra la pasarela de pagos de **Niubiz** dentro del flujo de ins
    sudo systemctl restart indico-celery indico-web
    ```
 
-## Configuración en Indico
+## Configuración de credenciales Niubiz
 
 1. Activa el plugin desde **Administración → Plugins → Niubiz**.
-2. Completa los campos globales:
-   * Merchant ID, Access key y Secret key.
-   * Entorno (`sandbox` o `producción`).
-   * Logo, color del botón y MDD (JSON) si Niubiz lo requiere.
+2. Introduce las credenciales entregadas por Niubiz:
+   * **Merchant ID** (identificador del comercio).
+   * **Access key** y **Secret key** para generar el *security token*.
+   * **Entorno** (`sandbox` o `producción`).
+3. Ajusta las opciones globales del conector según tu contrato:
+   * Logo, color del botón y parámetros MDD (en formato JSON) para los motores antifraude de Niubiz.
    * Métodos de pago habilitados (Tarjeta, Yape, PagoEfectivo, QR) y tokenización.
-   * Opcional: token de autorización/HMAC e IPs adicionales para callbacks.
-3. En cada evento puedes sobrescribir los mismos campos en **Gestión del evento → Pagos → Niubiz**.
+   * Token de autorización/HMAC e IPs adicionales para validar callbacks.
+4. Guarda la configuración y verifica el log del sistema para confirmar que se pudo generar el *security token*.
+
+### Configuración por evento
+
+Cada formulario de registro puede sobrescribir las credenciales y parámetros anteriores desde **Gestión del evento → Pagos → Niubiz**. Esto permite utilizar comercios distintos por evento, habilitar o deshabilitar métodos específicos y definir MDD particulares.
+
+## Soporte de operaciones
+
+El cliente HTTP (`NiubizClient`) y los controladores del plugin encapsulan los endpoints oficiales de Niubiz v3:
+
+* **Pagos con tarjeta y QR** – Autorización (`/api.authorization/v3/authorization/ecommerce/{merchantId}`) con confirmación inmediata.
+* **Reversas** – `POST /api.authorization/v3/authorization/ecommerce/{merchantId}/reverse/{transactionId}`.
+* **Reembolsos** – `POST /api.authorization/v3/authorization/ecommerce/{merchantId}/refund/{transactionId}` con soporte para montos parciales.
+* **Consultas de órdenes** – `GET /api.ordermgmt/api/v1/order/query/{merchantId}/{orderId}` o `.../external/{externalId}` para comercios con Payment Link habilitado.
+* **Consulta de transacciones** – `POST /api.authorization/v3/authorization/transactions/{transactionId}` enviando el `merchantId` en el cuerpo.
+* **Callbacks / webhooks** – Verificación de token, firma HMAC y lista blanca de IPs antes de actualizar el estado en Indico.
+* **Yape** – `POST /api.authorization/v3/authorization/yape/{merchantId}` incluyendo validación de OTP.
+* **PagoEfectivo** – `POST /api.authorization/v3/authorization/pagoefectivo/{merchantId}` para generar CIP y gestionar confirmaciones vía webhook.
+
+Todas estas operaciones quedan registradas en el log del evento junto con la respuesta normalizada que almacena Indico.
 
 ## Flujo de pago
 
@@ -86,6 +107,12 @@ Los datos almacenados incluyen `authorizationCode`, `traceNumber`, `transactionI
 * `NiubizStoredToken` guarda el `tokenId`, marca, tarjeta enmascarada y fecha de expiración vinculados al usuario de Indico.
 * El plugin expone métodos para listar, crear y eliminar tokens reutilizables.
 * En un flujo recurrente (membresías, cuotas) solo se envía el `tokenId`; el plugin llama a `authorize_transaction` y `confirm_transaction` automáticamente, reutilizando el token guardado.
+
+## Limitaciones conocidas
+
+* Las consultas de orden (`query_order_status_by_order_id` y `..._external_id`) dependen de que Niubiz habilite el servicio **Order Management** para el comercio.
+* La API pública solo permite consultar transacciones por `transactionId`; no existe un endpoint documentado para buscar por `purchaseNumber`.
+* Los tokens de sesión y de seguridad tienen caducidad corta, por lo que el plugin fuerza la renovación automática al detectar respuestas 401 de Niubiz.
 
 ## Proceso de certificación
 

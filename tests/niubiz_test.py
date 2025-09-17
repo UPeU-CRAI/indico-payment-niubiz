@@ -9,7 +9,7 @@ import requests
 
 from indico.modules.events.registration.models.registrations import RegistrationState
 
-from indico_payment_niubiz.client import NiubizClient
+from indico_payment_niubiz.client import NiubizClient, _sanitize_payload
 from indico_payment_niubiz.controllers import RHNiubizSuccess
 from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 
@@ -142,6 +142,53 @@ def test_client_get_security_token_caches(monkeypatch):
     assert len(calls) == 1
 
 
+def test_client_get_security_token_from_json(monkeypatch):
+    payload = {"accessToken": "json-token", "expiresIn": 600}
+    response = _build_response(text="ignored", json_payload=payload)
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    client = NiubizClient(merchant_id="MID", access_key="AK", secret_key="SK", endpoint="sandbox")
+
+    result = client.get_security_token()
+
+    assert result["success"] is True
+    assert result["token"] == "json-token"
+    assert result["payload"] == payload
+
+
+def test_sanitize_payload_masks_nested_sensitive_fields():
+    payload = {
+        "outer": {
+            "accessToken": "abcdef123456",
+            "nested": [
+                {"tokenId": "token-1", "maskedCard": "411111******1111"},
+                {"cvv": "123", "pan": "4111111111111111"},
+            ],
+            "details": {"secretKey": "shhhh", "sessionKey": "SESSION-123"},
+        }
+    }
+
+    sanitized = _sanitize_payload(payload)
+
+    assert sanitized["outer"]["accessToken"] == "abcdef**3456"
+    assert sanitized["outer"]["nested"][0]["tokenId"].startswith("t")
+    assert sanitized["outer"]["nested"][0]["tokenId"].endswith("1")
+    assert sanitized["outer"]["nested"][0]["tokenId"] != "token-1"
+    assert sanitized["outer"]["nested"][0]["maskedCard"] == "411111******1111"
+    assert sanitized["outer"]["nested"][1]["pan"] == "411111******1111"
+    assert sanitized["outer"]["nested"][1]["cvv"] == "***"
+    assert sanitized["outer"]["details"]["secretKey"].startswith("s")
+    assert sanitized["outer"]["details"]["secretKey"] != "shhhh"
+    assert sanitized["outer"]["details"]["sessionKey"].startswith("S")
+    assert sanitized["outer"]["details"]["sessionKey"] != "SESSION-123"
+    assert payload["outer"]["accessToken"] == "abcdef123456"
+    assert payload["outer"]["nested"][0]["tokenId"] == "token-1"
+    assert payload["outer"]["details"]["secretKey"] == "shhhh"
+
+
 def test_client_create_session_token_uses_authorization(monkeypatch):
     security_response = _build_response(text="token-value")
     session_payload = {"sessionKey": "session-123", "expirationTime": "2024-05-01T12:00:00"}
@@ -163,6 +210,60 @@ def test_client_create_session_token_uses_authorization(monkeypatch):
     assert result["success"] is True
     assert result["session_key"] == "session-123"
     assert calls == ["token-value"]
+
+
+def test_query_order_status_uses_order_mgmt(monkeypatch):
+    security_response = _build_response(text="token-value")
+    order_payload = {"statusOrder": "PAID"}
+    order_response = _build_response(json_payload=order_payload)
+
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        if "api.security" in url:
+            return security_response
+        calls.append((method, url, headers, json))
+        return order_response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    client = NiubizClient(merchant_id="MID", access_key="AK", secret_key="SK", endpoint="sandbox")
+
+    result = client.query_order_status_by_order_id(order_id="ORDER-1")
+
+    assert result["status"] == "PAID"
+    method, url, headers, body = calls[0]
+    assert method == "GET"
+    assert "api.ordermgmt/api/v1/order/query" in url
+    assert url.endswith("/ORDER-1")
+    assert headers["Authorization"] == "token-value"
+    assert body is None
+
+
+def test_query_transaction_status_uses_post(monkeypatch):
+    security_response = _build_response(text="token-value")
+    transaction_payload = {"data": {"STATUS": "CONFIRMED"}}
+    transaction_response = _build_response(json_payload=transaction_payload)
+
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        if "api.security" in url:
+            return security_response
+        calls.append((method, url, headers, json))
+        return transaction_response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    client = NiubizClient(merchant_id="MID", access_key="AK", secret_key="SK", endpoint="sandbox")
+
+    result = client.query_transaction_status(transaction_id="T-999")
+
+    assert result["status"] == "CONFIRMED"
+    method, url, headers, body = calls[0]
+    assert method == "POST"
+    assert url.endswith("/transactions/T-999")
+    assert headers["Authorization"] == "token-value"
+    assert headers["Content-Type"] == "application/json"
+    assert body == {"merchantId": "MID"}
 
 
 def test_authorization_and_confirmation_success(flask_app, monkeypatch):
