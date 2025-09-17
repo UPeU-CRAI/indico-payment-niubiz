@@ -61,9 +61,6 @@ QUERY_REFUND_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.refund/v1/queryRefund/{merchant_id}",
 }
 
-# -----------------------------
-# Order management (estado de órdenes)
-# -----------------------------
 ORDER_QUERY_ENDPOINTS = {
     "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
     "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
@@ -79,9 +76,6 @@ ORDER_BATCH_QUERY_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/batch/query/{merchant_id}/{batch_id}",
 }
 
-# -----------------------------
-# Medios de pago adicionales
-# -----------------------------
 YAPE_ENDPOINTS = {
     "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/yape/{merchant_id}",
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/yape/{merchant_id}",
@@ -92,9 +86,6 @@ PAGOEFECTIVO_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/pagoefectivo/{merchant_id}",
 }
 
-# -----------------------------
-# Utilidades
-# -----------------------------
 BIN_LOOKUP_ENDPOINTS = {
     "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/bin/{merchant_id}/{bin_number}",
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/bin/{merchant_id}/{bin_number}",
@@ -111,25 +102,9 @@ TOKENIZE_ENDPOINTS = {
 }
 
 
-# -----------------------------
-# Sensibilidad
-# -----------------------------
 SENSITIVE_KEYWORDS = (
-    "accesskey",
-    "access_key",
-    "secret",
-    "secretkey",
-    "token",
-    "tokenid",
-    "transactiontoken",
-    "sessionkey",
-    "cvv",
-    "cvv2",
-    "pan",
-    "cardnumber",
-    "card_number",
-    "otp",
-    "signature",
+    "accesskey", "access_key", "secret", "secretkey", "token", "tokenid", "transactiontoken",
+    "sessionkey", "cvv", "cvv2", "pan", "cardnumber", "card_number", "otp", "signature",
 )
 
 
@@ -141,8 +116,6 @@ class _TokenEntry:
     def is_valid(self) -> bool:
         now = datetime.now(timezone.utc)
         return self.expires_at > now + timedelta(seconds=TOKEN_REFRESH_THRESHOLD_SECONDS)
-
-
 class _TokenCache:
     def __init__(self) -> None:
         self._tokens: Dict[tuple, _TokenEntry] = {}
@@ -161,8 +134,8 @@ class _TokenCache:
                 self._tokens.pop(key, None)
         return None
 
-    def store(self, merchant_id: str, access_key: str, secret_key: str, endpoint: str, token: str,
-              expires_at: datetime) -> None:
+    def store(self, merchant_id: str, access_key: str, secret_key: str, endpoint: str,
+              token: str, expires_at: datetime) -> None:
         key = self._key(merchant_id, access_key, secret_key, endpoint)
         with self._lock:
             self._tokens[key] = _TokenEntry(token=token, expires_at=expires_at)
@@ -201,7 +174,6 @@ def _is_sensitive_key(key: Optional[str]) -> bool:
     if "masked" in key_lower and "card" in key_lower:
         return False
     return any(keyword in key_lower for keyword in SENSITIVE_KEYWORDS)
-
 
 def _sanitize_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, dict):
@@ -282,6 +254,7 @@ class NiubizClient:
             cached = _TOKEN_CACHE.get(self.merchant_id, self.access_key, self.secret_key, self.endpoint)
         else:
             cached = None
+
         if cached:
             logger.info("Using cached Niubiz security token for merchant %s", self.merchant_id)
             return {
@@ -306,6 +279,7 @@ class NiubizClient:
             allow_token_refresh=False,
             include_token=False,
         )
+
         if not result["success"]:
             return result
 
@@ -372,7 +346,11 @@ class NiubizClient:
             body["order"] = {"purchaseNumber": purchase_number}
 
         result = self._perform_request(
-            "POST", url, headers=headers, json=body, error_message=_("Failed to create the Niubiz checkout session."),
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to create the Niubiz checkout session."),
         )
         if not result["success"]:
             return result
@@ -380,7 +358,11 @@ class NiubizClient:
         payload = _safe_json(result["response"])
         session_key = payload.get("sessionKey")
         if not session_key:
-            return {"success": False, "error": _("The Niubiz session response was invalid."), "payload": payload}
+            return {
+                "success": False,
+                "error": _("The Niubiz session response was invalid."),
+                "payload": payload,
+            }
 
         return {
             "success": True,
@@ -420,8 +402,13 @@ class NiubizClient:
         if client_id:
             body["dataMap"]["clientId"] = client_id
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to authorise the Niubiz transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to authorise the Niubiz transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -433,11 +420,20 @@ class NiubizClient:
     def confirm_transaction(self, *, transaction_id: str) -> Dict[str, Any]:
         url = CONFIRMATION_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
-        headers = {"Authorization": token, "Accept": "application/json", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": token,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
         body = {"transactionId": transaction_id}
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to confirm the Niubiz transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to confirm the Niubiz transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -450,10 +446,19 @@ class NiubizClient:
         url = REVERSAL_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
-        body = {"transactionId": transaction_id, "amount": float(amount), "currency": currency}
+        body = {
+            "transactionId": transaction_id,
+            "amount": float(amount),
+            "currency": currency
+        }
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to reverse the Niubiz transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to reverse the Niubiz transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -463,17 +468,33 @@ class NiubizClient:
         return normalized
 
     def refund_transaction(
-        self, *, transaction_id: str, amount: Any, currency: str, reason: Optional[str] = None,
+        self,
+        *,
+        transaction_id: str,
+        amount: Any,
+        currency: str,
+        reason: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = REFUND_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, transaction_id=transaction_id)
+        url = REFUND_ENDPOINTS[self.endpoint].format(
+            merchant_id=self.merchant_id,
+            transaction_id=transaction_id,
+        )
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
-        body: Dict[str, Any] = {"amount": float(amount), "currency": currency}
+        body: Dict[str, Any] = {
+            "amount": float(amount),
+            "currency": currency
+        }
         if reason:
             body["reason"] = reason
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to refund the Niubiz transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to refund the Niubiz transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -488,8 +509,12 @@ class NiubizClient:
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
 
-        result = self._perform_request("GET", url, headers=headers,
-                                       error_message=_("Failed to query Niubiz refund status."))
+        result = self._perform_request(
+            "GET",
+            url,
+            headers=headers,
+            error_message=_("Failed to query Niubiz refund status."),
+        )
         if not result["success"]:
             return result
 
@@ -498,16 +523,20 @@ class NiubizClient:
         payload["access_token"] = token
         return payload
 
-    # ------------------------------------------------------------------
-    # Order management (query endpoints)
-    # ------------------------------------------------------------------
     def query_order(self, order_id: str) -> Dict[str, Any]:
-        url = ORDER_QUERY_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, order_id=order_id)
+        url = ORDER_QUERY_ENDPOINTS[self.endpoint].format(
+            merchant_id=self.merchant_id,
+            order_id=order_id
+        )
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
 
-        result = self._perform_request("GET", url, headers=headers,
-                                       error_message=_("Failed to query Niubiz order by ID."))
+        result = self._perform_request(
+            "GET",
+            url,
+            headers=headers,
+            error_message=_("Failed to query Niubiz order by ID."),
+        )
         if not result["success"]:
             return result
 
@@ -517,12 +546,19 @@ class NiubizClient:
         return payload
 
     def query_order_external(self, external_id: str) -> Dict[str, Any]:
-        url = ORDER_QUERY_EXTERNAL_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, external_id=external_id)
+        url = ORDER_QUERY_EXTERNAL_ENDPOINTS[self.endpoint].format(
+            merchant_id=self.merchant_id,
+            external_id=external_id
+        )
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
 
-        result = self._perform_request("GET", url, headers=headers,
-                                       error_message=_("Failed to query Niubiz order by external ID."))
+        result = self._perform_request(
+            "GET",
+            url,
+            headers=headers,
+            error_message=_("Failed to query Niubiz order by external ID."),
+        )
         if not result["success"]:
             return result
 
@@ -532,12 +568,19 @@ class NiubizClient:
         return payload
 
     def query_order_batch(self, batch_id: str) -> Dict[str, Any]:
-        url = ORDER_BATCH_QUERY_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, batch_id=batch_id)
+        url = ORDER_BATCH_QUERY_ENDPOINTS[self.endpoint].format(
+            merchant_id=self.merchant_id,
+            batch_id=batch_id
+        )
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
 
-        result = self._perform_request("GET", url, headers=headers,
-                                       error_message=_("Failed to query Niubiz order batch."))
+        result = self._perform_request(
+            "GET",
+            url,
+            headers=headers,
+            error_message=_("Failed to query Niubiz order batch."),
+        )
         if not result["success"]:
             return result
 
@@ -546,21 +589,38 @@ class NiubizClient:
         payload["access_token"] = token
         return payload
 
-    # ------------------------------------------------------------------
-    # Extras: Yape, PagoEfectivo, BIN, Antifraud, Tokenization
-    # ------------------------------------------------------------------
-    def yape_transaction(self, *, phone: str, otp: str, amount: Any, purchase_number: str, currency: str) -> Dict[str, Any]:
+    def yape_transaction(
+        self,
+        *,
+        phone: str,
+        otp: str,
+        amount: Any,
+        purchase_number: str,
+        currency: str,
+    ) -> Dict[str, Any]:
         url = YAPE_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
         body = {
             "channel": "yape",
-            "order": {"purchaseNumber": purchase_number, "amount": float(amount), "currency": currency},
-            "dataMap": {"phoneNumber": phone, "otp": otp},
+            "order": {
+                "purchaseNumber": purchase_number,
+                "amount": float(amount),
+                "currency": currency,
+            },
+            "dataMap": {
+                "phoneNumber": phone,
+                "otp": otp,
+            },
         }
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to process the Yape transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to process the Yape transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -570,24 +630,41 @@ class NiubizClient:
         return normalized
 
     def pagoefectivo_transaction(
-        self, *, amount: Any, purchase_number: str, currency: str,
-        expiration_minutes: int = 1440, customer_email: Optional[str] = None, customer_name: Optional[str] = None,
+        self,
+        *,
+        amount: Any,
+        purchase_number: str,
+        currency: str,
+        expiration_minutes: int = 1440,
+        customer_email: Optional[str] = None,
+        customer_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         url = PAGOEFECTIVO_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
         body: Dict[str, Any] = {
             "channel": "pagoefectivo",
-            "order": {"purchaseNumber": purchase_number, "amount": float(amount), "currency": currency},
-            "dataMap": {"timeLimitInMinutes": expiration_minutes},
+            "order": {
+                "purchaseNumber": purchase_number,
+                "amount": float(amount),
+                "currency": currency,
+            },
+            "dataMap": {
+                "timeLimitInMinutes": expiration_minutes,
+            },
         }
         if customer_email:
             body["dataMap"]["customerEmail"] = customer_email
         if customer_name:
             body["dataMap"]["customerName"] = customer_name
 
-        result = self._perform_request("POST", url, headers=headers, json=body,
-                                       error_message=_("Failed to create the PagoEfectivo transaction."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            error_message=_("Failed to create the PagoEfectivo transaction."),
+        )
         if not result["success"]:
             return result
 
@@ -597,12 +674,19 @@ class NiubizClient:
         return normalized
 
     def bin_lookup(self, *, bin_number: str) -> Dict[str, Any]:
-        url = BIN_LOOKUP_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, bin_number=bin_number)
+        url = BIN_LOOKUP_ENDPOINTS[self.endpoint].format(
+            merchant_id=self.merchant_id,
+            bin_number=bin_number,
+        )
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
 
-        result = self._perform_request("GET", url, headers=headers,
-                                       error_message=_("Failed to perform the BIN lookup."))
+        result = self._perform_request(
+            "GET",
+            url,
+            headers=headers,
+            error_message=_("Failed to perform the BIN lookup."),
+        )
         if not result["success"]:
             return result
 
@@ -616,8 +700,13 @@ class NiubizClient:
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
 
-        result = self._perform_request("POST", url, headers=headers, json=data,
-                                       error_message=_("Failed to execute the Niubiz antifraud check."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=data,
+            error_message=_("Failed to execute the Niubiz antifraud check."),
+        )
         if not result["success"]:
             return result
 
@@ -631,8 +720,13 @@ class NiubizClient:
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
 
-        result = self._perform_request("POST", url, headers=headers, json=data,
-                                       error_message=_("Failed to tokenize the card with Niubiz."))
+        result = self._perform_request(
+            "POST",
+            url,
+            headers=headers,
+            json=data,
+            error_message=_("Failed to tokenize the card with Niubiz."),
+        )
         if not result["success"]:
             return result
 
@@ -773,6 +867,6 @@ class NiubizClient:
             "data": payload,
         }
 
-
 def clear_token_cache() -> None:
     _TOKEN_CACHE.clear()
+
