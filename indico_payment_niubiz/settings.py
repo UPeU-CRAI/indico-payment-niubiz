@@ -9,6 +9,7 @@ from indico_payment_niubiz import _
 
 
 def _normalize_optional(value: Any) -> Optional[str]:
+    """Limpia strings y convierte vacíos en None."""
     if isinstance(value, str):
         value = value.strip()
         return value or None
@@ -16,38 +17,41 @@ def _normalize_optional(value: Any) -> Optional[str]:
 
 
 def _resolve_plugin(plugin=None):
+    """Devuelve el plugin actual si no se especifica uno."""
     return plugin or current_plugin
 
 
-def get_scoped_setting(event, name: str, plugin=None):
+def get_scoped_setting(event, name: str, plugin=None) -> Optional[str]:
+    """Obtiene un valor desde configuración de evento o global del plugin."""
     plugin = _resolve_plugin(plugin)
+    # Primero intenta en configuración del evento
     event_value = _normalize_optional(plugin.event_settings.get(event, name))
     if event_value is not None:
         return event_value
+    # Si no hay valor a nivel de evento, usa el global
     return _normalize_optional(plugin.settings.get(name))
 
 
 def get_endpoint_for_event(event, plugin=None) -> str:
-    endpoint = (get_scoped_setting(event, 'endpoint', plugin) or 'sandbox').lower()
-    return 'sandbox' if endpoint == 'sandbox' else 'prod'
+    """Obtiene el entorno configurado (sandbox o prod)."""
+    endpoint = (get_scoped_setting(event, "endpoint", plugin) or "sandbox").lower()
+    return "sandbox" if endpoint == "sandbox" else "prod"
 
 
 def get_credentials_for_event(event, plugin=None):
+    """Obtiene access_key y secret_key, primero por evento, luego global."""
     plugin = _resolve_plugin(plugin)
-    access_key = (plugin.event_settings.get(event, 'access_key') or
-                  plugin.settings.get('access_key'))
-    secret_key = (plugin.event_settings.get(event, 'secret_key') or
-                  plugin.settings.get('secret_key'))
+    access_key = plugin.event_settings.get(event, "access_key") or plugin.settings.get("access_key")
+    secret_key = plugin.event_settings.get(event, "secret_key") or plugin.settings.get("secret_key")
     if not access_key or not secret_key:
-        raise BadRequest(_('Niubiz credentials are not configured.'))
+        raise BadRequest(_("Niubiz credentials are not configured."))
     return access_key, secret_key
 
 
 def get_merchant_id_for_event(event, plugin=None):
+    """Obtiene merchant_id configurado para el evento o global."""
     plugin = _resolve_plugin(plugin)
-    merchant_id = (plugin.event_settings.get(event, 'merchant_id') or
-                   plugin.settings.get('merchant_id'))
+    merchant_id = plugin.event_settings.get(event, "merchant_id") or plugin.settings.get("merchant_id")
     if not merchant_id:
-        raise BadRequest(_('The Niubiz merchant ID is not configured.'))
+        raise BadRequest(_("The Niubiz merchant ID is not configured."))
     return merchant_id
-
