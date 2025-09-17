@@ -2,12 +2,22 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.web.rh import RH
+from indico.modules.events.registration.models.registrations import Registration
+
+from indico_payment_niubiz.indico_integration import (
+    build_transaction_data,
+    handle_successful_payment,
+    handle_failed_payment,
+    parse_amount,
+)
+from indico.modules.logs.models.entries import LogKind
 
 if TYPE_CHECKING:
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
@@ -20,36 +30,28 @@ def _get_plugin() -> "NiubizPaymentPlugin":
     return NiubizPaymentPlugin.instance
 
 
-# ------------------------------------------------------------------------------
-# Resource handler para los callbacks (webhooks) de Niubiz
-# ------------------------------------------------------------------------------
 class RHNiubizCallback(RH):
-    """Maneja los callbacks/webhooks enviados por Niubiz a Indico."""
+    """Maneja los callbacks (webhooks) enviados por Niubiz a Indico."""
 
     def _check_access(self):
-        """No se requiere autenticación de usuario para los callbacks."""
+        # No requiere autenticación del usuario
         return True
 
     def _process(self):
-        # Parsear payload JSON
         payload = request.get_json(force=True, silent=True)
         if not payload:
-            raise BadRequest("No se recibió un JSON válido en el callback de Niubiz.")
+            raise BadRequest("No se recibió un JSON válido.")
 
         plugin = _get_plugin()
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
-        # ----------------------------------------------------------------------
-        # Validaciones de seguridad del callback
-        # ----------------------------------------------------------------------
+        # Seguridad
         self._validate_authorization(event, plugin)
-        self._validate_signature(event, plugin, payload)
+        self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
-        # ----------------------------------------------------------------------
-        # Extraer información clave del payload
-        # ----------------------------------------------------------------------
+        # Extraer datos del payload
         purchase_number = (
             payload.get("order", {}).get("purchaseNumber")
             or payload.get("purchaseNumber")
@@ -64,24 +66,98 @@ class RHNiubizCallback(RH):
             or payload.get("STATUS")
             or payload.get("status")
         )
+        amount = (
+            payload.get("order", {}).get("amount")
+            or payload.get("amount")
+        )
+        currency = (
+            payload.get("order", {}).get("currency")
+            or payload.get("currency")
+            or "PEN"
+        )
+        action_code = (
+            payload.get("order", {}).get("actionCode")
+            or payload.get("actionCode")
+        )
 
         logger.info(
-            "Callback Niubiz recibido: purchase=%s, transaction=%s, status=%s",
-            purchase_number, transaction_id, status
+            "Callback Niubiz: purchase_number=%s, txn_id=%s, status=%s, action_code=%s",
+            purchase_number, transaction_id, status, action_code,
         )
-        logger.debug("Payload completo del callback: %r", payload)
+        logger.debug("Payload completo recibido de Niubiz: %r", payload)
 
-        # 🔧 TODO: Procesar el estado real de la transacción y actualizar en Indico
-        #  - Authorized -> pago exitoso
-        #  - Not Authorized / Rejected -> fallido
-        #  - Voided -> cancelado
-        #  - Pending (ej. Yape, PagoEfectivo) -> espera
+        # Buscar registro
+        registration = self._get_registration_from_purchase_number(purchase_number)
+        if not registration or registration.event_id != event.id:
+            logger.warning("Registro no encontrado o evento incorrecto: %s", purchase_number)
+            raise BadRequest("Registro no válido.")
+
+        # Preparar datos comunes
+        amount_decimal = parse_amount(amount, fallback=Decimal(registration.price or 0))
+        transaction_data = build_transaction_data(
+            payload=payload,
+            source="callback",
+            status=status,
+            transaction_id=transaction_id,
+            order_id=purchase_number,
+            action_code=action_code,
+        )
+
+        # Procesar según estado
+        if status and status.upper() == "AUTHORIZED":
+            summary = "Pago confirmado exitosamente por Niubiz"
+            handle_successful_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary=summary,
+                data=transaction_data,
+            )
+        elif status and status.upper() in {"REJECTED", "NOT AUTHORIZED"}:
+            summary = "Pago rechazado por Niubiz"
+            handle_failed_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary=summary,
+                data=transaction_data,
+            )
+        elif status and status.upper() in {"VOIDED", "CANCELLED"}:
+            summary = "Pago anulado por Niubiz"
+            handle_failed_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary=summary,
+                data=transaction_data,
+                cancelled=True,
+            )
+        elif status and status.upper() == "PENDING":
+            logger.info("Pago en estado pendiente. Se omite actualización.")
+        else:
+            logger.warning("Estado desconocido de pago recibido: %s", status)
 
         return jsonify({"received": True})
 
-    # ----------------------------------------------------------------------
-    # Seguridad: Authorization header
-    # ----------------------------------------------------------------------
+    def _get_registration_from_purchase_number(self, purchase_number: str) -> Registration | None:
+        if not purchase_number or "-" not in purchase_number:
+            return None
+        try:
+            event_id_str, reg_id_str = purchase_number.split("-", 1)
+            return Registration.query.filter_by(id=int(reg_id_str)).first()
+        except Exception:
+            logger.exception("No se pudo parsear purchaseNumber: %s", purchase_number)
+            return None
+
     def _validate_authorization(self, event, plugin):
         expected = plugin._get_setting(event, "callback_authorization_token")
         if expected:
@@ -90,30 +166,26 @@ class RHNiubizCallback(RH):
                 logger.warning("Callback rechazado: token Authorization inválido")
                 raise Forbidden("Invalid Authorization token")
 
-    # ----------------------------------------------------------------------
-    # Seguridad: Validación HMAC NBZ-Signature
-    # ----------------------------------------------------------------------
-    def _validate_signature(self, event, plugin, payload):
+    def _validate_signature(self, event, plugin):
         secret = plugin._get_setting(event, "callback_hmac_secret")
-        if secret:
-            received_sig = request.headers.get("NBZ-Signature")
-            if not received_sig:
-                logger.warning("Callback rechazado: NBZ-Signature faltante")
-                raise Forbidden("Missing NBZ-Signature header")
+        if not secret:
+            return
 
-            computed_sig = hmac.new(
-                secret.encode("utf-8"),
-                msg=request.data,
-                digestmod=hashlib.sha256,
-            ).hexdigest()
+        received_sig = request.headers.get("NBZ-Signature")
+        if not received_sig:
+            logger.warning("Callback rechazado: NBZ-Signature faltante")
+            raise Forbidden("Missing NBZ-Signature header")
 
-            if not hmac.compare_digest(computed_sig, received_sig):
-                logger.warning("Callback rechazado: firma NBZ-Signature inválida")
-                raise Forbidden("Invalid signature")
+        computed_sig = hmac.new(
+            secret.encode("utf-8"),
+            msg=request.data,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
 
-    # ----------------------------------------------------------------------
-    # Seguridad: Validación de IP (whitelist)
-    # ----------------------------------------------------------------------
+        if not hmac.compare_digest(computed_sig, received_sig):
+            logger.warning("Callback rechazado: firma NBZ-Signature inválida")
+            raise Forbidden("Invalid signature")
+
     def _validate_ip(self, event, plugin):
         whitelist = plugin._get_setting(event, "callback_ip_whitelist")
         if not whitelist:
@@ -133,9 +205,9 @@ class RHNiubizCallback(RH):
         raise Forbidden("IP not allowed")
 
 
-# ------------------------------------------------------------------------------
-# Registro de ruta para recibir callbacks desde Niubiz
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Registro del blueprint
+# ----------------------------------------------------------------------
 blueprint = Blueprint("payment_niubiz", __name__)
 blueprint.add_url_rule(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/response/niubiz/notify",
