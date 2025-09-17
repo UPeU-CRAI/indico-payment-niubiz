@@ -9,6 +9,7 @@ from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.web.rh import RH
+from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
 
 from indico_payment_niubiz.indico_integration import (
@@ -16,8 +17,8 @@ from indico_payment_niubiz.indico_integration import (
     handle_successful_payment,
     handle_failed_payment,
     parse_amount,
+    record_payment_transaction,
 )
-from indico.modules.logs.models.entries import LogKind
 
 if TYPE_CHECKING:
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
@@ -39,7 +40,8 @@ class RHNiubizCallback(RH):
 
     def _process(self):
         payload = request.get_json(force=True, silent=True)
-        if not payload:
+        if not isinstance(payload, dict):
+            logger.warning("Callback Niubiz recibido sin JSON válido")
             raise BadRequest("No se recibió un JSON válido.")
 
         plugin = _get_plugin()
@@ -51,49 +53,64 @@ class RHNiubizCallback(RH):
         self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
-        # Extraer datos del payload
-        purchase_number = (
-            payload.get("order", {}).get("purchaseNumber")
-            or payload.get("purchaseNumber")
+        purchase_number = self._extract_value(payload, "purchaseNumber")
+        if not purchase_number:
+            logger.warning("Callback Niubiz sin purchaseNumber. Payload=%r", payload)
+            return jsonify({"received": False, "error": "missing_purchase_number"})
+
+        parsed_event_id, registration_id = self._parse_purchase_number(purchase_number)
+        if registration_id is None:
+            logger.warning("Callback Niubiz con purchaseNumber inválido: %s", purchase_number)
+            return jsonify({"received": False, "error": "invalid_purchase_number"})
+
+        if parsed_event_id is not None and parsed_event_id != event.id:
+            logger.warning(
+                "Callback Niubiz con event_id inconsistente: purchase=%s, esperado=%s, recibido=%s",
+                purchase_number,
+                event.id,
+                parsed_event_id,
+            )
+            return jsonify({"received": False, "error": "event_mismatch"})
+
+        transaction_id = self._extract_value(
+            payload,
+            "transactionId",
+            "operationNumber",
+            "transaction_id",
         )
-        transaction_id = (
-            payload.get("order", {}).get("transactionId")
-            or payload.get("transactionId")
-            or payload.get("operationNumber")
-        )
-        status = (
-            payload.get("dataMap", {}).get("STATUS")
-            or payload.get("STATUS")
-            or payload.get("status")
-        )
-        amount = (
-            payload.get("order", {}).get("amount")
-            or payload.get("amount")
-        )
+        status = self._extract_value(payload, "STATUS", "status")
+        amount = self._extract_value(payload, "amount")
         currency = (
-            payload.get("order", {}).get("currency")
-            or payload.get("currency")
+            self._extract_value(payload, "currency")
+            or getattr(event, "default_currency", None)
             or "PEN"
         )
-        action_code = (
-            payload.get("order", {}).get("actionCode")
-            or payload.get("actionCode")
-        )
+        action_code = self._extract_value(payload, "actionCode")
 
         logger.info(
             "Callback Niubiz: purchase_number=%s, txn_id=%s, status=%s, action_code=%s",
-            purchase_number, transaction_id, status, action_code,
+            purchase_number,
+            transaction_id,
+            status,
+            action_code,
         )
         logger.debug("Payload completo recibido de Niubiz: %r", payload)
 
-        # Buscar registro
-        registration = self._get_registration_from_purchase_number(purchase_number)
+        registration = self._get_registration_from_id(registration_id)
         if not registration or registration.event_id != event.id:
-            logger.warning("Registro no encontrado o evento incorrecto: %s", purchase_number)
-            raise BadRequest("Registro no válido.")
+            logger.warning(
+                "No se encontró inscripción para purchaseNumber=%s en el evento %s",
+                purchase_number,
+                event.id,
+            )
+            return jsonify({"received": False, "error": "registration_not_found"})
 
-        # Preparar datos comunes
-        amount_decimal = parse_amount(amount, fallback=Decimal(registration.price or 0))
+        amount_decimal = parse_amount(
+            amount,
+            fallback=parse_amount(getattr(registration, "price", None), Decimal("0")),
+        )
+        currency = currency or getattr(registration, "currency", None) or "PEN"
+
         transaction_data = build_transaction_data(
             payload=payload,
             source="callback",
@@ -102,9 +119,16 @@ class RHNiubizCallback(RH):
             order_id=purchase_number,
             action_code=action_code,
         )
+        transaction_data.update(
+            {
+                "amount": float(amount_decimal) if amount_decimal is not None else None,
+                "currency": currency,
+            }
+        )
 
-        # Procesar según estado
-        if status and status.upper() == "AUTHORIZED":
+        status_key = (status or "").strip().upper()
+
+        if status_key == "AUTHORIZED":
             summary = "Pago confirmado exitosamente por Niubiz"
             handle_successful_payment(
                 registration,
@@ -116,7 +140,7 @@ class RHNiubizCallback(RH):
                 summary=summary,
                 data=transaction_data,
             )
-        elif status and status.upper() in {"REJECTED", "NOT AUTHORIZED"}:
+        elif status_key in {"REJECTED", "NOT AUTHORIZED", "NOT_AUTHORIZED"}:
             summary = "Pago rechazado por Niubiz"
             handle_failed_payment(
                 registration,
@@ -128,7 +152,7 @@ class RHNiubizCallback(RH):
                 summary=summary,
                 data=transaction_data,
             )
-        elif status and status.upper() in {"VOIDED", "CANCELLED"}:
+        elif status_key in {"VOIDED", "CANCELLED", "CANCELED"}:
             summary = "Pago anulado por Niubiz"
             handle_failed_payment(
                 registration,
@@ -141,21 +165,68 @@ class RHNiubizCallback(RH):
                 data=transaction_data,
                 cancelled=True,
             )
-        elif status and status.upper() == "PENDING":
-            logger.info("Pago en estado pendiente. Se omite actualización.")
+        elif status_key == "PENDING":
+            logger.info(
+                "Pago Niubiz en estado pendiente para purchaseNumber=%s", purchase_number
+            )
+            record_payment_transaction(
+                registration=registration,
+                amount=amount_decimal if amount_decimal is not None else Decimal("0"),
+                currency=currency,
+                action=TransactionAction.pending,
+                data=transaction_data,
+            )
         else:
-            logger.warning("Estado desconocido de pago recibido: %s", status)
+            logger.warning("Estado de pago Niubiz desconocido: %s", status)
+            handle_failed_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary="Estado de pago desconocido recibido desde Niubiz",
+                data=transaction_data,
+            )
 
         return jsonify({"received": True})
 
-    def _get_registration_from_purchase_number(self, purchase_number: str) -> Registration | None:
+    @staticmethod
+    def _extract_value(payload: dict, *keys: str):
+        order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+        data_map = payload.get("dataMap") if isinstance(payload.get("dataMap"), dict) else {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        for key in keys:
+            if key in order and order[key] is not None:
+                return order[key]
+            if key in data_map and data_map[key] is not None:
+                return data_map[key]
+            if key in data and data[key] is not None:
+                return data[key]
+            if key in payload and payload[key] is not None:
+                return payload[key]
+        return None
+
+    @staticmethod
+    def _parse_purchase_number(purchase_number: str) -> tuple[int | None, int | None]:
         if not purchase_number or "-" not in purchase_number:
-            return None
+            return None, None
         try:
             event_id_str, reg_id_str = purchase_number.split("-", 1)
-            return Registration.query.filter_by(id=int(reg_id_str)).first()
+            return int(event_id_str), int(reg_id_str)
+        except (TypeError, ValueError):
+            return None, None
+
+    @staticmethod
+    def _get_registration_from_id(registration_id: int | None) -> Registration | None:
+        if registration_id is None:
+            return None
+        try:
+            return Registration.query.filter_by(id=registration_id).first()
         except Exception:
-            logger.exception("No se pudo parsear purchaseNumber: %s", purchase_number)
+            logger.exception(
+                "No se pudo obtener la inscripción con id=%s", registration_id
+            )
             return None
 
     def _validate_authorization(self, event, plugin):
