@@ -275,9 +275,20 @@ class NiubizClient:
     # Token management helpers
     # ------------------------------------------------------------------
     def clear_cached_token(self) -> None:
+        """Invalidate the cached security token for this client instance."""
         _TOKEN_CACHE.invalidate(self.merchant_id, self.access_key, self.secret_key, self.endpoint)
 
     def get_security_token(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+        """Retrieve a security token from Niubiz.
+
+        Args:
+            force_refresh: When ``True`` skips the cache and forces a network call.
+
+        Returns:
+            Dict[str, Any]: Information about the retrieval attempt. When ``success`` is ``True`` the
+            dictionary contains the ``token`` string and the ``expires_at`` timestamp. On cached
+            responses the ``cached`` flag is included.
+        """
         if not force_refresh:
             cached = _TOKEN_CACHE.get(self.merchant_id, self.access_key, self.secret_key, self.endpoint)
         else:
@@ -352,6 +363,21 @@ class NiubizClient:
         customer_email: Optional[str] = None,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Create a checkout session token in Niubiz.
+
+        Args:
+            amount: Monetary amount of the purchase.
+            purchase_number: Optional merchant purchase identifier.
+            currency: ISO currency code.
+            antifraud_data: Additional antifraud payload to be sent to Niubiz.
+            customer_email: Customer email address for antifraud.
+            client_id: Identifier associated with the client on the merchant side.
+
+        Returns:
+            Dict[str, Any]: Response information that includes the ``session_key`` when
+            successful. Niubiz may report states ``P`` (pending), ``E`` (error), ``S`` (success) or
+            ``T`` (timeout) within the payload.
+        """
         url = SESSION_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -400,6 +426,21 @@ class NiubizClient:
         client_ip: Optional[str] = None,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Authorize a transaction against Niubiz.
+
+        Args:
+            transaction_token: Token returned by the checkout form.
+            purchase_number: Merchant purchase identifier.
+            amount: Monetary amount to authorise.
+            currency: ISO currency code.
+            client_ip: Customer IP used for antifraud evaluation.
+            client_id: Optional merchant-side client identifier.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction information with keys such as ``status``,
+            ``action_code`` and ``transaction_id``. Niubiz reports states ``P`` (pending), ``E``
+            (error), ``S`` (success) or ``T`` (timeout).
+        """
         url = AUTHORIZATION_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -431,6 +472,22 @@ class NiubizClient:
         return normalized
 
     def confirm_transaction(self, *, transaction_id: str) -> Dict[str, Any]:
+        """Confirm a previously authorized Niubiz transaction.
+
+        Args:
+            transaction_id: Identifier returned by Niubiz when the transaction was authorized.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction information that includes ``status``,
+            ``action_code`` and ``transaction_id``. The ``status`` can be ``P`` (pending), ``E``
+            (error), ``S`` (success) or ``T`` (timeout).
+
+        Raises:
+            ValueError: If ``transaction_id`` is empty.
+        """
+        if not transaction_id:
+            raise ValueError(_("The Niubiz transaction ID cannot be empty."))
+
         url = CONFIRMATION_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json", "Content-Type": "application/json"}
@@ -439,14 +496,34 @@ class NiubizClient:
         result = self._perform_request("POST", url, headers=headers, json=body,
                                        error_message=_("Failed to confirm the Niubiz transaction."))
         if not result["success"]:
+            logger.error("Failed to confirm transaction %s: %s", transaction_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         normalized = self._normalize_transaction_payload(payload)
         normalized["access_token"] = token
+        logger.info("Confirmed transaction %s with status %s", transaction_id, normalized.get("status"))
         return normalized
 
     def reverse_transaction(self, *, transaction_id: str, amount: Any, currency: str) -> Dict[str, Any]:
+        """Reverse (void) a transaction in Niubiz.
+
+        Args:
+            transaction_id: Identifier of the transaction to reverse.
+            amount: Monetary amount to reverse.
+            currency: ISO currency code.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction data that includes ``status``, ``action_code``
+            and ``transaction_id`` on success. Niubiz uses states ``P`` (pending), ``E`` (error),
+            ``S`` (success) or ``T`` (timeout).
+
+        Raises:
+            ValueError: If ``transaction_id`` is empty.
+        """
+        if not transaction_id:
+            raise ValueError(_("The Niubiz transaction ID cannot be empty."))
+
         url = REVERSAL_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -455,16 +532,37 @@ class NiubizClient:
         result = self._perform_request("POST", url, headers=headers, json=body,
                                        error_message=_("Failed to reverse the Niubiz transaction."))
         if not result["success"]:
+            logger.error("Failed to reverse transaction %s: %s", transaction_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         normalized = self._normalize_transaction_payload(payload)
         normalized["access_token"] = token
+        logger.info("Reversed transaction %s with status %s", transaction_id, normalized.get("status"))
         return normalized
 
     def refund_transaction(
         self, *, transaction_id: str, amount: Any, currency: str, reason: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Refund an existing Niubiz transaction.
+
+        Args:
+            transaction_id: Identifier of the transaction to refund.
+            amount: Monetary amount to refund.
+            currency: ISO currency code.
+            reason: Optional description of the refund reason.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction data including ``status``, ``action_code`` and
+            ``transaction_id`` when the refund succeeds. Niubiz states may be ``P`` (pending), ``E``
+            (error), ``S`` (success) or ``T`` (timeout).
+
+        Raises:
+            ValueError: If ``transaction_id`` is empty.
+        """
+        if not transaction_id:
+            raise ValueError(_("The Niubiz transaction ID cannot be empty."))
+
         url = REFUND_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, transaction_id=transaction_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -475,15 +573,23 @@ class NiubizClient:
         result = self._perform_request("POST", url, headers=headers, json=body,
                                        error_message=_("Failed to refund the Niubiz transaction."))
         if not result["success"]:
+            logger.error("Failed to refund transaction %s: %s", transaction_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         normalized = self._normalize_transaction_payload(payload)
         normalized["access_token"] = token
+        logger.info("Refunded transaction %s with status %s", transaction_id, normalized.get("status"))
         return normalized
 
     def query_refund(self) -> Dict[str, Any]:
-        """Consulta el estado de devoluciones (refunds)."""
+        """Query the status of refund operations associated with the merchant.
+
+        Returns:
+            Dict[str, Any]: Response payload including ``success`` and ``access_token`` when
+            available. Refund statuses reported by Niubiz may be ``P`` (pending), ``E`` (error),
+            ``S`` (success) or ``T`` (timeout).
+        """
         url = QUERY_REFUND_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
@@ -502,6 +608,22 @@ class NiubizClient:
     # Order management (query endpoints)
     # ------------------------------------------------------------------
     def query_order(self, order_id: str) -> Dict[str, Any]:
+        """Retrieve the status of an order using its Niubiz identifier.
+
+        Args:
+            order_id: Identifier assigned by Niubiz to the order.
+
+        Returns:
+            Dict[str, Any]: Raw order payload augmented with ``success`` and ``access_token`` when
+            successful. Niubiz reports order states such as ``PENDING``, ``COMPLETED``, ``CANCELED``
+            and ``EXPIRED``.
+
+        Raises:
+            ValueError: If ``order_id`` is empty.
+        """
+        if not order_id:
+            raise ValueError(_("The Niubiz order ID cannot be empty."))
+
         url = ORDER_QUERY_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, order_id=order_id)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
@@ -509,14 +631,32 @@ class NiubizClient:
         result = self._perform_request("GET", url, headers=headers,
                                        error_message=_("Failed to query Niubiz order by ID."))
         if not result["success"]:
+            logger.error("Failed to query order %s: %s", order_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         payload.setdefault("success", True)
         payload["access_token"] = token
+        logger.info("Queried order %s with status %s", order_id, self._extract_status(payload))
         return payload
 
     def query_order_external(self, external_id: str) -> Dict[str, Any]:
+        """Retrieve an order status using the merchant external identifier.
+
+        Args:
+            external_id: Merchant-side identifier registered in Niubiz.
+
+        Returns:
+            Dict[str, Any]: Raw order payload augmented with ``success`` and ``access_token`` when
+            successful. Possible states include ``PENDING``, ``COMPLETED``, ``CANCELED`` and
+            ``EXPIRED``.
+
+        Raises:
+            ValueError: If ``external_id`` is empty.
+        """
+        if not external_id:
+            raise ValueError(_("The Niubiz external order ID cannot be empty."))
+
         url = ORDER_QUERY_EXTERNAL_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, external_id=external_id)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
@@ -524,14 +664,32 @@ class NiubizClient:
         result = self._perform_request("GET", url, headers=headers,
                                        error_message=_("Failed to query Niubiz order by external ID."))
         if not result["success"]:
+            logger.error("Failed to query external order %s: %s", external_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         payload.setdefault("success", True)
         payload["access_token"] = token
+        logger.info("Queried external order %s with status %s", external_id, self._extract_status(payload))
         return payload
 
     def query_order_batch(self, batch_id: str) -> Dict[str, Any]:
+        """Retrieve information about a batch of orders.
+
+        Args:
+            batch_id: Identifier of the batch registered in Niubiz.
+
+        Returns:
+            Dict[str, Any]: Raw batch payload augmented with ``success`` and ``access_token`` when
+            successful. Order states within the batch may include ``PENDING``, ``COMPLETED``,
+            ``CANCELED`` and ``EXPIRED``.
+
+        Raises:
+            ValueError: If ``batch_id`` is empty.
+        """
+        if not batch_id:
+            raise ValueError(_("The Niubiz batch ID cannot be empty."))
+
         url = ORDER_BATCH_QUERY_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, batch_id=batch_id)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
@@ -539,17 +697,33 @@ class NiubizClient:
         result = self._perform_request("GET", url, headers=headers,
                                        error_message=_("Failed to query Niubiz order batch."))
         if not result["success"]:
+            logger.error("Failed to query order batch %s: %s", batch_id, result.get("error"))
             return result
 
         payload = _safe_json(result["response"])
         payload.setdefault("success", True)
         payload["access_token"] = token
+        logger.info("Queried order batch %s with status %s", batch_id, self._extract_status(payload))
         return payload
 
     # ------------------------------------------------------------------
     # Extras: Yape, PagoEfectivo, BIN, Antifraud, Tokenization
     # ------------------------------------------------------------------
     def yape_transaction(self, *, phone: str, otp: str, amount: Any, purchase_number: str, currency: str) -> Dict[str, Any]:
+        """Process a Yape transaction via Niubiz.
+
+        Args:
+            phone: Customer phone number associated with Yape.
+            otp: One-time password generated by Yape.
+            amount: Monetary amount to charge.
+            purchase_number: Merchant purchase identifier.
+            currency: ISO currency code.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction data with fields like ``status``, ``action_code``
+            and ``transaction_id`` when successful. Yape transactions share the same Niubiz states
+            ``P`` (pending), ``E`` (error), ``S`` (success) or ``T`` (timeout).
+        """
         url = YAPE_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -573,6 +747,21 @@ class NiubizClient:
         self, *, amount: Any, purchase_number: str, currency: str,
         expiration_minutes: int = 1440, customer_email: Optional[str] = None, customer_name: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Create a PagoEfectivo voucher through Niubiz.
+
+        Args:
+            amount: Monetary amount to charge.
+            purchase_number: Merchant purchase identifier.
+            currency: ISO currency code.
+            expiration_minutes: Validity of the voucher in minutes.
+            customer_email: Optional email for the customer.
+            customer_name: Optional name of the customer.
+
+        Returns:
+            Dict[str, Any]: Normalized transaction data with keys such as ``status``, ``action_code``
+            and ``transaction_id`` when successful. The status follows Niubiz values ``P`` (pending),
+            ``E`` (error), ``S`` (success) or ``T`` (timeout).
+        """
         url = PAGOEFECTIVO_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -597,6 +786,15 @@ class NiubizClient:
         return normalized
 
     def bin_lookup(self, *, bin_number: str) -> Dict[str, Any]:
+        """Retrieve BIN information from Niubiz.
+
+        Args:
+            bin_number: Bank identification number to look up.
+
+        Returns:
+            Dict[str, Any]: Response payload containing card brand and additional metadata together
+            with ``success`` and ``access_token`` when successful.
+        """
         url = BIN_LOOKUP_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id, bin_number=bin_number)
         token = self._ensure_token()
         headers = {"Authorization": token, "Accept": "application/json"}
@@ -612,6 +810,15 @@ class NiubizClient:
         return payload
 
     def antifraud_check(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute the Niubiz antifraud validation service.
+
+        Args:
+            data: Antifraud payload expected by Niubiz.
+
+        Returns:
+            Dict[str, Any]: Response payload including ``success`` and ``access_token`` when
+            successful, along with antifraud evaluation results.
+        """
         url = ANTIFRAUD_ENDPOINTS[self.endpoint]
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
@@ -627,6 +834,15 @@ class NiubizClient:
         return payload
 
     def tokenize_card(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Tokenize a card through Niubiz.
+
+        Args:
+            data: Card information payload as expected by Niubiz.
+
+        Returns:
+            Dict[str, Any]: Response payload including the generated token, ``success`` and
+            ``access_token`` on success.
+        """
         url = TOKENIZE_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {"Content-Type": "application/json", "Authorization": token}
