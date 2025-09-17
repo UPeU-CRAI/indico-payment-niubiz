@@ -38,34 +38,19 @@ AUTHORIZATION_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/ecommerce/{merchant_id}",
 }
 
-ORDER_STATUS_ENDPOINTS = {
-    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
-    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
-}
-
-ORDER_EXTERNAL_STATUS_ENDPOINTS = {
-    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
-    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
-}
-
-TRANSACTION_STATUS_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/transactions/{transaction_id}",
-    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/transactions/{transaction_id}",
-}
-
 CONFIRMATION_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.confirmation/v1/confirmation/ecommerce/{merchant_id}/{transaction_id}",
-    "prod": "https://apiprod.vnforapps.com/api.confirmation/v1/confirmation/ecommerce/{merchant_id}/{transaction_id}",
+    "sandbox": "https://apisandbox.vnforappstest.com/api.confirmation/v1/confirmation/ecommerce/{merchant_id}",
+    "prod": "https://apiprod.vnforapps.com/api.confirmation/v1/confirmation/ecommerce/{merchant_id}",
 }
 
 REVERSAL_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/reverse/{transaction_id}",
-    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/reverse/{transaction_id}",
+    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/reverse/ecommerce/{merchant_id}",
+    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/reverse/ecommerce/{merchant_id}",
 }
 
 REFUND_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/refund/{transaction_id}",
-    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/ecommerce/{merchant_id}/refund/{transaction_id}",
+    "sandbox": "https://apisandbox.vnforappstest.com/api.refund/v1/refund/{merchant_id}/{transaction_id}",
+    "prod": "https://apiprod.vnforapps.com/api.refund/v1/refund/{merchant_id}/{transaction_id}",
 }
 
 YAPE_ENDPOINTS = {
@@ -429,18 +414,19 @@ class NiubizClient:
         return normalized
 
     def confirm_transaction(self, *, transaction_id: str) -> Dict[str, Any]:
-        url = CONFIRMATION_ENDPOINTS[self.endpoint].format(
-            merchant_id=self.merchant_id, transaction_id=transaction_id
-        )
+        url = CONFIRMATION_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {
             "Authorization": token,
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
+        body = {"transactionId": transaction_id}
         result = self._perform_request(
             "POST",
             url,
             headers=headers,
+            json=body,
             error_message=_("Failed to confirm the Niubiz transaction."),
         )
         if not result["success"]:
@@ -452,15 +438,17 @@ class NiubizClient:
         return normalized
 
     def reverse_transaction(self, *, transaction_id: str, amount: Any, currency: str) -> Dict[str, Any]:
-        url = REVERSAL_ENDPOINTS[self.endpoint].format(
-            merchant_id=self.merchant_id, transaction_id=transaction_id
-        )
+        url = REVERSAL_ENDPOINTS[self.endpoint].format(merchant_id=self.merchant_id)
         token = self._ensure_token()
         headers = {
             "Content-Type": "application/json",
             "Authorization": token,
         }
-        body = {"amount": float(amount), "currency": currency}
+        body = {
+            "transactionId": transaction_id,
+            "amount": float(amount),
+            "currency": currency,
+        }
         result = self._perform_request(
             "POST",
             url,
@@ -620,103 +608,6 @@ class NiubizClient:
         payload.setdefault("success", True)
         payload["access_token"] = token
         return payload
-
-    def query_order_status_by_order_id(self, *, order_id: str) -> Dict[str, Any]:
-        """Retrieve the order status using the Niubiz order identifier.
-
-        Consulta el estado de una orden usando el ``orderId`` generado por Niubiz.
-        """
-        url = ORDER_STATUS_ENDPOINTS[self.endpoint].format(
-            merchant_id=self.merchant_id, order_id=order_id
-        )
-        token = self._ensure_token()
-        headers = {
-            "Authorization": token,
-            "Accept": "application/json",
-        }
-        result = self._perform_request(
-            "GET",
-            url,
-            headers=headers,
-            error_message=_("Failed to query the Niubiz order status."),
-        )
-        if not result["success"]:
-            return result
-
-        payload = _safe_json(result["response"])
-        status = self._extract_status(payload)
-        payload.setdefault("success", True)
-        return {
-            "success": True,
-            "status": status,
-            "payload": payload,
-            "access_token": token,
-        }
-
-    def query_order_status_by_external_id(self, *, external_id: str) -> Dict[str, Any]:
-        """Retrieve the order status using the commerce ``externalId``.
-
-        Consulta el estado de una orden usando el ``externalId`` definido por el comercio.
-        """
-        url = ORDER_EXTERNAL_STATUS_ENDPOINTS[self.endpoint].format(
-            merchant_id=self.merchant_id, external_id=external_id
-        )
-        token = self._ensure_token()
-        headers = {
-            "Authorization": token,
-            "Accept": "application/json",
-        }
-        result = self._perform_request(
-            "GET",
-            url,
-            headers=headers,
-            error_message=_("Failed to query the Niubiz order status."),
-        )
-        if not result["success"]:
-            return result
-
-        payload = _safe_json(result["response"])
-        status = self._extract_status(payload)
-        payload.setdefault("success", True)
-        return {
-            "success": True,
-            "status": status,
-            "payload": payload,
-            "access_token": token,
-        }
-
-    def query_transaction_status(self, *, transaction_id: str) -> Dict[str, Any]:
-        """Retrieve the status of a transaction using its ``transactionId``.
-
-        Consulta el estado de una transacción enviando el ``transactionId`` entregado
-        por Niubiz durante la autorización.
-        """
-        url = TRANSACTION_STATUS_ENDPOINTS[self.endpoint].format(transaction_id=transaction_id)
-        token = self._ensure_token()
-        headers = {
-            "Authorization": token,
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        result = self._perform_request(
-            "POST",
-            url,
-            headers=headers,
-            json={"merchantId": self.merchant_id},
-            error_message=_("Failed to query the Niubiz transaction status."),
-        )
-        if not result["success"]:
-            return result
-
-        payload = _safe_json(result["response"])
-        status = self._extract_status(payload)
-        payload.setdefault("success", True)
-        return {
-            "success": True,
-            "status": status,
-            "payload": payload,
-            "access_token": token,
-        }
 
     def antifraud_check(self, data: Dict[str, Any]) -> Dict[str, Any]:
         url = ANTIFRAUD_ENDPOINTS[self.endpoint]

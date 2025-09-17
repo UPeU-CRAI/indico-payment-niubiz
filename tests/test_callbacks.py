@@ -19,6 +19,7 @@ def _make_registration():
     registration.registration_form_id = 2
     registration.event = SimpleNamespace(id=1)
     registration.user = SimpleNamespace(id=5)
+    registration.set_paid = Mock()
     return registration
 
 
@@ -38,10 +39,11 @@ def _mock_registration_lookup(monkeypatch, registration):
         )
         return SimpleNamespace(first=lambda: registration if matches else None)
 
-    monkeypatch.setattr(
-        "indico_payment_niubiz.controllers.Registration",
-        SimpleNamespace(query=SimpleNamespace(filter_by=_filter_by)),
+    fake_registration = SimpleNamespace(
+        query=SimpleNamespace(filter_by=_filter_by),
+        get=lambda reg_id: registration if reg_id == registration.id else None,
     )
+    monkeypatch.setattr("indico_payment_niubiz.controllers.Registration", fake_registration)
 
 
 def _build_handler(monkeypatch, registration, settings=None):
@@ -54,6 +56,10 @@ def _build_handler(monkeypatch, registration, settings=None):
 
     monkeypatch.setattr(RHNiubizCallback, "_get_scoped_setting", _fake_setting)
     monkeypatch.setattr(RHNiubizCallback, "_get_credentials", lambda self: ("ACCESS", values.get("__secret__", "secret")))
+    monkeypatch.setattr(
+        "indico_payment_niubiz.controllers.db",
+        SimpleNamespace(session=SimpleNamespace(commit=lambda: None)),
+    )
     return handler
 
 

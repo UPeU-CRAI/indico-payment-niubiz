@@ -10,6 +10,7 @@ from flask import flash, redirect, render_template, request
 from flask_pluginengine import current_plugin
 from werkzeug.exceptions import BadRequest, Forbidden
 
+from indico.core.db import db
 from indico.modules.events.payment.models.transactions import TransactionAction, TransactionStatus
 from indico.modules.events.registration.models.registrations import Registration
 from indico.modules.logs.models.entries import LogKind
@@ -704,6 +705,14 @@ class RHNiubizCallback(RHNiubizBase):
             return "", 400
         # Extraer valores de estado
         status_value = details.get("status") or details.get("status_order") or ""
+        normalized_status = status_value.strip()
+        status_lower = normalized_status.lower()
+        if status_lower in {"authorized", "confirmed"}:
+            registration.set_paid(True)
+            db.session.commit()
+        elif status_lower in {"voided", "cancelled", "refunded"}:
+            registration.set_paid(False)
+            db.session.commit()
         action_code = details.get("action_code")
         action_description = details.get("action_description")
         payment_hint = details.get("payment_method") or details.get("channel")

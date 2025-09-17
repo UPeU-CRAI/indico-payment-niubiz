@@ -41,27 +41,25 @@ Este proyecto integra la pasarela de pagos de **Niubiz** dentro del flujo de ins
 
 Cada formulario de registro puede sobrescribir las credenciales y parámetros anteriores desde **Gestión del evento → Pagos → Niubiz**. Esto permite utilizar comercios distintos por evento, habilitar o deshabilitar métodos específicos y definir MDD particulares.
 
-## Soporte de operaciones
+## Flujos soportados
 
-El cliente HTTP (`NiubizClient`) y los controladores del plugin encapsulan los endpoints oficiales de Niubiz v3:
+El plugin implementa los principales flujos documentados por Niubiz y normaliza las respuestas dentro de Indico:
 
-* **Pagos con tarjeta y QR** – Autorización (`/api.authorization/v3/authorization/ecommerce/{merchantId}`) con confirmación inmediata.
-* **Reversas** – `POST /api.authorization/v3/authorization/ecommerce/{merchantId}/reverse/{transactionId}`.
-* **Reembolsos** – `POST /api.authorization/v3/authorization/ecommerce/{merchantId}/refund/{transactionId}` con soporte para montos parciales.
-* **Consultas de órdenes** – `GET /api.ordermgmt/api/v1/order/query/{merchantId}/{orderId}` o `.../external/{externalId}` para comercios con Payment Link habilitado.
-* **Consulta de transacciones** – `POST /api.authorization/v3/authorization/transactions/{transactionId}` enviando el `merchantId` en el cuerpo.
-* **Callbacks / webhooks** – Verificación de token, firma HMAC y lista blanca de IPs antes de actualizar el estado en Indico.
-* **Yape** – `POST /api.authorization/v3/authorization/yape/{merchantId}` incluyendo validación de OTP.
-* **PagoEfectivo** – `POST /api.authorization/v3/authorization/pagoefectivo/{merchantId}` para generar CIP y gestionar confirmaciones vía webhook.
+* **Autorización** – `POST /api.authorization/v3/authorization/ecommerce/{merchantId}` autoriza pagos con tarjeta o QR y retorna `transactionId`, `actionCode`, tarjeta enmascarada y datos antifraude.
+* **Confirmación** – `POST /api.confirmation/v1/confirmation/ecommerce/{merchantId}` envía el `transactionId` en el cuerpo para capturar manualmente operaciones autorizadas.
+* **Reversa** – `POST /api.authorization/v3/reverse/ecommerce/{merchantId}` invierte transacciones aún no liquidadas enviando `transactionId`, monto y moneda.
+* **Refund** – `POST /api.refund/v1/refund/{merchant_id}/{transaction_id}` procesa devoluciones parciales o totales de operaciones ya capturadas.
+* **Yape** – `POST /api.authorization/v3/authorization/yape/{merchantId}` valida el OTP del usuario y retorna el estado de la transacción.
+* **PagoEfectivo** – `POST /api.authorization/v3/authorization/pagoefectivo/{merchantId}` genera el CIP y recibe el estado final mediante webhook.
 
-Todas estas operaciones quedan registradas en el log del evento junto con la respuesta normalizada que almacena Indico.
+Cada invocación queda registrada en el log del evento con la respuesta normalizada, lo que facilita auditorías y conciliaciones.
 
 ## Flujo de pago
 
 1. **Inicio**: el organizador habilita Niubiz como método de pago. El participante ingresa a `/start` y el plugin solicita el *security token* y la *session key* a Niubiz (registradas en el log del evento).
 2. **Checkout**: para tarjeta/QR se carga `checkout.js` con el `transactionToken`. Yape, PagoEfectivo y pagos tokenizados utilizan las APIs específicas del cliente.
 3. **Autorización**: el endpoint `/success` invoca `authorizeTransaction`. El resultado almacena `actionCode`, `transactionId`, `authorizationCode`, `brand`, `maskedCard`, `eci` y el detalle antifraude.
-4. **Confirmación**: inmediatamente después se llama a `confirmation` (`/api.confirmation/...`). Solo si el estado es `CONFIRMED` la inscripción pasa a pagada. Cualquier otro resultado registra la transacción como rechazada, cancelada o vencida usando `TransactionStatus` de Indico.
+4. **Confirmación**: inmediatamente después se llama a `confirmation` (`POST /api.confirmation/v1/confirmation/ecommerce/{merchantId}`) enviando el `transactionId` en el cuerpo. Solo si Niubiz responde `CONFIRMED` la inscripción pasa a pagada; cualquier otro resultado se registra como rechazado, cancelado o vencido usando `TransactionStatus` de Indico.
 5. **Tokenización opcional**: si el usuario marca “guardar tarjeta”, se consume `tokenizeCard`. Los tokens se guardan en `NiubizStoredToken` y pueden reutilizarse para cobros recurrentes.
 
 ### Métodos de pago soportados
@@ -81,13 +79,17 @@ Todas estas operaciones quedan registradas en el log del evento junto con la res
   * Firma `NBZ-Signature` mediante HMAC SHA-256.
   * IP contra la whitelist (por defecto las redes oficiales de Niubiz + configuraciones adicionales).
   * Rechazo de peticiones sin HTTPS.
-* Todos los callbacks se registran en el log del evento con el payload completo. Si el estado es `CONFIRMED`, se marca la inscripción como pagada; en cancelaciones o expiraciones se actualiza el estado y se crea una transacción correspondiente.
+* Todos los callbacks se registran en el log del evento con el payload completo. Si el estado recibido es `Authorized` o `Confirmed`, la inscripción se marca como pagada; ante `Voided`, `Cancelled` o `Refunded` el pago se revierte y se crea la transacción correspondiente.
+
+## Integración con Indico
+
+Cuando Niubiz envía un callback válido, el plugin sincroniza automáticamente el estado de pago del registro de Indico. Las respuestas con estado `Authorized` o `Confirmed` ejecutan `registration.set_paid(True)` y confirman la transacción en la base de datos. Si posteriormente se recibe `Voided`, `Cancelled` o `Refunded`, el mismo registro se marca como no pagado (`registration.set_paid(False)`), dejando trazabilidad en el log del evento y en el historial de transacciones. Este “toggle-payment” evita intervenciones manuales y mantiene la información visible para los organizadores y participantes.
 
 ## Reembolsos y reversos
 
 * Desde la interfaz de Indico se puede lanzar `refund`. El plugin decide automáticamente:
-  * **Reverse** (`/reverse`) si la transacción aún no ha sido liquidada.
-  * **Refund** (`/refund`) cuando la confirmación indica que está capturada.
+  * **Reverse** (`POST /api.authorization/v3/reverse/ecommerce/{merchantId}`) si la transacción aún no ha sido liquidada.
+  * **Refund** (`POST /api.refund/v1/refund/{merchant_id}/{transaction_id}`) cuando la confirmación indica que está capturada.
 * Soporta reembolsos parciales (monto inferior al total). Se registran en los logs `authorizationCode`, `traceNumber`, `transactionId`, marca y tarjeta enmascarada.
 
 ## Auditoría y trazabilidad
@@ -110,7 +112,6 @@ Los datos almacenados incluyen `authorizationCode`, `traceNumber`, `transactionI
 
 ## Limitaciones conocidas
 
-* Las consultas de orden (`query_order_status_by_order_id` y `..._external_id`) dependen de que Niubiz habilite el servicio **Order Management** para el comercio.
 * La API pública solo permite consultar transacciones por `transactionId`; no existe un endpoint documentado para buscar por `purchaseNumber`.
 * Los tokens de sesión y de seguridad tienen caducidad corta, por lo que el plugin fuerza la renovación automática al detectar respuestas 401 de Niubiz.
 
@@ -122,21 +123,15 @@ Los datos almacenados incluyen `authorizationCode`, `traceNumber`, `transactionI
 4. Una vez aprobada la certificación, Niubiz habilitará el comercio en producción y entregará credenciales definitivas.
 5. Cambia el entorno en el plugin a `Producción`, actualiza credenciales y reinicia Indico.
 
-## Pruebas automatizadas
+## Pruebas
 
-El repositorio incluye una batería de pruebas que simula:
-
-* Generación y caché del *security token*.
-* Creación de sesiones, autorizaciones y confirmaciones.
-* Callbacks válidos/ inválidos (token, IP, HMAC).
-* Reembolsos parciales usando la API correcta (reverse vs refund).
-* Flujos Yape y PagoEfectivo.
-
-Ejecuta las pruebas con:
+El proyecto cuenta con pruebas unitarias que validan los flujos principales del cliente y los callbacks de Niubiz: autorización, confirmación manual, reversas, refunds, Yape, PagoEfectivo y la actualización automática del estado de pago en Indico. Para ejecutarlas utiliza:
 
 ```bash
 pytest
 ```
+
+Las pruebas pueden ejecutarse en cualquier entorno virtual de Indico y emplean `monkeypatch` para simular las respuestas de la API de Niubiz.
 
 ---
 
