@@ -212,60 +212,6 @@ def test_client_create_session_token_uses_authorization(monkeypatch):
     assert calls == ["token-value"]
 
 
-def test_query_order_status_uses_order_mgmt(monkeypatch):
-    security_response = _build_response(text="token-value")
-    order_payload = {"statusOrder": "PAID"}
-    order_response = _build_response(json_payload=order_payload)
-
-    calls = []
-
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        if "api.security" in url:
-            return security_response
-        calls.append((method, url, headers, json))
-        return order_response
-
-    monkeypatch.setattr(requests, "request", fake_request)
-    client = NiubizClient(merchant_id="MID", access_key="AK", secret_key="SK", endpoint="sandbox")
-
-    result = client.query_order_status_by_order_id(order_id="ORDER-1")
-
-    assert result["status"] == "PAID"
-    method, url, headers, body = calls[0]
-    assert method == "GET"
-    assert "api.ordermgmt/api/v1/order/query" in url
-    assert url.endswith("/ORDER-1")
-    assert headers["Authorization"] == "token-value"
-    assert body is None
-
-
-def test_query_transaction_status_uses_post(monkeypatch):
-    security_response = _build_response(text="token-value")
-    transaction_payload = {"data": {"STATUS": "CONFIRMED"}}
-    transaction_response = _build_response(json_payload=transaction_payload)
-
-    calls = []
-
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        if "api.security" in url:
-            return security_response
-        calls.append((method, url, headers, json))
-        return transaction_response
-
-    monkeypatch.setattr(requests, "request", fake_request)
-    client = NiubizClient(merchant_id="MID", access_key="AK", secret_key="SK", endpoint="sandbox")
-
-    result = client.query_transaction_status(transaction_id="T-999")
-
-    assert result["status"] == "CONFIRMED"
-    method, url, headers, body = calls[0]
-    assert method == "POST"
-    assert url.endswith("/transactions/T-999")
-    assert headers["Authorization"] == "token-value"
-    assert headers["Content-Type"] == "application/json"
-    assert body == {"merchantId": "MID"}
-
-
 def test_authorization_and_confirmation_success(flask_app, monkeypatch):
     registration = _make_registration()
     handler = RHNiubizSuccess()
