@@ -3,8 +3,7 @@
 Este módulo define:
 - Configuración global y por evento para la pasarela Niubiz.
 - Métodos habilitados: tarjeta, Yape, PagoEfectivo, QR y tokenización.
-- Integración con el flujo de pagos de Indico.
-- Placeholder para refund() pendiente de implementar con APIs Niubiz.
+- Integración con el flujo de pagos de Indico, incluyendo reembolsos.
 """
 
 from __future__ import annotations
@@ -230,46 +229,141 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         if not registration:
             return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
 
+        event = getattr(registration, "event", None)
         txn = transaction or getattr(registration, "transaction", None)
         currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
         amount_decimal = parse_amount(amount, None) if amount is not None else None
-
         if amount_decimal is None:
             amount_decimal = parse_amount(getattr(txn, "amount", None), None)
         if amount_decimal is None:
             amount_decimal = parse_amount(getattr(registration, "price", None), None)
 
         transaction_payload = getattr(txn, "data", {}) or {}
-        transaction_id = self._extract_transaction_id(transaction_payload)
-
-        summary = _("Refund requested — not yet implemented")
-        logger.info("Refund requested for Niubiz transaction %s on registration %s",
-                    transaction_id or "unknown", getattr(registration, "id", "?"))
-
-        data = build_transaction_data(
-            payload=transaction_payload,
-            source="refund",
-            transaction_id=str(transaction_id) if transaction_id else None,
-            reason=reason,
-            message=summary,
-            status="NOT_IMPLEMENTED",
+        transaction_id = (
+            self._extract_transaction_id(transaction_payload)
+            or getattr(txn, "transaction_id", None)
+            or getattr(txn, "external_transaction_id", None)
         )
-        data["currency"] = currency
-        if amount_decimal is not None:
-            data["amount"] = float(amount_decimal)
+        transaction_id = str(transaction_id) if transaction_id else None
+
+        def _finalize_failure(summary: str, *, status: str = "FAILED", payload=None):
+            data = build_transaction_data(
+                payload=payload if isinstance(payload, dict) else transaction_payload,
+                source="refund",
+                transaction_id=transaction_id,
+                reason=reason,
+                message=summary,
+                status=status,
+            )
+            data["currency"] = currency
+            if amount_decimal is not None:
+                data["amount"] = float(amount_decimal)
+            data["error"] = summary
+
+            handle_refund(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                summary=summary,
+                data=data,
+                success=False,
+            )
+            return {"success": False, "error": summary}
+
+        if event is None:
+            return _finalize_failure(_("La inscripción no está asociada a un evento válido."))
+
+        if transaction_id is None:
+            return _finalize_failure(_("No se encontró el identificador de transacción en Niubiz."))
+
+        if amount_decimal is None:
+            return _finalize_failure(_("No se pudo determinar el monto a reembolsar."))
+
+        logger.info(
+            "Solicitando reembolso Niubiz para registration_id=%s, transaction_id=%s",
+            getattr(registration, "id", "?"),
+            transaction_id,
+        )
+
+        try:
+            client = self._build_client(event)
+        except Exception:
+            logger.exception("No se pudo inicializar el cliente de Niubiz para reembolsar")
+            return _finalize_failure(_("No se pudo inicializar el cliente de Niubiz."))
+
+        try:
+            result = client.refund_transaction(
+                transaction_id=transaction_id,
+                amount=amount_decimal,
+                currency=currency,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("Error inesperado al solicitar el reembolso en Niubiz")
+            return _finalize_failure(_("Error al comunicarse con Niubiz para el reembolso."))
+
+        payload_for_storage = None
+        if result.get("success"):
+            payload_for_storage = result.get("data") if isinstance(result.get("data"), dict) else result
+        else:
+            payload_for_storage = result.get("payload") if isinstance(result.get("payload"), dict) else result
+
+        status_value = result.get("status") or ""
+        status_key = status_value.upper()
+        niubiz_transaction_id = result.get("transaction_id") or transaction_id
+
+        transaction_data = build_transaction_data(
+            payload=payload_for_storage,
+            source="refund",
+            transaction_id=niubiz_transaction_id,
+            status=status_value or None,
+            reason=reason,
+        )
+        transaction_data["currency"] = currency
+        transaction_data["amount"] = float(amount_decimal)
+
+        success_statuses = {"REFUNDED", "VOIDED"}
+        is_success = bool(result.get("success")) and status_key in success_statuses
+
+        if is_success:
+            summary = _("Niubiz confirmó el reembolso correctamente.")
+            transaction_data["message"] = summary
+            logger.info(
+                "Reembolso Niubiz exitoso para registration_id=%s, transaction_id=%s",
+                getattr(registration, "id", "?"),
+                niubiz_transaction_id,
+            )
+        else:
+            summary = result.get("error") or _("Niubiz no pudo completar el reembolso.")
+            if result.get("status_code"):
+                transaction_data["status_code"] = result["status_code"]
+            if result.get("error"):
+                transaction_data["message"] = result["error"]
+            transaction_data["error"] = summary
+            logger.warning(
+                "Reembolso Niubiz fallido para registration_id=%s, transaction_id=%s: %s",
+                getattr(registration, "id", "?"),
+                niubiz_transaction_id,
+                summary,
+            )
 
         handle_refund(
             registration,
             amount=amount_decimal,
             currency=currency,
-            transaction_id=str(transaction_id) if transaction_id else None,
-            status="NOT_IMPLEMENTED",
+            transaction_id=niubiz_transaction_id,
+            status=status_value or ("REFUNDED" if is_success else "FAILED"),
             summary=summary,
-            data=data,
-            success=False,
+            data=transaction_data,
+            success=is_success,
         )
 
-        return {"success": False, "error": summary}
+        if not is_success and "message" not in transaction_data:
+            transaction_data["message"] = summary
+
+        return {"success": is_success, **({} if is_success else {"error": summary})}
 
     @staticmethod
     def _extract_transaction_id(payload: Dict[str, object]) -> Optional[str]:
