@@ -617,11 +617,25 @@ class RHNiubizCallback(RHNiubizBase):
         self.registration = registration
         self.event = registration.event
 
+        expected_amount = parse_amount(getattr(registration, "price", None), None)
+        expected_currency = getattr(registration, "currency", None) or "PEN"
+
         amount_decimal = parse_amount(details.get("amount"), None)
-        if amount_decimal is None:
-            amount_decimal = parse_amount(getattr(registration, "price", None), None)
-        currency = details.get("currency") or getattr(registration, "currency", None) or "PEN"
+        currency = details.get("currency") or "PEN"
         transaction_id = details.get("transaction_id") or details.get("operation_number")
+
+        # Validar monto
+        if amount_decimal is not None and expected_amount is not None:
+            if float(amount_decimal) != float(expected_amount):
+                logger.warning("Monto inconsistente en callback de Niubiz. Esperado=%.2f, Recibido=%.2f",
+                               expected_amount, amount_decimal)
+                return "", 400
+
+        # Validar moneda
+        if currency != expected_currency:
+            logger.warning("Moneda inconsistente en callback de Niubiz. Esperada=%s, Recibida=%s",
+                           expected_currency, currency)
+            return "", 400
 
         # Validar whitelist de IPs
         remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr or "")
@@ -799,6 +813,18 @@ class RHNiubizCallback(RHNiubizBase):
 
         # Procesamiento final según estado mapeado
         if mapped.status == TransactionStatus.successful:
+            # Verificar si ya existe una transacción exitosa con este transaction_id
+            from indico.modules.events.payment.models.transactions import PaymentTransaction
+
+            existing = PaymentTransaction.query.filter_by(
+                registration_id=registration.id,
+                external_transaction_id=transaction_id
+            ).first()
+
+            if existing:
+                logger.info("Callback duplicado ignorado para transaction_id=%s", transaction_id)
+                return "", 200
+
             success_summary = _("Niubiz confirmó el pago mediante notificación.")
             if mapped.manual_confirmation:
                 success_summary = _("Niubiz confirmó manualmente el pago mediante notificación.")
@@ -812,6 +838,7 @@ class RHNiubizCallback(RHNiubizBase):
                 summary=success_summary,
                 data=transaction_data,
             )
+
         elif mapped.status == TransactionStatus.cancelled:
             handle_failed_payment(
                 registration,
@@ -824,6 +851,7 @@ class RHNiubizCallback(RHNiubizBase):
                 data=transaction_data,
                 cancelled=True,
             )
+
         elif mapped.status == TransactionStatus.pending:
             record_payment_transaction(
                 registration=registration,
@@ -832,6 +860,7 @@ class RHNiubizCallback(RHNiubizBase):
                 action=TransactionAction.pending,
                 data=transaction_data,
             )
+
         else:
             handle_failed_payment(
                 registration,
