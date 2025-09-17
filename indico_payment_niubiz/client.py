@@ -39,18 +39,18 @@ AUTHORIZATION_ENDPOINTS = {
 }
 
 ORDER_STATUS_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/{order_id}",
-    "prod": "https://apiprod.vnforapps.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/{order_id}",
+    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
+    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
 }
 
 ORDER_EXTERNAL_STATUS_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/external/{external_id}",
-    "prod": "https://apiprod.vnforapps.com/api.ecommerce/v2/ecommerce/orders/{merchant_id}/external/{external_id}",
+    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
+    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
 }
 
 TRANSACTION_STATUS_ENDPOINTS = {
-    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/transactions/{merchant_id}/{transaction_id}",
-    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/transactions/{merchant_id}/{transaction_id}",
+    "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/transactions/{transaction_id}",
+    "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/transactions/{transaction_id}",
 }
 
 CONFIRMATION_ENDPOINTS = {
@@ -94,21 +94,23 @@ TOKENIZE_ENDPOINTS = {
 }
 
 
-SENSITIVE_KEYS = {
+SENSITIVE_KEYWORDS = (
     "accesskey",
-    "authorization",
-    "card",
-    "cardnumber",
-    "card_number",
-    "cvv",
-    "cvv2",
-    "pan",
+    "access_key",
     "secret",
     "secretkey",
     "token",
     "tokenid",
     "transactiontoken",
-}
+    "sessionkey",
+    "cvv",
+    "cvv2",
+    "pan",
+    "cardnumber",
+    "card_number",
+    "otp",
+    "signature",
+)
 
 
 @dataclass
@@ -172,6 +174,15 @@ def _mask_string(value: str) -> str:
     return f"{value[:6]}{'*' * (len(value) - 10)}{value[-4:]}"
 
 
+def _is_sensitive_key(key: Optional[str]) -> bool:
+    if not key:
+        return False
+    key_lower = key.lower()
+    if "masked" in key_lower and "card" in key_lower:
+        return False
+    return any(keyword in key_lower for keyword in SENSITIVE_KEYWORDS)
+
+
 def _sanitize_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return payload
@@ -181,7 +192,7 @@ def _sanitize_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
             return {k: _sanitize(v, k) for k, v in value.items()}
         if isinstance(value, list):
             return [_sanitize(item, key) for item in value]
-        if key and key.lower() in SENSITIVE_KEYS:
+        if _is_sensitive_key(key):
             if isinstance(value, str):
                 return _mask_string(value)
             return "***"
@@ -279,10 +290,9 @@ class NiubizClient:
             return result
 
         response = result["response"]
-        token = response.text.strip()
         payload = _safe_json(response)
-        if not token:
-            token = payload.get("accessToken") or payload.get("access_token") or ""
+        raw_text = (response.text or "").strip()
+        token = payload.get("accessToken") or payload.get("access_token") or raw_text
 
         if token:
             expires_at = self._parse_expiration(payload) or (
@@ -612,6 +622,10 @@ class NiubizClient:
         return payload
 
     def query_order_status_by_order_id(self, *, order_id: str) -> Dict[str, Any]:
+        """Retrieve the order status using the Niubiz order identifier.
+
+        Consulta el estado de una orden usando el ``orderId`` generado por Niubiz.
+        """
         url = ORDER_STATUS_ENDPOINTS[self.endpoint].format(
             merchant_id=self.merchant_id, order_id=order_id
         )
@@ -640,6 +654,10 @@ class NiubizClient:
         }
 
     def query_order_status_by_external_id(self, *, external_id: str) -> Dict[str, Any]:
+        """Retrieve the order status using the commerce ``externalId``.
+
+        Consulta el estado de una orden usando el ``externalId`` definido por el comercio.
+        """
         url = ORDER_EXTERNAL_STATUS_ENDPOINTS[self.endpoint].format(
             merchant_id=self.merchant_id, external_id=external_id
         )
@@ -668,18 +686,23 @@ class NiubizClient:
         }
 
     def query_transaction_status(self, *, transaction_id: str) -> Dict[str, Any]:
-        url = TRANSACTION_STATUS_ENDPOINTS[self.endpoint].format(
-            merchant_id=self.merchant_id, transaction_id=transaction_id
-        )
+        """Retrieve the status of a transaction using its ``transactionId``.
+
+        Consulta el estado de una transacción enviando el ``transactionId`` entregado
+        por Niubiz durante la autorización.
+        """
+        url = TRANSACTION_STATUS_ENDPOINTS[self.endpoint].format(transaction_id=transaction_id)
         token = self._ensure_token()
         headers = {
             "Authorization": token,
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
         result = self._perform_request(
-            "GET",
+            "POST",
             url,
             headers=headers,
+            json={"merchantId": self.merchant_id},
             error_message=_("Failed to query the Niubiz transaction status."),
         )
         if not result["success"]:
