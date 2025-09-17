@@ -23,6 +23,9 @@ TOKEN_TTL_SECONDS = 55 * 60
 TOKEN_REFRESH_THRESHOLD_SECONDS = 5 * 60
 
 
+# -----------------------------
+# Core endpoints
+# -----------------------------
 SECURITY_ENDPOINTS = {
     "sandbox": "https://apisandbox.vnforappstest.com/api.security/v1/security",
     "prod": "https://apiprod.vnforapps.com/api.security/v1/security",
@@ -53,6 +56,32 @@ REFUND_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.refund/v1/refund/{merchant_id}/{transaction_id}",
 }
 
+QUERY_REFUND_ENDPOINTS = {
+    "sandbox": "https://apitestenv.vnforapps.com/api.refund/v1/queryRefund/{merchant_id}",
+    "prod": "https://apiprod.vnforapps.com/api.refund/v1/queryRefund/{merchant_id}",
+}
+
+# -----------------------------
+# Order management (estado de órdenes)
+# -----------------------------
+ORDER_QUERY_ENDPOINTS = {
+    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
+    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/{order_id}",
+}
+
+ORDER_QUERY_EXTERNAL_ENDPOINTS = {
+    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
+    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/order/query/{merchant_id}/external/{external_id}",
+}
+
+ORDER_BATCH_QUERY_ENDPOINTS = {
+    "sandbox": "https://apitestenv.vnforapps.com/api.ordermgmt/api/v1/batch/query/{merchant_id}/{batch_id}",
+    "prod": "https://apiprod.vnforapps.com/api.ordermgmt/api/v1/batch/query/{merchant_id}/{batch_id}",
+}
+
+# -----------------------------
+# Medios de pago adicionales
+# -----------------------------
 YAPE_ENDPOINTS = {
     "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/yape/{merchant_id}",
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/yape/{merchant_id}",
@@ -63,6 +92,9 @@ PAGOEFECTIVO_ENDPOINTS = {
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/pagoefectivo/{merchant_id}",
 }
 
+# -----------------------------
+# Utilidades
+# -----------------------------
 BIN_LOOKUP_ENDPOINTS = {
     "sandbox": "https://apisandbox.vnforappstest.com/api.authorization/v3/authorization/bin/{merchant_id}/{bin_number}",
     "prod": "https://apiprod.vnforapps.com/api.authorization/v3/authorization/bin/{merchant_id}/{bin_number}",
@@ -79,6 +111,9 @@ TOKENIZE_ENDPOINTS = {
 }
 
 
+# -----------------------------
+# Sensibilidad
+# -----------------------------
 SENSITIVE_KEYWORDS = (
     "accesskey",
     "access_key",
