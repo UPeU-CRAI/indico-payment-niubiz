@@ -9,7 +9,7 @@ from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.web.rh import RH
 
-if TYPE_CHECKING:  # pragma: no cover - only for type checkers
+if TYPE_CHECKING:
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 
 logger = logging.getLogger(__name__)
@@ -17,18 +17,21 @@ logger = logging.getLogger(__name__)
 
 def _get_plugin() -> "NiubizPaymentPlugin":
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
-
     return NiubizPaymentPlugin.instance
 
 
+# ------------------------------------------------------------------------------
+# Resource handler para los callbacks (webhooks) de Niubiz
+# ------------------------------------------------------------------------------
 class RHNiubizCallback(RH):
-    """Maneja los callbacks/webhooks enviados por Niubiz."""
+    """Maneja los callbacks/webhooks enviados por Niubiz a Indico."""
 
     def _check_access(self):
-        """Los callbacks no requieren autenticación de usuario, solo validación interna."""
+        """No se requiere autenticación de usuario para los callbacks."""
         return True
 
     def _process(self):
+        # Parsear payload JSON
         payload = request.get_json(force=True, silent=True)
         if not payload:
             raise BadRequest("No se recibió un JSON válido en el callback de Niubiz.")
@@ -37,16 +40,16 @@ class RHNiubizCallback(RH):
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
-        # -----------------------------
-        # Validar seguridad del callback
-        # -----------------------------
+        # ----------------------------------------------------------------------
+        # Validaciones de seguridad del callback
+        # ----------------------------------------------------------------------
         self._validate_authorization(event, plugin)
         self._validate_signature(event, plugin, payload)
         self._validate_ip(event, plugin)
 
-        # -----------------------------
-        # Procesar payload
-        # -----------------------------
+        # ----------------------------------------------------------------------
+        # Extraer información clave del payload
+        # ----------------------------------------------------------------------
         purchase_number = (
             payload.get("order", {}).get("purchaseNumber")
             or payload.get("purchaseNumber")
@@ -64,59 +67,75 @@ class RHNiubizCallback(RH):
 
         logger.info(
             "Callback Niubiz recibido: purchase=%s, transaction=%s, status=%s",
-            purchase_number,
-            transaction_id,
-            status,
+            purchase_number, transaction_id, status
         )
-        logger.debug("Payload completo: %s", payload)
+        logger.debug("Payload completo del callback: %r", payload)
 
-        # TODO: mapear status/actionCode a estados de Indico
-        # - Authorized -> success
-        # - Not Authorized / Reject -> failed
-        # - Voided -> cancelled
-        # - Pending (PagoEfectivo CIP o Yape en espera) -> pending
+        # 🔧 TODO: Procesar el estado real de la transacción y actualizar en Indico
+        #  - Authorized -> pago exitoso
+        #  - Not Authorized / Rejected -> fallido
+        #  - Voided -> cancelado
+        #  - Pending (ej. Yape, PagoEfectivo) -> espera
 
-        # Por ahora respondemos 200 para confirmar recepción
         return jsonify({"received": True})
 
-    # -----------------------------
-    # Validaciones de seguridad
-    # -----------------------------
+    # ----------------------------------------------------------------------
+    # Seguridad: Authorization header
+    # ----------------------------------------------------------------------
     def _validate_authorization(self, event, plugin):
         expected = plugin._get_setting(event, "callback_authorization_token")
         if expected:
             auth_header = request.headers.get("Authorization")
             if auth_header != expected:
-                logger.warning("Callback rechazado por token Authorization inválido")
+                logger.warning("Callback rechazado: token Authorization inválido")
                 raise Forbidden("Invalid Authorization token")
 
+    # ----------------------------------------------------------------------
+    # Seguridad: Validación HMAC NBZ-Signature
+    # ----------------------------------------------------------------------
     def _validate_signature(self, event, plugin, payload):
         secret = plugin._get_setting(event, "callback_hmac_secret")
         if secret:
             received_sig = request.headers.get("NBZ-Signature")
             if not received_sig:
+                logger.warning("Callback rechazado: NBZ-Signature faltante")
                 raise Forbidden("Missing NBZ-Signature header")
+
             computed_sig = hmac.new(
                 secret.encode("utf-8"),
                 msg=request.data,
                 digestmod=hashlib.sha256,
             ).hexdigest()
+
             if not hmac.compare_digest(computed_sig, received_sig):
-                logger.warning("Firma NBZ-Signature inválida en callback")
+                logger.warning("Callback rechazado: firma NBZ-Signature inválida")
                 raise Forbidden("Invalid signature")
 
+    # ----------------------------------------------------------------------
+    # Seguridad: Validación de IP (whitelist)
+    # ----------------------------------------------------------------------
     def _validate_ip(self, event, plugin):
         whitelist = plugin._get_setting(event, "callback_ip_whitelist")
-        if whitelist:
-            ips = [ip.strip() for ip in whitelist.splitlines() if ip.strip()]
-            remote_ip = ipaddress.ip_address(request.remote_addr)
-            for allowed in ips:
+        if not whitelist:
+            return
+
+        remote_ip = ipaddress.ip_address(request.remote_addr)
+        ips = [ip.strip() for ip in whitelist.splitlines() if ip.strip()]
+
+        for allowed in ips:
+            try:
                 if remote_ip in ipaddress.ip_network(allowed, strict=False):
                     return
-            logger.warning("Callback desde IP no autorizada: %s", remote_ip)
-            raise Forbidden("IP not allowed")
+            except ValueError:
+                logger.warning("Entrada inválida en whitelist de IPs: %s", allowed)
+
+        logger.warning("Callback desde IP no autorizada: %s", remote_ip)
+        raise Forbidden("IP not allowed")
 
 
+# ------------------------------------------------------------------------------
+# Registro de ruta para recibir callbacks desde Niubiz
+# ------------------------------------------------------------------------------
 blueprint = Blueprint("payment_niubiz", __name__)
 blueprint.add_url_rule(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/response/niubiz/notify",
