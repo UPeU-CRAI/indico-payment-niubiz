@@ -8,10 +8,8 @@ if ROOT not in sys.path:
 import pytest
 
 import indico_payment_niubiz.client as client_module  # noqa: E402
-import indico_payment_niubiz.controllers as controllers  # noqa: E402
 
-controllers._ = lambda text: text  # type: ignore
-client_module._ = lambda text: text  # type: ignore
+client_module._ = lambda text: text  # type: ignore[attr-defined]
 
 
 @pytest.fixture(autouse=True)

@@ -159,7 +159,12 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         merchant_id = get_merchant_id_for_event(event, plugin=self)
         access_key, secret_key = get_credentials_for_event(event, plugin=self)
         endpoint = get_endpoint_for_event(event, plugin=self)
-        return NiubizClient(merchant_id, access_key, secret_key, endpoint)
+        return NiubizClient(
+            merchant_id=merchant_id,
+            access_key=access_key,
+            secret_key=secret_key,
+            endpoint=endpoint,
+        )
 
     def _collect_methods(self, event) -> Dict[str, bool]:
         return {
