@@ -8,19 +8,20 @@ from typing import Any, Dict, Optional
 from indico.modules.events.payment.models.transactions import TransactionAction, TransactionStatus
 from indico.modules.events.payment.util import register_transaction
 
-try:  # pragma: no cover - import depends on indico version
+# Opcionales según versión de Indico
+try:  # pragma: no cover
     from indico.modules.events.payment.util import toggle_registration_payment as _toggle_registration_payment
-except ImportError:  # pragma: no cover - legacy indico
+except ImportError:
     _toggle_registration_payment = None
 
-try:  # pragma: no cover - optional in old indico versions
+try:  # pragma: no cover
     from indico.modules.events.registration.util import apply_registration_status as _apply_registration_status
-except ImportError:  # pragma: no cover - optional fallback
+except ImportError:
     _apply_registration_status = None
 
-try:  # pragma: no cover - optional dependency in tests
+try:  # pragma: no cover
     from indico.modules.events.logs.models.entries import EventLogRealm, LogKind
-except Exception:  # pragma: no cover - testing fallback when logs module missing
+except Exception:  # fallback en entornos limitados (tests)
     from enum import Enum
 
     class EventLogRealm(Enum):  # type: ignore
@@ -39,11 +40,10 @@ NIUBIZ_MODULE_NAME = "Niubiz"
 
 
 # -----------------------------------------------------
-# Utilidades de conversión
+# Utilidades
 # -----------------------------------------------------
 def parse_amount(value: Any, fallback: Optional[Decimal]) -> Optional[Decimal]:
-    """Convierte un valor genérico a :class:`~decimal.Decimal`."""
-
+    """Convierte un valor genérico a Decimal o retorna el fallback."""
     if value is None:
         return fallback
     if isinstance(value, Decimal):
@@ -54,9 +54,6 @@ def parse_amount(value: Any, fallback: Optional[Decimal]) -> Optional[Decimal]:
         return fallback
 
 
-# -----------------------------------------------------
-# Construcción de datos
-# -----------------------------------------------------
 def build_transaction_data(
     *,
     payload: Optional[Dict[str, Any]] = None,
@@ -70,24 +67,25 @@ def build_transaction_data(
     reason: Optional[str] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    """Prepara la estructura ``data`` que acompaña a la transacción en Indico."""
-
-    data: Dict[str, Any] = {"provider": "niubiz", "payload": payload}
+    """Crea un diccionario con los datos extra de la transacción."""
+    data: Dict[str, Any] = {"provider": "niubiz"}
+    if payload is not None:
+        data["payload"] = payload
     if source:
         data["source"] = source
-    if status is not None:
+    if status:
         data["status"] = status
-    if action_code is not None:
+    if action_code:
         data["action_code"] = action_code
-    if transaction_id is not None:
+    if transaction_id:
         data["transaction_id"] = transaction_id
-    if order_id is not None:
+    if order_id:
         data["order_id"] = order_id
-    if external_id is not None:
+    if external_id:
         data["external_id"] = external_id
-    if message is not None:
+    if message:
         data["message"] = message
-    if reason is not None:
+    if reason:
         data["reason"] = reason
     if extra:
         data.update(extra)
@@ -102,6 +100,7 @@ def _prepare_transaction_payload(
     amount: Optional[Decimal],
     currency: Optional[str],
 ) -> Dict[str, Any]:
+    """Completa el diccionario data con campos básicos faltantes."""
     payload = deepcopy(data) if data else {}
     payload.setdefault("provider", "niubiz")
     payload.setdefault("payload", None)
@@ -120,94 +119,46 @@ def _prepare_transaction_payload(
 
 
 # -----------------------------------------------------
-# Registro de transacciones
-# -----------------------------------------------------
-def record_payment_transaction(
-    *,
-    registration,
-    amount: Optional[Decimal],
-    currency: Optional[str],
-    action: TransactionAction,
-    data: Optional[Dict[str, Any]] = None,
-):
-    """Registra una transacción en Indico garantizando el almacenamiento del payload."""
-
-    if amount is None:
-        amount = parse_amount(getattr(registration, "price", None), Decimal("0")) or Decimal("0")
-    base_amount = amount
-    try:
-        amount_value = float(base_amount)
-    except (TypeError, ValueError):
-        fallback_amount = parse_amount(getattr(registration, "price", None), Decimal("0")) or Decimal("0")
-        amount_value = float(fallback_amount)
-        base_amount = fallback_amount
-
-    currency_value = currency or getattr(registration, "currency", None) or "PEN"
-    data_payload = _prepare_transaction_payload(
-        data,
-        transaction_id=None,
-        status=None,
-        amount=base_amount,
-        currency=currency_value,
-    )
-
-    try:
-        return register_transaction(
-            registration=registration,
-            amount=amount_value,
-            currency=currency_value,
-            action=action,
-            provider="niubiz",
-            data=data_payload,
-        )
-    except Exception:  # pragma: no cover - defensive
-        logger.exception(
-            "Error registrando transacción Niubiz para inscripción %s", getattr(registration, "id", "?")
-        )
-        return None
-
-
-# -----------------------------------------------------
-# Gestión de estados de inscripción
+# Estado de inscripción
 # -----------------------------------------------------
 def _apply_registration_paid_state(registration, paid: bool) -> bool:
-    """Aplica el estado *pagado* en la inscripción utilizando la mejor opción disponible."""
-
-    if _toggle_registration_payment is not None:  # pragma: no branch - prefer official helper when available
+    """
+    Marca una inscripción como pagada/no pagada usando la mejor opción disponible
+    según la versión de Indico instalada.
+    """
+    if _toggle_registration_payment is not None:
         try:
             _toggle_registration_payment(registration, paid)
             return True
-        except Exception:  # pragma: no cover - defensive fallback
-            logger.exception("toggle_registration_payment falló; intentando alternativas")
+        except Exception:
+            logger.exception("toggle_registration_payment falló; probando alternativas")
 
-    if _apply_registration_status is not None:  # pragma: no cover - legacy Indico helper
+    if _apply_registration_status is not None:
         try:
             _apply_registration_status(registration, paid=paid)
             return True
         except Exception:
-            logger.exception("apply_registration_status falló; intentando actualización directa")
+            logger.exception("apply_registration_status falló")
 
-    update_state = getattr(registration, "update_state", None)
-    if callable(update_state):
+    if callable(getattr(registration, "update_state", None)):
         try:
-            update_state(paid=paid)
+            registration.update_state(paid=paid)
             return True
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("No se pudo actualizar el estado de la inscripción via update_state")
+        except Exception:
+            logger.exception("update_state falló en inscripción")
 
-    set_paid = getattr(registration, "set_paid", None)
-    if callable(set_paid):
+    if callable(getattr(registration, "set_paid", None)):
         try:
-            set_paid(paid)
+            registration.set_paid(paid)
             return True
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("No se pudo actualizar el estado de la inscripción via set_paid")
+        except Exception:
+            logger.exception("set_paid falló en inscripción")
 
     return False
 
 
 # -----------------------------------------------------
-# Logging centralizado
+# Logging
 # -----------------------------------------------------
 def _log_event(
     registration,
@@ -220,6 +171,7 @@ def _log_event(
     currency: Optional[str],
     data: Optional[Dict[str, Any]],
 ) -> None:
+    """Escribe un log en el evento para que quede visible en la UI de Indico."""
     event = getattr(registration, "event", None)
     if not event or not hasattr(event, "log"):
         return
@@ -232,12 +184,12 @@ def _log_event(
     if amount is not None:
         try:
             log_data["amount"] = float(amount)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
+        except Exception:
             pass
     if currency:
         log_data["currency"] = currency
     if data:
-        log_data["payload_present"] = "payload" in data and data.get("payload") is not None
+        log_data["payload_present"] = bool(data.get("payload"))
         extra = {k: v for k, v in data.items() if k not in {"payload", "provider"}}
         if extra:
             log_data["details"] = extra
@@ -250,12 +202,54 @@ def _log_event(
             summary,
             data=log_data,
         )
-    except Exception:  # pragma: no cover - defensive
-        logger.exception("No se pudo registrar el evento de log Niubiz")
+    except Exception:
+        logger.exception("No se pudo registrar el log Niubiz en el evento")
 
 
 # -----------------------------------------------------
-# Funciones públicas para los callbacks
+# Transacciones
+# -----------------------------------------------------
+def record_payment_transaction(
+    *,
+    registration,
+    amount: Optional[Decimal],
+    currency: Optional[str],
+    action: TransactionAction,
+    data: Optional[Dict[str, Any]] = None,
+):
+    """Crea una transacción en Indico y asegura la persistencia del payload."""
+    if amount is None:
+        amount = parse_amount(getattr(registration, "price", None), Decimal("0")) or Decimal("0")
+    try:
+        amount_value = float(amount)
+    except Exception:
+        amount_value = float(parse_amount(getattr(registration, "price", None), Decimal("0")) or 0)
+
+    currency_value = currency or getattr(registration, "currency", None) or "PEN"
+    data_payload = _prepare_transaction_payload(
+        data,
+        transaction_id=None,
+        status=None,
+        amount=amount,
+        currency=currency_value,
+    )
+
+    try:
+        return register_transaction(
+            registration=registration,
+            amount=amount_value,
+            currency=currency_value,
+            action=action,
+            provider="niubiz",
+            data=data_payload,
+        )
+    except Exception:
+        logger.exception("Error registrando transacción Niubiz para inscripción %s", getattr(registration, "id", "?"))
+        return None
+
+
+# -----------------------------------------------------
+# Funciones de alto nivel (callbacks)
 # -----------------------------------------------------
 def handle_successful_payment(
     registration,
@@ -275,10 +269,7 @@ def handle_successful_payment(
         action=TransactionAction.complete,
         data=data,
     )
-
-    if toggle_paid and (
-        transaction is None or getattr(transaction, "status", None) != TransactionStatus.successful
-    ):
+    if toggle_paid and (transaction is None or getattr(transaction, "status", None) != TransactionStatus.successful):
         _apply_registration_paid_state(registration, True)
 
     _log_event(
@@ -291,7 +282,6 @@ def handle_successful_payment(
         currency=currency,
         data=data,
     )
-
     return transaction
 
 
@@ -315,7 +305,6 @@ def handle_failed_payment(
         action=action,
         data=data,
     )
-
     if (cancelled or toggle_paid) and (
         transaction is None or getattr(transaction, "status", None) not in {TransactionStatus.cancelled}
     ):
@@ -331,7 +320,6 @@ def handle_failed_payment(
         currency=currency,
         data=data,
     )
-
     return transaction
 
 
@@ -354,10 +342,7 @@ def handle_refund(
         action=action,
         data=data,
     )
-
-    if success and (
-        transaction is None or getattr(transaction, "status", None) not in {TransactionStatus.cancelled}
-    ):
+    if success and (transaction is None or getattr(transaction, "status", None) not in {TransactionStatus.cancelled}):
         _apply_registration_paid_state(registration, False)
 
     _log_event(
@@ -370,7 +355,6 @@ def handle_refund(
         currency=currency,
         data=data,
     )
-
     return transaction
 
 
@@ -391,7 +375,6 @@ def handle_pending_payment(
         action=TransactionAction.pending,
         data=data,
     )
-
     _log_event(
         registration,
         summary=summary,
@@ -402,7 +385,6 @@ def handle_pending_payment(
         currency=currency,
         data=data,
     )
-
     return transaction
 
 
