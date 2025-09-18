@@ -6,33 +6,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 
 from indico.modules.events.payment.models.transactions import TransactionAction, TransactionStatus
-from indico.modules.events.payment.util import register_transaction
-
-# Opcionales según versión de Indico
-try:  # pragma: no cover
-    from indico.modules.events.payment.util import toggle_registration_payment as _toggle_registration_payment
-except ImportError:
-    _toggle_registration_payment = None
-
-try:  # pragma: no cover
-    from indico.modules.events.registration.util import apply_registration_status as _apply_registration_status
-except ImportError:
-    _apply_registration_status = None
-
-try:  # pragma: no cover
-    from indico.modules.events.logs.models.entries import EventLogRealm, LogKind
-except Exception:  # fallback en entornos limitados (tests)
-    from enum import Enum
-
-    class EventLogRealm(Enum):  # type: ignore
-        participants = "participants"
-
-    class LogKind(Enum):  # type: ignore
-        positive = "positive"
-        negative = "negative"
-        warning = "warning"
-        change = "change"
-
+from indico.modules.events.payment.util import register_transaction, toggle_registration_payment
+from indico.modules.events.logs.models.entries import EventLogRealm, LogKind
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +86,7 @@ def _prepare_transaction_payload(
     if amount is not None:
         try:
             payload["amount"] = float(amount)
-        except (TypeError, ValueError):
+        except Exception:
             pass
     if currency and not payload.get("currency"):
         payload["currency"] = currency
@@ -121,40 +96,12 @@ def _prepare_transaction_payload(
 # -----------------------------------------------------
 # Estado de inscripción
 # -----------------------------------------------------
-def _apply_registration_paid_state(registration, paid: bool) -> bool:
-    """
-    Marca una inscripción como pagada/no pagada usando la mejor opción disponible
-    según la versión de Indico instalada.
-    """
-    if _toggle_registration_payment is not None:
-        try:
-            _toggle_registration_payment(registration, paid)
-            return True
-        except Exception:
-            logger.exception("toggle_registration_payment falló; probando alternativas")
-
-    if _apply_registration_status is not None:
-        try:
-            _apply_registration_status(registration, paid=paid)
-            return True
-        except Exception:
-            logger.exception("apply_registration_status falló")
-
-    if callable(getattr(registration, "update_state", None)):
-        try:
-            registration.update_state(paid=paid)
-            return True
-        except Exception:
-            logger.exception("update_state falló en inscripción")
-
-    if callable(getattr(registration, "set_paid", None)):
-        try:
-            registration.set_paid(paid)
-            return True
-        except Exception:
-            logger.exception("set_paid falló en inscripción")
-
-    return False
+def _apply_registration_paid_state(registration, paid: bool) -> None:
+    """Marca la inscripción como pagada/no pagada usando la API oficial."""
+    try:
+        toggle_registration_payment(registration, paid)
+    except Exception:
+        logger.exception("No se pudo actualizar el estado de pago de la inscripción")
 
 
 # -----------------------------------------------------
@@ -164,7 +111,7 @@ def _log_event(
     registration,
     *,
     summary: str,
-    kind,
+    kind: LogKind,
     status: Optional[str],
     transaction_id: Optional[str],
     amount: Optional[Decimal],
@@ -305,9 +252,7 @@ def handle_failed_payment(
         action=action,
         data=data,
     )
-    if (cancelled or toggle_paid) and (
-        transaction is None or getattr(transaction, "status", None) not in {TransactionStatus.cancelled}
-    ):
+    if cancelled or toggle_paid:
         _apply_registration_paid_state(registration, False)
 
     _log_event(
@@ -342,7 +287,7 @@ def handle_refund(
         action=action,
         data=data,
     )
-    if success and (transaction is None or getattr(transaction, "status", None) not in {TransactionStatus.cancelled}):
+    if success:
         _apply_registration_paid_state(registration, False)
 
     _log_event(
