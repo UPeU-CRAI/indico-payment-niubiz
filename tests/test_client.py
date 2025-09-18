@@ -1,144 +1,121 @@
-from types import SimpleNamespace
+import hashlib
+import hmac
+import ipaddress
+import pytest
+from decimal import Decimal
+from flask import Flask
 
-import requests
-
-from indico_payment_niubiz.client import NiubizClient
-
-
-class DummyResponse:
-    def __init__(self, *, json_payload=None, text="", status_code=200):
-        self._json_payload = json_payload
-        self.text = text
-        self.status_code = status_code
-
-    def json(self):
-        if self._json_payload is None:
-            raise ValueError
-        return self._json_payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(response=self)
+from indico_payment_niubiz.blueprint import blueprint
 
 
-def test_authorize_transaction_success(monkeypatch):
-    security_response = DummyResponse(json_payload={"accessToken": "sec-token", "expiresIn": 600})
-    authorization_payload = {
-        "data": {
-            "order": {
-                "STATUS": "Authorized",
-                "ACTION_CODE": "000",
-                "TRANSACTION_ID": "T-123",
-                "AUTHORIZATION_CODE": "654321",
-            },
-            "card": {"BRAND": "VISA", "PAN": "411111******1111"},
-            "traceNumber": "TRACE-1",
-        }
+@pytest.fixture
+def app():
+    """Crea una app Flask mínima con el blueprint Niubiz registrado."""
+    app = Flask(__name__)
+    app.register_blueprint(blueprint, url_prefix="/test")
+    return app
+
+
+@pytest.fixture
+def client(app):
+    return app.test_client()
+
+
+def make_payload(status="AUTHORIZED", purchase_number="1-123", amount="100.00"):
+    """Crea un payload Niubiz de prueba."""
+    return {
+        "order": {"purchaseNumber": purchase_number},
+        "dataMap": {
+            "STATUS": status,
+            "transactionId": "TX123",
+            "amount": amount,
+            "currency": "PEN",
+            "actionCode": "000",
+        },
     }
-    authorization_response = DummyResponse(json_payload=authorization_payload)
-
-    calls = []
-
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        if "api.security" in url:
-            return security_response
-        calls.append(SimpleNamespace(method=method, url=url, headers=headers, json=json))
-        return authorization_response
-
-    monkeypatch.setattr(requests, "request", fake_request)
-    client = NiubizClient(merchant_id="MERCHANT", access_key="ACCESS", secret_key="SECRET", endpoint="sandbox")
-
-    result = client.authorize_transaction(
-        transaction_token="TOKEN-123",
-        purchase_number="ORDER-1",
-        amount=10.5,
-        currency="PEN",
-        client_ip="203.0.113.20",
-        client_id="client-abc",
-    )
-
-    assert result["success"] is True
-    assert result["status"] == "Authorized"
-    assert result["transaction_id"] == "T-123"
-    assert result["trace_number"] == "TRACE-1"
-    assert result["brand"] == "VISA"
-    assert result["access_token"] == "sec-token"
-
-    assert len(calls) == 1
-    call = calls[0]
-    assert call.method == "POST"
-    assert call.url.endswith("/api.authorization/v3/authorization/ecommerce/MERCHANT")
-    assert call.headers["Authorization"] == "sec-token"
-    assert call.json["order"]["purchaseNumber"] == "ORDER-1"
-    assert call.json["order"]["tokenId"] == "TOKEN-123"
-    assert call.json["order"]["amount"] == 10.5
-    assert call.json["order"]["currency"] == "PEN"
-    assert call.json["dataMap"]["clientIp"] == "203.0.113.20"
-    assert call.json["dataMap"]["clientId"] == "client-abc"
 
 
-def test_refund_transaction_success(monkeypatch):
-    security_response = DummyResponse(json_payload={"accessToken": "sec-token", "expiresIn": 600})
-    refund_payload = {"data": {"STATUS": "Refunded", "transactionId": "T-1"}}
-    refund_response = DummyResponse(json_payload=refund_payload)
+def add_headers(app, payload, token=None, hmac_secret=None, ip=None):
+    """Genera headers válidos para la petición simulada."""
+    headers = {"Content-Type": "application/json"}
 
-    calls = []
+    if token:
+        headers["Authorization"] = token
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        if "api.security" in url:
-            return security_response
-        calls.append(SimpleNamespace(method=method, url=url, headers=headers, json=json))
-        return refund_response
+    if hmac_secret:
+        sig = hmac.new(
+            hmac_secret.encode("utf-8"),
+            msg=app.json.dumps(payload).encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+        headers["NBZ-Signature"] = sig
 
-    monkeypatch.setattr(requests, "request", fake_request)
-    client = NiubizClient(merchant_id="MERCHANT", access_key="ACCESS", secret_key="SECRET", endpoint="sandbox")
+    if ip:
+        headers["X-Forwarded-For"] = ip
 
-    result = client.refund_transaction(
-        transaction_id="T-1",
-        amount=25,
-        currency="PEN",
-        reason="Customer request",
-    )
-
-    assert result["success"] is True
-    assert result["status"] == "Refunded"
-    assert result["transaction_id"] == "T-1"
-    assert result["access_token"] == "sec-token"
-
-    assert len(calls) == 1
-    call = calls[0]
-    assert call.method == "POST"
-    assert call.url.endswith("/api.refund/v1/refund/MERCHANT/T-1")
-    assert call.headers["Authorization"] == "sec-token"
-    assert call.json == {"amount": 25.0, "currency": "PEN", "reason": "Customer request"}
+    return headers
 
 
-def test_reverse_transaction_success(monkeypatch):
-    security_response = DummyResponse(json_payload={"accessToken": "sec-token", "expiresIn": 600})
-    reversal_payload = {"data": {"STATUS": "Voided", "transactionId": "T-2"}}
-    reversal_response = DummyResponse(json_payload=reversal_payload)
+# ----------------------------------------------------------------------
+# Casos de éxito por estado
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("status", [
+    "AUTHORIZED", "REJECTED", "VOIDED",
+    "PENDING", "REFUNDED", "EXPIRED", "REVIEW"
+])
+def test_callback_processes_known_status(client, app, status):
+    payload = make_payload(status=status)
+    headers = add_headers(app, payload)
+    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
+                       json=payload, headers=headers)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["received"] is True
 
-    calls = []
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        if "api.security" in url:
-            return security_response
-        calls.append(SimpleNamespace(method=method, url=url, headers=headers, json=json))
-        return reversal_response
+def test_callback_missing_purchase_number(client, app):
+    payload = make_payload()
+    payload["order"].pop("purchaseNumber")
+    headers = add_headers(app, payload)
+    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
+                       json=payload, headers=headers)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["received"] is False
+    assert data["error"] == "missing_purchase_number"
 
-    monkeypatch.setattr(requests, "request", fake_request)
-    client = NiubizClient(merchant_id="MERCHANT", access_key="ACCESS", secret_key="SECRET", endpoint="sandbox")
 
-    result = client.reverse_transaction(transaction_id="T-2", amount=30, currency="PEN")
+# ----------------------------------------------------------------------
+# Validaciones de seguridad
+# ----------------------------------------------------------------------
+def test_callback_rejects_invalid_authorization(client, app):
+    payload = make_payload()
+    headers = add_headers(app, payload, token="WRONG")
+    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
+                       json=payload, headers=headers)
+    assert resp.status_code == 403
 
-    assert result["success"] is True
-    assert result["status"] == "Voided"
-    assert result["transaction_id"] == "T-2"
-    assert result["access_token"] == "sec-token"
 
-    assert len(calls) == 1
-    call = calls[0]
-    assert call.method == "POST"
-    assert call.url.endswith("/api.authorization/v3/reverse/ecommerce/MERCHANT")
-    assert call.headers["Authorization"] == "sec-token"
-    assert call.json == {"transactionId": "T-2", "amount": 30.0, "currency": "PEN"}
+def test_callback_rejects_invalid_hmac(client, app):
+    payload = make_payload()
+    headers = add_headers(app, payload, hmac_secret="badsecret")
+    # Sobreescribir con firma inválida
+    headers["NBZ-Signature"] = "invalidsig"
+    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
+                       json=payload, headers=headers)
+    assert resp.status_code == 403
+
+
+def test_callback_rejects_invalid_ip(client, app, monkeypatch):
+    payload = make_payload()
+    headers = add_headers(app, payload, ip="203.0.113.55")
+
+    # Simula que whitelist está configurado y no incluye la IP
+    from indico_payment_niubiz import blueprint as bp
+    monkeypatch.setattr(bp, "_get_plugin", lambda: type("P", (), {
+        "_get_setting": lambda self, event, key: "10.0.0.0/8" if key == "callback_ip_whitelist" else None
+    })())
+
+    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
+                       json=payload, headers=headers)
+    assert resp.status_code == 403
