@@ -2,7 +2,7 @@
 name = 'indico-plugin-payment-niubiz'
 description = 'Niubiz payments for Indico event registration fees'
 readme = 'README.md'
-version = '0.1.0'
+version = '0.0.1'
 license = 'MIT'
 authors = [{ name = 'Indico Team', email = 'indico-team@cern.ch' }]
 classifiers = [

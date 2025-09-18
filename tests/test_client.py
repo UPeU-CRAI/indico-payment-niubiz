@@ -1,9 +1,10 @@
 import json
+
 import pytest
 import responses
 from decimal import Decimal
 
-from indico_payment_niubiz.client import NiubizClient, NiubizAPIError
+from indico_payment_niubiz.client import NiubizAuthError, NiubizClient
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ def test_get_auth_token_fail(client):
     url = f"{client.base_url}/api.security/v1/security"
     responses.add("POST", url, status=500)
 
-    with pytest.raises(NiubizAPIError):
+    with pytest.raises(NiubizAuthError):
         client.get_auth_token()
 
 

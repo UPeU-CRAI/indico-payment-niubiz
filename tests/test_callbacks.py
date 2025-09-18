@@ -1,13 +1,6 @@
-import hashlib
-import hmac
-import ipaddress
-from decimal import Decimal
-
 import pytest
-from flask import url_for
 
 from indico.modules.events.payment.models.transactions import TransactionAction
-from indico_payment_niubiz.status_mapping import NIUBIZ_STATUS_MAP
 
 
 # ----------------------------------------------------------------------
@@ -22,10 +15,6 @@ def _make_payload(status="AUTHORIZED", purchase_number="1-1", txn_id="abc123", a
         "currency": "PEN",
         "actionCode": "000",
     }
-
-
-def _make_signature(secret, payload_bytes):
-    return hmac.new(secret.encode("utf-8"), msg=payload_bytes, digestmod=hashlib.sha256).hexdigest()
 
 
 # ----------------------------------------------------------------------

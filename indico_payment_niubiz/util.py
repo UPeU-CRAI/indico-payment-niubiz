@@ -220,6 +220,9 @@ def map_niubiz_status(
     if status_lower in {"expired", "expirado", "expirada"}:
         return StatusMapping(TransactionStatus.cancelled)
 
+    if status_lower in {"refunded", "refund", "reembolsado", "reembolsada"}:
+        return StatusMapping(TransactionStatus.cancelled)
+
     if status_lower in {"rejected"}:
         return StatusMapping(TransactionStatus.failed)
 
