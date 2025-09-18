@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Dict
 from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
-from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
 from indico.web.rh import RH
 
@@ -32,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 def _get_plugin() -> "NiubizPaymentPlugin":
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
-
     return NiubizPaymentPlugin.instance
 
 
@@ -40,9 +38,12 @@ class RHNiubizCallback(RH):
     """Procesa los callbacks de Niubiz y delega la lógica centralizada."""
 
     def _check_access(self):
-        return True
+        return True  # No requiere autenticación de usuario
 
     def _process(self):
+        # -------------------------------
+        # Parsear payload
+        # -------------------------------
         payload = request.get_json(force=True, silent=True)
         if not isinstance(payload, dict):
             logger.warning("Callback Niubiz recibido sin JSON válido")
@@ -52,10 +53,16 @@ class RHNiubizCallback(RH):
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
+        # -------------------------------
+        # Validaciones de seguridad
+        # -------------------------------
         self._validate_authorization(event, plugin)
         self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
+        # -------------------------------
+        # Extraer identificadores
+        # -------------------------------
         purchase_number = self._extract_value(payload, "purchaseNumber")
         if not purchase_number:
             return jsonify({"received": False, "error": "missing_purchase_number"})
@@ -70,6 +77,9 @@ class RHNiubizCallback(RH):
         if not registration or registration.event_id != event.id:
             return jsonify({"received": False, "error": "registration_not_found"})
 
+        # -------------------------------
+        # Extraer datos de la transacción
+        # -------------------------------
         transaction_id = self._extract_value(payload, "transactionId", "operationNumber")
         status_value = self._extract_value(payload, "STATUS", "status")
         action_code = self._extract_value(payload, "actionCode", "ACTION_CODE")
@@ -95,6 +105,9 @@ class RHNiubizCallback(RH):
         )
         transaction_data.update(self._collect_additional_details(payload, currency, amount_decimal))
 
+        # -------------------------------
+        # Resolver acción según mapping
+        # -------------------------------
         status_key = (status_value or "").strip().upper()
         config = NIUBIZ_STATUS_MAP.get(status_key, DEFAULT_STATUS)
         action = config["action"]
@@ -102,13 +115,14 @@ class RHNiubizCallback(RH):
         toggle_paid = config.get("toggle_paid", False)
 
         logger.info(
-            "Callback Niubiz recibido: purchase=%s, transaction_id=%s, status=%s",  # noqa: G004
-            purchase_number,
-            transaction_id,
-            status_value,
+            "Callback Niubiz recibido: purchase=%s, txn=%s, status=%s",
+            purchase_number, transaction_id, status_value,
         )
         logger.debug("Payload completo recibido: %r", payload)
 
+        # -------------------------------
+        # Delegar al handler correspondiente
+        # -------------------------------
         if status_key == "REFUNDED":
             handle_refund(
                 registration,
@@ -120,7 +134,7 @@ class RHNiubizCallback(RH):
                 data=transaction_data,
                 success=True,
             )
-        elif action == TransactionAction.complete:
+        elif action.complete == action:  # pago confirmado
             handle_successful_payment(
                 registration,
                 amount=amount_decimal,
@@ -131,7 +145,7 @@ class RHNiubizCallback(RH):
                 data=transaction_data,
                 toggle_paid=toggle_paid,
             )
-        elif action == TransactionAction.pending:
+        elif action.pending == action:  # pago pendiente
             handle_pending_payment(
                 registration,
                 amount=amount_decimal,
@@ -141,7 +155,7 @@ class RHNiubizCallback(RH):
                 summary=summary,
                 data=transaction_data,
             )
-        elif action in {TransactionAction.reject, TransactionAction.cancel}:
+        elif action in {action.reject, action.cancel}:  # fallidos/anulados
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -150,10 +164,10 @@ class RHNiubizCallback(RH):
                 status=status_value,
                 summary=summary,
                 data=transaction_data,
-                cancelled=(action == TransactionAction.cancel),
+                cancelled=(action == action.cancel),
                 toggle_paid=toggle_paid,
             )
-        else:
+        else:  # fallback defensivo
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -261,6 +275,9 @@ class RHNiubizCallback(RH):
         raise Forbidden("IP not allowed")
 
 
+# ----------------------------------------------------------------------
+# Registro del blueprint
+# ----------------------------------------------------------------------
 blueprint = Blueprint("payment_niubiz", __name__)
 blueprint.add_url_rule(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/response/niubiz/notify",
