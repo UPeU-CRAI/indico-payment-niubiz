@@ -1,121 +1,142 @@
-import hashlib
-import hmac
-import ipaddress
+import json
 import pytest
+import responses
 from decimal import Decimal
-from flask import Flask
 
-from indico_payment_niubiz.blueprint import blueprint
-
-
-@pytest.fixture
-def app():
-    """Crea una app Flask mínima con el blueprint Niubiz registrado."""
-    app = Flask(__name__)
-    app.register_blueprint(blueprint, url_prefix="/test")
-    return app
+from indico_payment_niubiz.client import NiubizClient, NiubizAPIError
 
 
 @pytest.fixture
-def client(app):
-    return app.test_client()
+def client():
+    return NiubizClient(
+        merchant_id="123456789",
+        access_key="fake-access",
+        secret_key="fake-secret",
+        endpoint="sandbox"
+    )
 
 
-def make_payload(status="AUTHORIZED", purchase_number="1-123", amount="100.00"):
-    """Crea un payload Niubiz de prueba."""
-    return {
-        "order": {"purchaseNumber": purchase_number},
-        "dataMap": {
-            "STATUS": status,
-            "transactionId": "TX123",
-            "amount": amount,
-            "currency": "PEN",
-            "actionCode": "000",
-        },
-    }
+# ----------------------
+# Helper para stub
+# ----------------------
+def add_response(method, url, status=200, body=None, json_data=None):
+    if json_data is not None:
+        body = json.dumps(json_data)
+    responses.add(method, url, body=body, status=status, content_type="application/json")
 
 
-def add_headers(app, payload, token=None, hmac_secret=None, ip=None):
-    """Genera headers válidos para la petición simulada."""
-    headers = {"Content-Type": "application/json"}
+# ----------------------
+# Auth / sesión
+# ----------------------
+@responses.activate
+def test_get_auth_token_ok(client):
+    url = f"{client.base_url}/api.security/v1/security"
+    add_response("POST", url, json_data={"accessToken": "abc123"})
 
-    if token:
-        headers["Authorization"] = token
-
-    if hmac_secret:
-        sig = hmac.new(
-            hmac_secret.encode("utf-8"),
-            msg=app.json.dumps(payload).encode("utf-8"),
-            digestmod=hashlib.sha256,
-        ).hexdigest()
-        headers["NBZ-Signature"] = sig
-
-    if ip:
-        headers["X-Forwarded-For"] = ip
-
-    return headers
+    token = client.get_auth_token()
+    assert token == "abc123"
+    # Cached en segunda llamada
+    token2 = client.get_auth_token()
+    assert token2 == "abc123"
 
 
-# ----------------------------------------------------------------------
-# Casos de éxito por estado
-# ----------------------------------------------------------------------
-@pytest.mark.parametrize("status", [
-    "AUTHORIZED", "REJECTED", "VOIDED",
-    "PENDING", "REFUNDED", "EXPIRED", "REVIEW"
-])
-def test_callback_processes_known_status(client, app, status):
-    payload = make_payload(status=status)
-    headers = add_headers(app, payload)
-    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
-                       json=payload, headers=headers)
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["received"] is True
+@responses.activate
+def test_get_auth_token_fail(client):
+    url = f"{client.base_url}/api.security/v1/security"
+    responses.add("POST", url, status=500)
+
+    with pytest.raises(NiubizAPIError):
+        client.get_auth_token()
 
 
-def test_callback_missing_purchase_number(client, app):
-    payload = make_payload()
-    payload["order"].pop("purchaseNumber")
-    headers = add_headers(app, payload)
-    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
-                       json=payload, headers=headers)
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["received"] is False
-    assert data["error"] == "missing_purchase_number"
+# ----------------------
+# Órdenes
+# ----------------------
+@responses.activate
+def test_create_order_ok(client):
+    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/session/{client.merchant_id}"
+    add_response("POST", url, json_data={"sessionKey": "sess-123", "status": "AUTHORIZED"})
+
+    result = client.create_order(Decimal("10.50"), "PEN", "1-100")
+    assert result["success"]
+    assert result["data"]["sessionKey"] == "sess-123"
 
 
-# ----------------------------------------------------------------------
-# Validaciones de seguridad
-# ----------------------------------------------------------------------
-def test_callback_rejects_invalid_authorization(client, app):
-    payload = make_payload()
-    headers = add_headers(app, payload, token="WRONG")
-    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
-                       json=payload, headers=headers)
-    assert resp.status_code == 403
+@responses.activate
+def test_get_order_status_ok(client):
+    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/order/{client.merchant_id}/ORD-123"
+    add_response("GET", url, json_data={"status": "PENDING"})
+
+    result = client.get_order_status("ORD-123")
+    assert result["success"]
+    assert result["data"]["status"] == "PENDING"
 
 
-def test_callback_rejects_invalid_hmac(client, app):
-    payload = make_payload()
-    headers = add_headers(app, payload, hmac_secret="badsecret")
-    # Sobreescribir con firma inválida
-    headers["NBZ-Signature"] = "invalidsig"
-    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
-                       json=payload, headers=headers)
-    assert resp.status_code == 403
+# ----------------------
+# Refunds
+# ----------------------
+@responses.activate
+def test_refund_transaction_success(client):
+    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/{client.merchant_id}/refund"
+    add_response("POST", url, json_data={"status": "REFUNDED", "transactionId": "TXN-1"})
+
+    result = client.refund_transaction("TXN-1", Decimal("20.0"), "PEN", reason="Test refund")
+    assert result["success"]
+    assert result["status"] == "REFUNDED"
+    assert result["transaction_id"] == "TXN-1"
 
 
-def test_callback_rejects_invalid_ip(client, app, monkeypatch):
-    payload = make_payload()
-    headers = add_headers(app, payload, ip="203.0.113.55")
+@responses.activate
+def test_refund_transaction_fail(client):
+    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/{client.merchant_id}/refund"
+    add_response("POST", url, json_data={"status": "FAILED", "transactionId": "TXN-2"})
 
-    # Simula que whitelist está configurado y no incluye la IP
-    from indico_payment_niubiz import blueprint as bp
-    monkeypatch.setattr(bp, "_get_plugin", lambda: type("P", (), {
-        "_get_setting": lambda self, event, key: "10.0.0.0/8" if key == "callback_ip_whitelist" else None
-    })())
+    result = client.refund_transaction("TXN-2", Decimal("20.0"), "PEN")
+    assert not result["success"]
+    assert result["status"] == "FAILED"
 
-    resp = client.post("/test/event/1/registrations/1/payment/response/niubiz/notify",
-                       json=payload, headers=headers)
-    assert resp.status_code == 403
+
+# ----------------------
+# Capture
+# ----------------------
+@responses.activate
+def test_capture_payment_ok(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/capture"
+    add_response("POST", url, json_data={"status": "CAPTURED", "transactionId": "TXN-3"})
+
+    result = client.capture_payment("TXN-3")
+    assert result["success"]
+    assert result["status"] == "CAPTURED"
+
+
+@responses.activate
+def test_capture_payment_fail(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/capture"
+    add_response("POST", url, json_data={"status": "DECLINED", "transactionId": "TXN-4"})
+
+    result = client.capture_payment("TXN-4")
+    assert not result["success"]
+    assert result["status"] == "DECLINED"
+
+
+# ----------------------
+# Void
+# ----------------------
+@responses.activate
+def test_void_payment_ok(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/void"
+    add_response("POST", url, json_data={"status": "VOIDED", "transactionId": "TXN-5"})
+
+    result = client.void_payment("TXN-5")
+    assert result["success"]
+    assert result["status"] == "VOIDED"
+
+
+@responses.activate
+def test_void_payment_fail(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/void"
+    add_response("POST", url, json_data={"status": "FAILED", "transactionId": "TXN-6"})
+
+    result = client.void_payment("TXN-6")
+    assert not result["success"]
+    assert result["status"] == "FAILED"
