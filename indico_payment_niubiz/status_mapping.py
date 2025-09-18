@@ -1,23 +1,27 @@
-"""
-Centraliza el mapeo de estados de Niubiz a acciones y efectos en Indico.
-"""
-
 from indico.modules.events.payment.models.transactions import TransactionAction
 
-# Diccionario principal: estados Niubiz → configuración de Indico
+"""
+Mapeo de estados Niubiz → acciones en Indico.
+
+Cada estado devuelve:
+- action: TransactionAction (cómo registrar la transacción en Indico)
+- toggle_paid: bool (si debe marcar/desmarcar la inscripción como pagada)
+- summary: str (mensaje para logs y auditoría)
+"""
+
 NIUBIZ_STATUS_MAP = {
-    # ------------------------------
-    # Confirmados
-    # ------------------------------
+    # -------------------------------------------------
+    # Confirmados (venta exitosa)
+    # -------------------------------------------------
     "AUTHORIZED": {
         "action": TransactionAction.complete,
         "toggle_paid": True,
         "summary": "Pago confirmado exitosamente por Niubiz",
     },
 
-    # ------------------------------
+    # -------------------------------------------------
     # Fallidos / No autorizados
-    # ------------------------------
+    # -------------------------------------------------
     "REJECTED": {
         "action": TransactionAction.reject,
         "toggle_paid": False,
@@ -34,9 +38,9 @@ NIUBIZ_STATUS_MAP = {
         "summary": "Pago no autorizado por Niubiz",
     },
 
-    # ------------------------------
+    # -------------------------------------------------
     # Anulados / Cancelados
-    # ------------------------------
+    # -------------------------------------------------
     "VOIDED": {
         "action": TransactionAction.cancel,
         "toggle_paid": False,
@@ -53,9 +57,9 @@ NIUBIZ_STATUS_MAP = {
         "summary": "Pago cancelado por Niubiz",
     },
 
-    # ------------------------------
+    # -------------------------------------------------
     # Pendientes
-    # ------------------------------
+    # -------------------------------------------------
     "PENDING": {
         "action": TransactionAction.pending,
         "toggle_paid": False,
@@ -64,29 +68,31 @@ NIUBIZ_STATUS_MAP = {
     "REVIEW": {
         "action": TransactionAction.pending,
         "toggle_paid": False,
-        "summary": "Pago en revisión antifraude",
+        "summary": "Pago en revisión antifraude en Niubiz",
     },
 
-    # ------------------------------
+    # -------------------------------------------------
     # Expirados
-    # ------------------------------
+    # -------------------------------------------------
     "EXPIRED": {
         "action": TransactionAction.reject,
         "toggle_paid": False,
         "summary": "Pago expirado en Niubiz",
     },
 
-    # ------------------------------
+    # -------------------------------------------------
     # Reembolsos
-    # ------------------------------
+    # -------------------------------------------------
     "REFUNDED": {
         "action": TransactionAction.cancel,
-        "toggle_paid": True,  # revierte a "no pagada"
+        "toggle_paid": True,  # revierte a no pagado
         "summary": "Pago reembolsado por Niubiz",
     },
 }
 
-# Configuración por defecto en caso de estado desconocido
+# -------------------------------------------------
+# Fallback para estados desconocidos
+# -------------------------------------------------
 DEFAULT_STATUS = {
     "action": TransactionAction.reject,
     "toggle_paid": False,
