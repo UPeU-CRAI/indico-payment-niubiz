@@ -1,26 +1,28 @@
+from __future__ import annotations
+
 import hashlib
 import hmac
 import ipaddress
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict
 
 from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
-from indico.web.rh import RH
-from indico.modules.events.registration.models.registrations import Registration
 from indico.modules.events.payment.models.transactions import TransactionAction
+from indico.modules.events.registration.models.registrations import Registration
+from indico.web.rh import RH
 
-from indico_payment_niubiz.status_mapping import NIUBIZ_STATUS_MAP, DEFAULT_STATUS
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
-    parse_amount,
-    record_payment_transaction,
-    handle_successful_payment,
     handle_failed_payment,
+    handle_pending_payment,
     handle_refund,
+    handle_successful_payment,
+    parse_amount,
 )
+from indico_payment_niubiz.status_mapping import DEFAULT_STATUS, NIUBIZ_STATUS_MAP
 
 if TYPE_CHECKING:
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
@@ -30,19 +32,17 @@ logger = logging.getLogger(__name__)
 
 def _get_plugin() -> "NiubizPaymentPlugin":
     from indico_payment_niubiz.plugin import NiubizPaymentPlugin
+
     return NiubizPaymentPlugin.instance
 
 
 class RHNiubizCallback(RH):
-    """Maneja los callbacks (webhooks) enviados por Niubiz a Indico."""
+    """Procesa los callbacks de Niubiz y delega la lógica centralizada."""
 
     def _check_access(self):
-        return True  # no requiere autenticación de usuario
+        return True
 
     def _process(self):
-        # -------------------------------
-        # Parsear JSON del callback
-        # -------------------------------
         payload = request.get_json(force=True, silent=True)
         if not isinstance(payload, dict):
             logger.warning("Callback Niubiz recibido sin JSON válido")
@@ -52,16 +52,10 @@ class RHNiubizCallback(RH):
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
-        # -------------------------------
-        # Validaciones de seguridad
-        # -------------------------------
         self._validate_authorization(event, plugin)
         self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
-        # -------------------------------
-        # Extraer datos clave
-        # -------------------------------
         purchase_number = self._extract_value(payload, "purchaseNumber")
         if not purchase_number:
             return jsonify({"received": False, "error": "missing_purchase_number"})
@@ -77,9 +71,9 @@ class RHNiubizCallback(RH):
             return jsonify({"received": False, "error": "registration_not_found"})
 
         transaction_id = self._extract_value(payload, "transactionId", "operationNumber")
-        status = self._extract_value(payload, "STATUS", "status")
-        action_code = self._extract_value(payload, "actionCode")
-        amount = self._extract_value(payload, "amount")
+        status_value = self._extract_value(payload, "STATUS", "status")
+        action_code = self._extract_value(payload, "actionCode", "ACTION_CODE")
+        amount_value = self._extract_value(payload, "amount")
         currency = (
             self._extract_value(payload, "currency")
             or getattr(registration, "currency", None)
@@ -87,96 +81,88 @@ class RHNiubizCallback(RH):
         )
 
         amount_decimal = parse_amount(
-            amount,
+            amount_value,
             fallback=parse_amount(getattr(registration, "price", None), Decimal("0")),
         )
 
         transaction_data = build_transaction_data(
             payload=payload,
             source="callback",
-            status=status,
+            status=status_value,
+            action_code=action_code,
             transaction_id=transaction_id,
             order_id=purchase_number,
-            action_code=action_code,
         )
-        transaction_data.update(
-            {"amount": float(amount_decimal) if amount_decimal else None, "currency": currency}
-        )
+        transaction_data.update(self._collect_additional_details(payload, currency, amount_decimal))
+
+        status_key = (status_value or "").strip().upper()
+        config = NIUBIZ_STATUS_MAP.get(status_key, DEFAULT_STATUS)
+        action = config["action"]
+        summary = config["summary"]
+        toggle_paid = config.get("toggle_paid", False)
 
         logger.info(
-            "Callback Niubiz recibido: purchase=%s, txn=%s, status=%s, action=%s",
-            purchase_number, transaction_id, status, action_code,
+            "Callback Niubiz recibido: purchase=%s, transaction_id=%s, status=%s",  # noqa: G004
+            purchase_number,
+            transaction_id,
+            status_value,
         )
         logger.debug("Payload completo recibido: %r", payload)
 
-        # -------------------------------
-        # Mapear estados Niubiz → Indico
-        # -------------------------------
-        status_key = (status or "").strip().upper()
-        config = NIUBIZ_STATUS_MAP.get(status_key, DEFAULT_STATUS)
-
-        action = config["action"]
-        toggle_paid = config["toggle_paid"]
-        summary = config["summary"]
-
-        # Derivar la acción concreta
         if status_key == "REFUNDED":
             handle_refund(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
                 transaction_id=transaction_id,
-                status=status,
+                status=status_value,
                 summary=summary,
                 data=transaction_data,
                 success=True,
             )
-
         elif action == TransactionAction.complete:
             handle_successful_payment(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
                 transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
+                status=status_value,
+                summary=summary,
+                data=transaction_data,
+                toggle_paid=toggle_paid,
+            )
+        elif action == TransactionAction.pending:
+            handle_pending_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status_value,
                 summary=summary,
                 data=transaction_data,
             )
-
-        elif action == TransactionAction.pending:
-            record_payment_transaction(
-                registration=registration,
-                amount=amount_decimal or Decimal("0"),
-                currency=currency,
-                action=TransactionAction.pending,
-                data=transaction_data,
-            )
-            logger.info("Pago pendiente registrado en Indico [purchase=%s]", purchase_number)
-
         elif action in {TransactionAction.reject, TransactionAction.cancel}:
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
                 transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
+                status=status_value,
                 summary=summary,
                 data=transaction_data,
                 cancelled=(action == TransactionAction.cancel),
+                toggle_paid=toggle_paid,
             )
-
         else:
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
                 transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
+                status=status_value,
                 summary="Estado no reconocido recibido desde Niubiz",
                 data=transaction_data,
+                cancelled=False,
             )
 
         return jsonify({"received": True})
@@ -185,7 +171,7 @@ class RHNiubizCallback(RH):
     # Utilidades internas
     # ------------------------------------------------------------------
     @staticmethod
-    def _extract_value(payload: dict, *keys: str):
+    def _extract_value(payload: Dict[str, Any], *keys: str):
         order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
         data_map = payload.get("dataMap") if isinstance(payload.get("dataMap"), dict) else {}
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -219,6 +205,20 @@ class RHNiubizCallback(RH):
         except Exception:
             logger.exception("Error consultando inscripción id=%s", registration_id)
             return None
+
+    @staticmethod
+    def _collect_additional_details(payload: Dict[str, Any], currency: str, amount: Decimal | None) -> Dict[str, Any]:
+        details: Dict[str, Any] = {
+            "currency": currency,
+            "amount": float(amount) if amount is not None else None,
+            "status_order": RHNiubizCallback._extract_value(payload, "statusOrder"),
+            "operation_number": RHNiubizCallback._extract_value(payload, "operationNumber"),
+            "action_description": RHNiubizCallback._extract_value(payload, "actionDescription"),
+            "channel": RHNiubizCallback._extract_value(payload, "channel"),
+            "payment_method": RHNiubizCallback._extract_value(payload, "paymentMethod"),
+            "cip": RHNiubizCallback._extract_value(payload, "cip"),
+        }
+        return {k: v for k, v in details.items() if v is not None}
 
     # ------------------------------------------------------------------
     # Validaciones de seguridad
@@ -261,9 +261,6 @@ class RHNiubizCallback(RH):
         raise Forbidden("IP not allowed")
 
 
-# ----------------------------------------------------------------------
-# Registro del blueprint
-# ----------------------------------------------------------------------
 blueprint = Blueprint("payment_niubiz", __name__)
 blueprint.add_url_rule(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/response/niubiz/notify",

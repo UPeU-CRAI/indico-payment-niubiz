@@ -1,25 +1,52 @@
+from __future__ import annotations
+
 import hashlib
 import json
 from decimal import Decimal
+import hmac
 from types import SimpleNamespace
-from unittest.mock import Mock
+from typing import Dict
 
 import pytest
 from flask import Flask, request
+from werkzeug.exceptions import Forbidden
 
-from indico_payment_niubiz.controllers import RHNiubizCallback
+from indico.modules.events.payment.models.transactions import TransactionAction, TransactionStatus
+
+from indico_payment_niubiz.blueprint import RHNiubizCallback
 
 
 def _make_registration():
-    registration = Mock()
+    event_log_entries = []
+
+    class DummyEvent:
+        id = 123
+
+        def __init__(self):
+            self.log_entries = event_log_entries
+
+        def log(self, realm, kind, module, summary, data=None, meta=None):
+            self.log_entries.append(
+                {
+                    "realm": realm,
+                    "kind": kind,
+                    "module": module,
+                    "summary": summary,
+                    "data": data or {},
+                }
+            )
+
+    registration = SimpleNamespace()
     registration.id = 10
-    registration.price = Decimal("50")
+    registration.event_id = 123
+    registration.registration_form_id = 5
+    registration.price = Decimal("50.00")
     registration.currency = "PEN"
-    registration.event_id = 1
-    registration.registration_form_id = 2
-    registration.event = SimpleNamespace(id=1)
-    registration.user = SimpleNamespace(id=5)
-    registration.set_paid = Mock()
+    registration.event = DummyEvent()
+    registration.update_state = lambda *a, **k: None
+    registration.set_paid = lambda *a, **k: None
+    registration.event.log = registration.event.log  # satisfy attribute lookup
+    registration._log_entries = event_log_entries
     return registration
 
 
@@ -30,249 +57,244 @@ def flask_app():
     return app
 
 
-def _mock_registration_lookup(monkeypatch, registration):
-    def _filter_by(**kwargs):
-        matches = (
-            kwargs.get("id") == registration.id
-            and kwargs.get("event_id") == registration.event_id
-            and kwargs.get("registration_form_id") == registration.registration_form_id
+@pytest.fixture
+def plugin_factory(monkeypatch):
+    class DummyPlugin:
+        def __init__(self, settings: Dict[str, str]):
+            self._settings = settings
+
+        def _get_setting(self, event, key: str) -> str:
+            return self._settings.get(key, "")
+
+    def _factory(settings):
+        plugin = DummyPlugin(settings)
+        monkeypatch.setattr("indico_payment_niubiz.blueprint._get_plugin", lambda: plugin)
+        return plugin
+
+    return _factory
+
+
+@pytest.fixture
+def register_transaction_calls(monkeypatch):
+    calls = []
+
+    def _fake_register_transaction(*, registration, amount, currency, action, provider=None, data=None):
+        calls.append(
+            {
+                "registration": registration,
+                "amount": amount,
+                "currency": currency,
+                "action": action,
+                "provider": provider,
+                "data": data,
+            }
         )
-        return SimpleNamespace(first=lambda: registration if matches else None)
+        status_map = {
+            TransactionAction.complete: TransactionStatus.successful,
+            TransactionAction.cancel: TransactionStatus.cancelled,
+            TransactionAction.pending: TransactionStatus.pending,
+            TransactionAction.reject: TransactionStatus.rejected,
+        }
+        return SimpleNamespace(status=status_map.get(action))
 
-    fake_registration = SimpleNamespace(
-        query=SimpleNamespace(filter_by=_filter_by),
-        get=lambda reg_id: registration if reg_id == registration.id else None,
-    )
-    monkeypatch.setattr("indico_payment_niubiz.controllers.Registration", fake_registration)
-
-
-def _build_handler(monkeypatch, registration, settings=None):
-    handler = RHNiubizCallback()
-    _mock_registration_lookup(monkeypatch, registration)
-    values = settings or {}
-
-    def _fake_setting(self, name):
-        return values.get(name, "")
-
-    monkeypatch.setattr(RHNiubizCallback, "_get_scoped_setting", _fake_setting)
-    monkeypatch.setattr(RHNiubizCallback, "_get_credentials", lambda self: ("ACCESS", values.get("__secret__", "secret")))
     monkeypatch.setattr(
-        "indico_payment_niubiz.controllers.db",
-        SimpleNamespace(session=SimpleNamespace(commit=lambda: None)),
+        "indico_payment_niubiz.indico_integration.register_transaction",
+        _fake_register_transaction,
     )
-    return handler
+    return calls
 
 
-def test_callback_successful_payment(flask_app, monkeypatch):
+def _configure_request(monkeypatch, registration, *, plugin_settings, remote_ip="200.48.119.10"):
+    def _locate_event(self, event_id):  # pragma: no cover - simple delegation
+        return registration.event
+
+    def _get_registration_from_id(self, reg_id):
+        return registration if reg_id == registration.id else None
+
+    monkeypatch.setattr(RHNiubizCallback, "_locate_event", _locate_event)
+    monkeypatch.setattr(RHNiubizCallback, "_get_registration_from_id", _get_registration_from_id)
+    return plugin_settings
+
+
+def _build_headers(body: str, settings: Dict[str, str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    token = settings.get("callback_authorization_token")
+    if token:
+        headers["Authorization"] = token
+    secret = settings.get("callback_hmac_secret")
+    if secret:
+        headers["NBZ-Signature"] = hmac.new(
+            secret.encode("utf-8"),
+            body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    return headers
+
+
+@pytest.mark.parametrize(
+    "status, expected_action, expected_kind, summary",
+    [
+        ("AUTHORIZED", TransactionAction.complete, "positive", "Pago confirmado por Niubiz"),
+        ("REJECTED", TransactionAction.reject, "negative", "Pago rechazado por Niubiz"),
+        ("NOT AUTHORIZED", TransactionAction.reject, "negative", "Pago no autorizado por Niubiz"),
+        ("VOIDED", TransactionAction.cancel, "change", "Pago anulado por Niubiz"),
+        ("CANCELLED", TransactionAction.cancel, "change", "Pago cancelado por Niubiz"),
+        ("PENDING", TransactionAction.pending, "warning", "Pago pendiente en Niubiz"),
+        ("REFUNDED", TransactionAction.cancel, "change", "Reembolso confirmado por Niubiz"),
+        ("EXPIRED", TransactionAction.reject, "negative", "Orden expirada en Niubiz"),
+        ("REVIEW", TransactionAction.pending, "warning", "Pago en revisión antifraude Niubiz"),
+    ],
+)
+def test_callback_status_flows(
+    flask_app,
+    monkeypatch,
+    plugin_factory,
+    register_transaction_calls,
+    status,
+    expected_action,
+    expected_kind,
+    summary,
+):
     registration = _make_registration()
-    handler = _build_handler(monkeypatch, registration)
-
-    success_calls = {}
-    log_entries = []
-
-    def fake_success(registration, **kwargs):
-        success_calls.update(kwargs)
-
-    def fake_log(registration, summary, *, kind, data, meta=None):
-        log_entries.append({"summary": summary, "data": data, "kind": kind})
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", fake_success)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", fake_log)
+    plugin_settings = {
+        "callback_authorization_token": "token",
+        "callback_hmac_secret": "secret",
+        "callback_ip_whitelist": "0.0.0.0/0",
+    }
+    plugin_factory(plugin_settings)
+    _configure_request(monkeypatch, registration, plugin_settings=plugin_settings)
 
     payload = {
-        "purchaseNumber": "1-10",
-        "transactionId": "T-1",
-        "STATUS": "Authorized",
-        "ACTION_CODE": "000",
+        "purchaseNumber": f"{registration.event_id}-{registration.id}",
+        "transactionId": "TX-1",
         "amount": "50.00",
-        "currency": "PEN",
-        "transactionDate": "2024-01-01T10:00:00",
-        "actionDescription": "Autorizado automáticamente",
+        "currency": registration.currency,
+        "STATUS": status,
+        "ACTION_CODE": "000",
     }
+    if status == "REFUNDED":
+        payload.pop("ACTION_CODE", None)
 
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
-        handler._process_args()
-        handler._process()
-
-    assert success_calls["transaction_id"] == "T-1"
-    assert success_calls["status"] == "Authorized"
-    assert success_calls["data"]["action_description"] == "Autorizado automáticamente"
-    assert any(entry["data"].get("mappedStatus") == "successful" for entry in log_entries)
-
-
-def test_callback_failed_payment(flask_app, monkeypatch):
-    registration = _make_registration()
-    handler = _build_handler(monkeypatch, registration)
-
-    failure_calls = {}
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-
-    def fake_failed(registration, **kwargs):
-        failure_calls.update(kwargs)
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", fake_failed)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", lambda *a, **k: None)
-
-    payload = {
-        "purchaseNumber": "1-10",
-        "transactionId": "T-2",
-        "STATUS": "Not Authorized",
-        "ACTION_CODE": "101",
-        "amount": "50",
-        "currency": "PEN",
-    }
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
-        handler._process_args()
-        handler._process()
-
-    assert failure_calls["status"] == "Not Authorized"
-    assert failure_calls["transaction_id"] == "T-2"
-
-
-def test_callback_pagoefectivo_pending(flask_app, monkeypatch):
-    registration = _make_registration()
-    handler = _build_handler(monkeypatch, registration)
-
-    pending_calls = {}
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", lambda *a, **k: None)
-
-    def fake_record(**kwargs):
-        pending_calls.update(kwargs)
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", fake_record)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", lambda *a, **k: None)
-
-    payload = {
-        "purchaseNumber": "1-10",
-        "transactionId": "PE-1",
-        "status": "PENDING",
-        "channel": "pagoefectivo",
-        "cip": "12345678",
-        "operationNumber": "OP-1",
-        "currency": "PEN",
-    }
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
-        handler._process_args()
-        handler._process()
-
-    assert pending_calls["action"].name == "pending"
-    assert pending_calls["data"]["cip"] == "12345678"
-
-
-def test_callback_pagoefectivo_expired(flask_app, monkeypatch):
-    registration = _make_registration()
-    handler = _build_handler(monkeypatch, registration)
-
-    failure_calls = {}
-
-    def fake_failed(registration, **kwargs):
-        failure_calls.update(kwargs)
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", fake_failed)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", lambda *a, **k: None)
-
-    payload = {
-        "purchaseNumber": "1-10",
-        "transactionId": "PE-2",
-        "status": "EXPIRED",
-        "channel": "pagoefectivo",
-        "operationNumber": "OP-2",
-    }
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
-        handler._process_args()
-        handler._process()
-
-    assert failure_calls["cancelled"] is True
-
-
-def test_callback_missing_transaction_id_returns_400(flask_app, monkeypatch):
-    registration = _make_registration()
-    handler = _build_handler(monkeypatch, registration)
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", lambda *a, **k: None)
-
-    payload = {"purchaseNumber": "1-10", "STATUS": "AUTHORIZED", "ACTION_CODE": "000"}
-
-    with flask_app.test_request_context(
-        "/notify",
-        method="POST",
-        data=json.dumps(payload),
-        content_type="application/json",
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
-    ):
-        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
-        handler._process_args()
-        result = handler._process()
-
-    assert result == ("", 400)
-
-
-def test_callback_invalid_signature_returns_401(flask_app, monkeypatch):
-    registration = _make_registration()
-    settings = {"callback_hmac_secret": "secret"}
-    handler = _build_handler(monkeypatch, registration, settings=settings)
-
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_successful_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.handle_failed_payment", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.record_payment_transaction", lambda *a, **k: None)
-    monkeypatch.setattr("indico_payment_niubiz.controllers.log_registration_event", lambda *a, **k: None)
-
-    payload = {"purchaseNumber": "1-10", "transactionId": "T-1", "STATUS": "AUTHORIZED"}
     body = json.dumps(payload)
-    signature = hashlib.sha256(b"invalid").hexdigest()
+    headers = _build_headers(body, plugin_settings)
 
+    handler = RHNiubizCallback()
     with flask_app.test_request_context(
         "/notify",
         method="POST",
         data=body,
-        content_type="application/json",
-        headers={"NBZ-Signature": signature},
-        environ_overrides={"REMOTE_ADDR": "200.48.119.10", "wsgi.url_scheme": "https"},
+        headers=headers,
+        environ_overrides={"REMOTE_ADDR": "200.48.119.10"},
     ):
         request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
         handler._process_args()
-        result = handler._process()
+        response = handler._process()
 
-    assert result == ("", 401)
+    assert response.status_code == 200
+    assert response.get_json() == {"received": True}
+    assert len(register_transaction_calls) == 1
+    transaction_call = register_transaction_calls[0]
+    assert transaction_call["action"] == expected_action
+    assert transaction_call["provider"] == "niubiz"
+    assert transaction_call["data"]["status"].strip().upper() == status
+    assert transaction_call["data"]["payload"] == payload
+
+    log_entry = registration._log_entries[-1]
+    kind = getattr(log_entry["kind"], "name", str(log_entry["kind"]))
+    assert kind.lower() == expected_kind
+    assert log_entry["summary"] == summary
+    assert log_entry["data"]["status"].strip().upper() == status
+
+
+def test_callback_invalid_token(flask_app, monkeypatch, plugin_factory):
+    registration = _make_registration()
+    plugin_settings = {
+        "callback_authorization_token": "expected-token",
+        "callback_hmac_secret": "",
+        "callback_ip_whitelist": "",
+    }
+    plugin_factory(plugin_settings)
+    _configure_request(monkeypatch, registration, plugin_settings=plugin_settings)
+
+    payload = {
+        "purchaseNumber": f"{registration.event_id}-{registration.id}",
+        "transactionId": "TX-1",
+        "STATUS": "AUTHORIZED",
+    }
+
+    handler = RHNiubizCallback()
+    with flask_app.test_request_context(
+        "/notify",
+        method="POST",
+        data=json.dumps(payload),
+        headers={"Authorization": "invalid", "Content-Type": "application/json"},
+        environ_overrides={"REMOTE_ADDR": "200.48.119.10"},
+    ):
+        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
+        handler._process_args()
+        with pytest.raises(Forbidden):
+            handler._process()
+
+
+def test_callback_invalid_signature(flask_app, monkeypatch, plugin_factory):
+    registration = _make_registration()
+    plugin_settings = {
+        "callback_authorization_token": "token",
+        "callback_hmac_secret": "secret",
+        "callback_ip_whitelist": "",
+    }
+    plugin_factory(plugin_settings)
+    _configure_request(monkeypatch, registration, plugin_settings=plugin_settings)
+
+    payload = {
+        "purchaseNumber": f"{registration.event_id}-{registration.id}",
+        "transactionId": "TX-1",
+        "STATUS": "AUTHORIZED",
+    }
+
+    handler = RHNiubizCallback()
+    with flask_app.test_request_context(
+        "/notify",
+        method="POST",
+        data=json.dumps(payload),
+        headers={
+            "Authorization": plugin_settings["callback_authorization_token"],
+            "NBZ-Signature": "invalid",
+            "Content-Type": "application/json",
+        },
+        environ_overrides={"REMOTE_ADDR": "200.48.119.10"},
+    ):
+        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
+        handler._process_args()
+        with pytest.raises(Forbidden):
+            handler._process()
+
+
+def test_callback_ip_not_allowed(flask_app, monkeypatch, plugin_factory):
+    registration = _make_registration()
+    plugin_settings = {
+        "callback_authorization_token": "token",
+        "callback_hmac_secret": "",
+        "callback_ip_whitelist": "10.0.0.0/24",
+    }
+    plugin_factory(plugin_settings)
+    _configure_request(monkeypatch, registration, plugin_settings=plugin_settings)
+
+    payload = {
+        "purchaseNumber": f"{registration.event_id}-{registration.id}",
+        "transactionId": "TX-1",
+        "STATUS": "AUTHORIZED",
+    }
+
+    handler = RHNiubizCallback()
+    with flask_app.test_request_context(
+        "/notify",
+        method="POST",
+        data=json.dumps(payload),
+        headers={"Authorization": "token", "Content-Type": "application/json"},
+        environ_overrides={"REMOTE_ADDR": "200.48.119.10"},
+    ):
+        request.view_args = {"event_id": registration.event_id, "reg_form_id": registration.registration_form_id}
+        handler._process_args()
+        with pytest.raises(Forbidden):
+            handler._process()
