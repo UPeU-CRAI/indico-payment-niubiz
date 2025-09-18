@@ -9,15 +9,17 @@ from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.web.rh import RH
-from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
-from indico.modules.events.payment.util import toggle_registration_payment
-from indico.modules.logs.models.entries import LogKind
+from indico.modules.events.payment.models.transactions import TransactionAction
 
+from indico_payment_niubiz.status_mapping import NIUBIZ_STATUS_MAP, DEFAULT_STATUS
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
     parse_amount,
     record_payment_transaction,
+    handle_successful_payment,
+    handle_failed_payment,
+    handle_refund,
 )
 
 if TYPE_CHECKING:
@@ -111,57 +113,40 @@ class RHNiubizCallback(RH):
         # Mapear estados Niubiz → Indico
         # -------------------------------
         status_key = (status or "").strip().upper()
+        config = NIUBIZ_STATUS_MAP.get(status_key, DEFAULT_STATUS)
 
-        if status_key == "AUTHORIZED":
-            # Pago confirmado
-            record_payment_transaction(
+        action = config["action"]
+        toggle_paid = config["toggle_paid"]
+        summary = config["summary"]
+
+        # Derivar la acción concreta
+        if status_key == "REFUNDED":
+            handle_refund(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                action=TransactionAction.complete,
+                transaction_id=transaction_id,
+                status=status,
+                summary=summary,
                 data=transaction_data,
+                success=True,
             )
-            toggle_registration_payment(registration, True)
-            logger.info("Pago confirmado y marcado como pagado en Indico [purchase=%s]", purchase_number)
 
-        elif status_key in {"REJECTED", "NOT AUTHORIZED", "NOT_AUTHORIZED"}:
-            # Pago rechazado
-            record_payment_transaction(
+        elif action == TransactionAction.complete:
+            handle_successful_payment(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                action=TransactionAction.reject,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary=summary,
                 data=transaction_data,
             )
-            logger.info("Pago rechazado registrado en Indico [purchase=%s]", purchase_number)
 
-        elif status_key in {"VOIDED", "CANCELLED", "CANCELED"}:
-            # Pago anulado
+        elif action == TransactionAction.pending:
             record_payment_transaction(
-                registration,
-                amount=amount_decimal,
-                currency=currency,
-                action=TransactionAction.cancel,
-                data=transaction_data,
-            )
-            logger.info("Pago anulado registrado en Indico [purchase=%s]", purchase_number)
-
-        elif status_key == "REFUNDED":
-            # Reembolso confirmado
-            record_payment_transaction(
-                registration,
-                amount=amount_decimal,
-                currency=currency,
-                action=TransactionAction.cancel,
-                data=transaction_data,
-            )
-            toggle_registration_payment(registration, False)
-            logger.info("Reembolso procesado y marcado como no pagado en Indico [purchase=%s]", purchase_number)
-
-        elif status_key == "PENDING":
-            # Pago pendiente
-            record_payment_transaction(
-                registration,
+                registration=registration,
                 amount=amount_decimal or Decimal("0"),
                 currency=currency,
                 action=TransactionAction.pending,
@@ -169,16 +154,30 @@ class RHNiubizCallback(RH):
             )
             logger.info("Pago pendiente registrado en Indico [purchase=%s]", purchase_number)
 
-        else:
-            # Estado desconocido
-            record_payment_transaction(
+        elif action in {TransactionAction.reject, TransactionAction.cancel}:
+            handle_failed_payment(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                action=TransactionAction.reject,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary=summary,
+                data=transaction_data,
+                cancelled=(action == TransactionAction.cancel),
+            )
+
+        else:
+            handle_failed_payment(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                action_code=action_code,
+                summary="Estado no reconocido recibido desde Niubiz",
                 data=transaction_data,
             )
-            logger.warning("Estado desconocido de Niubiz → registrado como rechazado [purchase=%s]", purchase_number)
 
         return jsonify({"received": True})
 
