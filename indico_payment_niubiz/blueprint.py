@@ -11,11 +11,13 @@ from werkzeug.exceptions import BadRequest, Forbidden
 from indico.web.rh import RH
 from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
+from indico.modules.logs.models.entries import LogKind
 
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
     handle_successful_payment,
     handle_failed_payment,
+    handle_refund,
     parse_amount,
     record_payment_transaction,
 )
@@ -35,7 +37,7 @@ class RHNiubizCallback(RH):
     """Maneja los callbacks (webhooks) enviados por Niubiz a Indico."""
 
     def _check_access(self):
-        # No requiere autenticación del usuario
+        # No requiere autenticación de usuario
         return True
 
     def _process(self):
@@ -48,11 +50,16 @@ class RHNiubizCallback(RH):
         event_id = request.view_args.get("event_id")
         event = self._locate_event(event_id)
 
+        # -------------------------------
         # Seguridad
+        # -------------------------------
         self._validate_authorization(event, plugin)
         self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
+        # -------------------------------
+        # Extraer información clave
+        # -------------------------------
         purchase_number = self._extract_value(payload, "purchaseNumber")
         if not purchase_number:
             logger.warning("Callback Niubiz sin purchaseNumber. Payload=%r", payload)
@@ -60,56 +67,35 @@ class RHNiubizCallback(RH):
 
         parsed_event_id, registration_id = self._parse_purchase_number(purchase_number)
         if registration_id is None:
-            logger.warning("Callback Niubiz con purchaseNumber inválido: %s", purchase_number)
             return jsonify({"received": False, "error": "invalid_purchase_number"})
 
         if parsed_event_id is not None and parsed_event_id != event.id:
-            logger.warning(
-                "Callback Niubiz con event_id inconsistente: purchase=%s, esperado=%s, recibido=%s",
-                purchase_number,
-                event.id,
-                parsed_event_id,
-            )
             return jsonify({"received": False, "error": "event_mismatch"})
-
-        transaction_id = self._extract_value(
-            payload,
-            "transactionId",
-            "operationNumber",
-            "transaction_id",
-        )
-        status = self._extract_value(payload, "STATUS", "status")
-        amount = self._extract_value(payload, "amount")
-        currency = (
-            self._extract_value(payload, "currency")
-            or getattr(event, "default_currency", None)
-            or "PEN"
-        )
-        action_code = self._extract_value(payload, "actionCode")
-
-        logger.info(
-            "Callback Niubiz: purchase_number=%s, txn_id=%s, status=%s, action_code=%s",
-            purchase_number,
-            transaction_id,
-            status,
-            action_code,
-        )
-        logger.debug("Payload completo recibido de Niubiz: %r", payload)
 
         registration = self._get_registration_from_id(registration_id)
         if not registration or registration.event_id != event.id:
-            logger.warning(
-                "No se encontró inscripción para purchaseNumber=%s en el evento %s",
-                purchase_number,
-                event.id,
-            )
             return jsonify({"received": False, "error": "registration_not_found"})
+
+        transaction_id = self._extract_value(payload, "transactionId", "operationNumber")
+        status = self._extract_value(payload, "STATUS", "status")
+        action_code = self._extract_value(payload, "actionCode")
+        amount = self._extract_value(payload, "amount")
+        currency = (
+            self._extract_value(payload, "currency")
+            or getattr(registration, "currency", None)
+            or "PEN"
+        )
+
+        logger.info(
+            "Callback Niubiz recibido: purchase=%s, txn=%s, status=%s, action=%s",
+            purchase_number, transaction_id, status, action_code,
+        )
+        logger.debug("Payload completo: %r", payload)
 
         amount_decimal = parse_amount(
             amount,
             fallback=parse_amount(getattr(registration, "price", None), Decimal("0")),
         )
-        currency = currency or getattr(registration, "currency", None) or "PEN"
 
         transaction_data = build_transaction_data(
             payload=payload,
@@ -126,10 +112,12 @@ class RHNiubizCallback(RH):
             }
         )
 
+        # -------------------------------
+        # Mapear estados de Niubiz → Indico
+        # -------------------------------
         status_key = (status or "").strip().upper()
 
         if status_key == "AUTHORIZED":
-            summary = "Pago confirmado exitosamente por Niubiz"
             handle_successful_payment(
                 registration,
                 amount=amount_decimal,
@@ -137,11 +125,12 @@ class RHNiubizCallback(RH):
                 transaction_id=transaction_id,
                 status=status,
                 action_code=action_code,
-                summary=summary,
+                summary="Pago confirmado exitosamente por Niubiz",
                 data=transaction_data,
+                kind=LogKind.positive,
             )
+
         elif status_key in {"REJECTED", "NOT AUTHORIZED", "NOT_AUTHORIZED"}:
-            summary = "Pago rechazado por Niubiz"
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -149,11 +138,11 @@ class RHNiubizCallback(RH):
                 transaction_id=transaction_id,
                 status=status,
                 action_code=action_code,
-                summary=summary,
+                summary="Pago rechazado por Niubiz",
                 data=transaction_data,
             )
+
         elif status_key in {"VOIDED", "CANCELLED", "CANCELED"}:
-            summary = "Pago anulado por Niubiz"
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -161,14 +150,24 @@ class RHNiubizCallback(RH):
                 transaction_id=transaction_id,
                 status=status,
                 action_code=action_code,
-                summary=summary,
+                summary="Pago anulado por Niubiz",
                 data=transaction_data,
                 cancelled=True,
             )
-        elif status_key == "PENDING":
-            logger.info(
-                "Pago Niubiz en estado pendiente para purchaseNumber=%s", purchase_number
+
+        elif status_key == "REFUNDED":
+            handle_refund(
+                registration,
+                amount=amount_decimal,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=status,
+                summary="Reembolso confirmado por Niubiz",
+                data=transaction_data,
+                success=True,
             )
+
+        elif status_key == "PENDING":
             record_payment_transaction(
                 registration=registration,
                 amount=amount_decimal if amount_decimal is not None else Decimal("0"),
@@ -176,8 +175,10 @@ class RHNiubizCallback(RH):
                 action=TransactionAction.pending,
                 data=transaction_data,
             )
+            logger.info("Pago pendiente en Niubiz para purchase=%s", purchase_number)
+
         else:
-            logger.warning("Estado de pago Niubiz desconocido: %s", status)
+            logger.warning("Estado desconocido recibido de Niubiz: %s", status)
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -191,6 +192,9 @@ class RHNiubizCallback(RH):
 
         return jsonify({"received": True})
 
+    # ------------------------------------------------------------------
+    # Utilidades internas
+    # ------------------------------------------------------------------
     @staticmethod
     def _extract_value(payload: dict, *keys: str):
         order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
@@ -224,11 +228,12 @@ class RHNiubizCallback(RH):
         try:
             return Registration.query.filter_by(id=registration_id).first()
         except Exception:
-            logger.exception(
-                "No se pudo obtener la inscripción con id=%s", registration_id
-            )
+            logger.exception("Error consultando inscripción id=%s", registration_id)
             return None
 
+    # ------------------------------------------------------------------
+    # Validaciones de seguridad
+    # ------------------------------------------------------------------
     def _validate_authorization(self, event, plugin):
         expected = plugin._get_setting(event, "callback_authorization_token")
         if expected:
@@ -241,10 +246,8 @@ class RHNiubizCallback(RH):
         secret = plugin._get_setting(event, "callback_hmac_secret")
         if not secret:
             return
-
         received_sig = request.headers.get("NBZ-Signature")
         if not received_sig:
-            logger.warning("Callback rechazado: NBZ-Signature faltante")
             raise Forbidden("Missing NBZ-Signature header")
 
         computed_sig = hmac.new(
@@ -252,26 +255,22 @@ class RHNiubizCallback(RH):
             msg=request.data,
             digestmod=hashlib.sha256,
         ).hexdigest()
-
         if not hmac.compare_digest(computed_sig, received_sig):
-            logger.warning("Callback rechazado: firma NBZ-Signature inválida")
+            logger.warning("Callback rechazado: firma inválida")
             raise Forbidden("Invalid signature")
 
     def _validate_ip(self, event, plugin):
         whitelist = plugin._get_setting(event, "callback_ip_whitelist")
         if not whitelist:
             return
-
         remote_ip = ipaddress.ip_address(request.remote_addr)
         ips = [ip.strip() for ip in whitelist.splitlines() if ip.strip()]
-
         for allowed in ips:
             try:
                 if remote_ip in ipaddress.ip_network(allowed, strict=False):
                     return
             except ValueError:
-                logger.warning("Entrada inválida en whitelist de IPs: %s", allowed)
-
+                logger.warning("Entrada inválida en whitelist: %s", allowed)
         logger.warning("Callback desde IP no autorizada: %s", remote_ip)
         raise Forbidden("IP not allowed")
 
