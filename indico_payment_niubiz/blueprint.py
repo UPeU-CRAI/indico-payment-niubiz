@@ -11,13 +11,11 @@ from werkzeug.exceptions import BadRequest, Forbidden
 from indico.web.rh import RH
 from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
+from indico.modules.events.payment.util import toggle_registration_payment
 from indico.modules.logs.models.entries import LogKind
 
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
-    handle_successful_payment,
-    handle_failed_payment,
-    handle_refund,
     parse_amount,
     record_payment_transaction,
 )
@@ -37,10 +35,12 @@ class RHNiubizCallback(RH):
     """Maneja los callbacks (webhooks) enviados por Niubiz a Indico."""
 
     def _check_access(self):
-        # No requiere autenticación de usuario
-        return True
+        return True  # no requiere autenticación de usuario
 
     def _process(self):
+        # -------------------------------
+        # Parsear JSON del callback
+        # -------------------------------
         payload = request.get_json(force=True, silent=True)
         if not isinstance(payload, dict):
             logger.warning("Callback Niubiz recibido sin JSON válido")
@@ -51,25 +51,23 @@ class RHNiubizCallback(RH):
         event = self._locate_event(event_id)
 
         # -------------------------------
-        # Seguridad
+        # Validaciones de seguridad
         # -------------------------------
         self._validate_authorization(event, plugin)
         self._validate_signature(event, plugin)
         self._validate_ip(event, plugin)
 
         # -------------------------------
-        # Extraer información clave
+        # Extraer datos clave
         # -------------------------------
         purchase_number = self._extract_value(payload, "purchaseNumber")
         if not purchase_number:
-            logger.warning("Callback Niubiz sin purchaseNumber. Payload=%r", payload)
             return jsonify({"received": False, "error": "missing_purchase_number"})
 
         parsed_event_id, registration_id = self._parse_purchase_number(purchase_number)
-        if registration_id is None:
+        if not registration_id:
             return jsonify({"received": False, "error": "invalid_purchase_number"})
-
-        if parsed_event_id is not None and parsed_event_id != event.id:
+        if parsed_event_id and parsed_event_id != event.id:
             return jsonify({"received": False, "error": "event_mismatch"})
 
         registration = self._get_registration_from_id(registration_id)
@@ -86,12 +84,6 @@ class RHNiubizCallback(RH):
             or "PEN"
         )
 
-        logger.info(
-            "Callback Niubiz recibido: purchase=%s, txn=%s, status=%s, action=%s",
-            purchase_number, transaction_id, status, action_code,
-        )
-        logger.debug("Payload completo: %r", payload)
-
         amount_decimal = parse_amount(
             amount,
             fallback=parse_amount(getattr(registration, "price", None), Decimal("0")),
@@ -106,89 +98,87 @@ class RHNiubizCallback(RH):
             action_code=action_code,
         )
         transaction_data.update(
-            {
-                "amount": float(amount_decimal) if amount_decimal is not None else None,
-                "currency": currency,
-            }
+            {"amount": float(amount_decimal) if amount_decimal else None, "currency": currency}
         )
 
+        logger.info(
+            "Callback Niubiz recibido: purchase=%s, txn=%s, status=%s, action=%s",
+            purchase_number, transaction_id, status, action_code,
+        )
+        logger.debug("Payload completo recibido: %r", payload)
+
         # -------------------------------
-        # Mapear estados de Niubiz → Indico
+        # Mapear estados Niubiz → Indico
         # -------------------------------
         status_key = (status or "").strip().upper()
 
         if status_key == "AUTHORIZED":
-            handle_successful_payment(
+            # Pago confirmado
+            record_payment_transaction(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
-                summary="Pago confirmado exitosamente por Niubiz",
+                action=TransactionAction.complete,
                 data=transaction_data,
-                kind=LogKind.positive,
             )
+            toggle_registration_payment(registration, True)
+            logger.info("Pago confirmado y marcado como pagado en Indico [purchase=%s]", purchase_number)
 
         elif status_key in {"REJECTED", "NOT AUTHORIZED", "NOT_AUTHORIZED"}:
-            handle_failed_payment(
+            # Pago rechazado
+            record_payment_transaction(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
-                summary="Pago rechazado por Niubiz",
+                action=TransactionAction.reject,
                 data=transaction_data,
             )
+            logger.info("Pago rechazado registrado en Indico [purchase=%s]", purchase_number)
 
         elif status_key in {"VOIDED", "CANCELLED", "CANCELED"}:
-            handle_failed_payment(
+            # Pago anulado
+            record_payment_transaction(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
-                summary="Pago anulado por Niubiz",
+                action=TransactionAction.cancel,
                 data=transaction_data,
-                cancelled=True,
             )
+            logger.info("Pago anulado registrado en Indico [purchase=%s]", purchase_number)
 
         elif status_key == "REFUNDED":
-            handle_refund(
+            # Reembolso confirmado
+            record_payment_transaction(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                summary="Reembolso confirmado por Niubiz",
+                action=TransactionAction.cancel,
                 data=transaction_data,
-                success=True,
             )
+            toggle_registration_payment(registration, False)
+            logger.info("Reembolso procesado y marcado como no pagado en Indico [purchase=%s]", purchase_number)
 
         elif status_key == "PENDING":
+            # Pago pendiente
             record_payment_transaction(
-                registration=registration,
-                amount=amount_decimal if amount_decimal is not None else Decimal("0"),
+                registration,
+                amount=amount_decimal or Decimal("0"),
                 currency=currency,
                 action=TransactionAction.pending,
                 data=transaction_data,
             )
-            logger.info("Pago pendiente en Niubiz para purchase=%s", purchase_number)
+            logger.info("Pago pendiente registrado en Indico [purchase=%s]", purchase_number)
 
         else:
-            logger.warning("Estado desconocido recibido de Niubiz: %s", status)
-            handle_failed_payment(
+            # Estado desconocido
+            record_payment_transaction(
                 registration,
                 amount=amount_decimal,
                 currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                action_code=action_code,
-                summary="Estado de pago desconocido recibido desde Niubiz",
+                action=TransactionAction.reject,
                 data=transaction_data,
             )
+            logger.warning("Estado desconocido de Niubiz → registrado como rechazado [purchase=%s]", purchase_number)
 
         return jsonify({"received": True})
 
@@ -236,11 +226,9 @@ class RHNiubizCallback(RH):
     # ------------------------------------------------------------------
     def _validate_authorization(self, event, plugin):
         expected = plugin._get_setting(event, "callback_authorization_token")
-        if expected:
-            auth_header = request.headers.get("Authorization")
-            if auth_header != expected:
-                logger.warning("Callback rechazado: token Authorization inválido")
-                raise Forbidden("Invalid Authorization token")
+        if expected and request.headers.get("Authorization") != expected:
+            logger.warning("Callback rechazado: token Authorization inválido")
+            raise Forbidden("Invalid Authorization token")
 
     def _validate_signature(self, event, plugin):
         secret = plugin._get_setting(event, "callback_hmac_secret")
@@ -249,7 +237,6 @@ class RHNiubizCallback(RH):
         received_sig = request.headers.get("NBZ-Signature")
         if not received_sig:
             raise Forbidden("Missing NBZ-Signature header")
-
         computed_sig = hmac.new(
             secret.encode("utf-8"),
             msg=request.data,
