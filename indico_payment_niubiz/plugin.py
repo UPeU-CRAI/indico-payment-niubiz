@@ -37,6 +37,7 @@ from indico_payment_niubiz.settings import (
     get_credentials_for_event,
     get_endpoint_for_event,
     get_merchant_id_for_event,
+    get_scoped_setting,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class PluginSettingsForm(PaymentPluginSettingsFormBase):
     )
     enable_card = BooleanField(_("Tarjeta"), default=True)
     enable_yape = BooleanField(_("Yape"), default=False)
-    enable_pagoefectivo = BooleanField(_("PagoEfectivo")), default=False)
+    enable_pagoefectivo = BooleanField(_("PagoEfectivo"), default=False)
     enable_qr = BooleanField(_("QR"), default=False)
     enable_tokenization = BooleanField(_("Tokenización"), default=False)
     callback_authorization_token = IndicoPasswordField(_("Token de autorización de callback"), [OptionalValidator()])
@@ -154,12 +155,19 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             return override == "1"
         if override not in (None, ""):
             return bool(override)
-        return bool(self.settings.get(name))
+
+        value = get_scoped_setting(event, name, plugin=self)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
 
     def _get_setting(self, event, name: str) -> Optional[str]:
         """Obtiene un setting de evento o global."""
-        value = self.event_settings.get(event, name)
-        return self.settings.get(name) if value in (None, "") else value
+        return get_scoped_setting(event, name, plugin=self)
 
     # ------------------ Cliente ------------------
     def _build_client(self, event) -> NiubizClient:

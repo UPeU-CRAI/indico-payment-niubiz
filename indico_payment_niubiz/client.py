@@ -75,19 +75,45 @@ class NiubizClient:
 
     # ------------------ HTTP genérico ------------------
     def _request(self, method: str, path: str, *, json: Optional[Dict[str, Any]] = None) -> Response:
-        """Ejecuta un request autenticado contra Niubiz."""
+        """Ejecuta un request autenticado contra Niubiz con reintento ante 401."""
         url = f"{self.base_url}{path}"
-        headers = {"Authorization": self._get_session_token()}
-        try:
-            response = requests.request(method, url, headers=headers, json=json, timeout=20)
-            response.raise_for_status()
-            return response
-        except requests.HTTPError as exc:
-            logger.warning("Error HTTP %s en Niubiz: %s", exc.response.status_code if exc.response else "?", exc)
-            raise NiubizAPIError(f"Error de API Niubiz: {exc}") from exc
-        except requests.RequestException as exc:
-            logger.error("Error de red en request Niubiz: %s", exc)
-            raise NiubizClientError("Error de red al llamar Niubiz") from exc
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(2):
+            headers = {"Authorization": self._get_session_token()}
+            try:
+                response = requests.request(method, url, headers=headers, json=json, timeout=20)
+                if response.status_code == 401 and attempt == 0:
+                    # Token expirado: limpiar cache y reintentar una vez.
+                    logger.info("Token Niubiz expirado; reintentando autenticación")
+                    self._session_token = None
+                    self._session_expiry = None
+                    continue
+                response.raise_for_status()
+                return response
+            except requests.HTTPError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Error HTTP %s en Niubiz: %s",
+                    exc.response.status_code if exc.response else "?",
+                    exc,
+                )
+                break
+            except requests.RequestException as exc:
+                last_exc = exc
+                logger.error("Error de red en request Niubiz: %s", exc)
+                break
+
+        if isinstance(last_exc, requests.HTTPError):
+            raise NiubizAPIError(f"Error de API Niubiz: {last_exc}") from last_exc
+        if last_exc:
+            raise NiubizClientError("Error de red al llamar Niubiz") from last_exc
+        raise NiubizClientError("No se pudo completar la petición Niubiz")
+
+    # ------------------ API pública ------------------
+    def get_auth_token(self) -> str:
+        """Expone públicamente la obtención del session token (para tests/usos externos)."""
+        return self._get_session_token()
 
     # ------------------ Helpers ------------------
     @staticmethod

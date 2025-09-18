@@ -1,10 +1,25 @@
 import hashlib
 import hmac
-import ipaddress
 import json
-import pytest
+import os
+import sys
 from decimal import Decimal
 from unittest.mock import MagicMock
+
+import pytest
+
+
+# Ensure the package under development is importable even when pytest changes
+# the working directory (as it happens in the execution environment of these
+# kata-style exercises).
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+pytest.importorskip("indico", reason="Indico no está disponible en el entorno de pruebas.")
+pytest.importorskip("indico.modules.events.payment", reason="Indico no está disponible en el entorno de pruebas.")
+pytest.importorskip("indico.modules.events.logs", reason="Indico no está disponible en el entorno de pruebas.")
 
 from indico_payment_niubiz.plugin import NiubizPaymentPlugin
 
