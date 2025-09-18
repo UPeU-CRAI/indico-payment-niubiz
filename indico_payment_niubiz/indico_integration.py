@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Utilidades de conversión
 # -----------------------------------------------------
 def parse_amount(value: Any, fallback: Optional[Decimal]) -> Optional[Decimal]:
-    """Convierte un valor a Decimal, o retorna el fallback si no es válido."""
+    """Convierte un valor a Decimal o retorna el fallback si no es válido."""
     if value is None:
         return fallback
     try:
@@ -29,7 +29,7 @@ def parse_amount(value: Any, fallback: Optional[Decimal]) -> Optional[Decimal]:
 def build_transaction_data(
     *,
     payload: Optional[Dict[str, Any]] = None,
-    source: Optional[str] = None,
+    source: str = "callback",
     status: Optional[str] = None,
     action_code: Optional[str] = None,
     transaction_id: Optional[str] = None,
@@ -38,8 +38,12 @@ def build_transaction_data(
     message: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Crea un diccionario con los datos adicionales de la transacción."""
+    """
+    Crea un diccionario con los datos adicionales de la transacción.
+    Siempre se usa 'niubiz' como proveedor.
+    """
     data: Dict[str, Any] = {"provider": "niubiz"}
+
     if source:
         data["source"] = source
     if payload is not None:
@@ -58,6 +62,7 @@ def build_transaction_data(
         data["message"] = message
     if reason:
         data["reason"] = reason
+
     return data
 
 
@@ -73,10 +78,10 @@ def record_payment_transaction(
     data: Optional[Dict[str, Any]] = None,
 ):
     """
-    Crea una transacción de pago en Indico (completada, fallida, cancelada, reembolso, pendiente).
-    
-    Esta función debe ser llamada siempre que llegue un callback de Niubiz
-    para mantener el historial consistente en Indico.
+    Registra una transacción de pago en Indico.
+
+    El parámetro `action` ya debe venir decidido desde el mapeo
+    (NIUBIZ_STATUS_MAP), evitando lógica duplicada aquí.
     """
     try:
         amount_value = float(amount)
