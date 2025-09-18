@@ -11,10 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, Optional
 
+from werkzeug.exceptions import BadRequest
 from wtforms.fields import BooleanField, SelectField, StringField, TextAreaField
 from wtforms.validators import DataRequired, Optional as OptionalValidator
-
-from werkzeug.exceptions import BadRequest
 
 from indico.core.plugins import IndicoPlugin
 from indico.modules.events.payment import (
@@ -42,12 +41,14 @@ from indico_payment_niubiz.settings import (
 
 logger = logging.getLogger(__name__)
 
+
 # --------------------- CONFIGURACIÓN GLOBAL ---------------------
 BOOL_INHERIT_CHOICES = (
     ("", _("Usar configuración global")),
     ("1", _("Activado")),
     ("0", _("Desactivado")),
 )
+
 
 class PluginSettingsForm(PaymentPluginSettingsFormBase):
     merchant_id = StringField(_("Merchant ID"), [DataRequired()])
@@ -56,13 +57,13 @@ class PluginSettingsForm(PaymentPluginSettingsFormBase):
     merchant_logo_url = StringField(_("Logo del comercio"), [OptionalValidator()])
     button_color = StringField(_("Color del botón"), [OptionalValidator()])
     merchant_defined_data = TextAreaField(_("Merchant Define Data (MDD)"), [OptionalValidator()])
-    endpoint = SelectField(_("Entorno"), [DataRequired()], choices=[
-        ("sandbox", _("Sandbox (pruebas)")),
-        ("prod", _("Producción")),
-    ])
+    endpoint = SelectField(
+        _("Entorno"), [DataRequired()],
+        choices=[("sandbox", _("Sandbox (pruebas)")), ("prod", _("Producción"))],
+    )
     enable_card = BooleanField(_("Tarjeta"), default=True)
     enable_yape = BooleanField(_("Yape"), default=False)
-    enable_pagoefectivo = BooleanField(_("PagoEfectivo"), default=False)
+    enable_pagoefectivo = BooleanField(_("PagoEfectivo")), default=False)
     enable_qr = BooleanField(_("QR"), default=False)
     enable_tokenization = BooleanField(_("Tokenización"), default=False)
     callback_authorization_token = IndicoPasswordField(_("Token de autorización de callback"), [OptionalValidator()])
@@ -78,11 +79,12 @@ class EventSettingsForm(PaymentEventSettingsFormBase):
     merchant_logo_url = StringField(_("Logo"), [OptionalValidator()])
     button_color = StringField(_("Color del botón"), [OptionalValidator()])
     merchant_defined_data = TextAreaField(_("Merchant Define Data"), [OptionalValidator()])
-    endpoint = SelectField(_("Entorno"), [OptionalValidator()], choices=[
-        ("", _("Usar configuración global")),
-        ("sandbox", _("Sandbox (pruebas)")),
-        ("prod", _("Producción")),
-    ])
+    endpoint = SelectField(
+        _("Entorno"), [OptionalValidator()],
+        choices=[("", _("Usar configuración global")),
+                 ("sandbox", _("Sandbox (pruebas)")),
+                 ("prod", _("Producción"))],
+    )
     enable_card = SelectField(_("Tarjeta"), choices=BOOL_INHERIT_CHOICES, default="")
     enable_yape = SelectField(_("Yape"), choices=BOOL_INHERIT_CHOICES, default="")
     enable_pagoefectivo = SelectField(_("PagoEfectivo"), choices=BOOL_INHERIT_CHOICES, default="")
@@ -140,21 +142,26 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         "callback_ip_whitelist": None,
     }
 
+    # ------------------ Registro ------------------
     def get_blueprints(self):
         return blueprint
 
+    # ------------------ Helpers de settings ------------------
     def _get_bool(self, event, name: str) -> bool:
+        """Obtiene un booleano considerando overrides por evento."""
         override = self.event_settings.get(event, name)
         if isinstance(override, str) and override in {"0", "1"}:
             return override == "1"
-        if override is not None and not isinstance(override, str):
+        if override not in (None, ""):
             return bool(override)
         return bool(self.settings.get(name))
 
     def _get_setting(self, event, name: str) -> Optional[str]:
+        """Obtiene un setting de evento o global."""
         value = self.event_settings.get(event, name)
         return self.settings.get(name) if value in (None, "") else value
 
+    # ------------------ Cliente ------------------
     def _build_client(self, event) -> NiubizClient:
         merchant_id = get_merchant_id_for_event(event, plugin=self)
         access_key, secret_key = get_credentials_for_event(event, plugin=self)
@@ -166,6 +173,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             endpoint=endpoint,
         )
 
+    # ------------------ Métodos de pago ------------------
     def _collect_methods(self, event) -> Dict[str, bool]:
         return {
             "card": self._get_bool(event, "enable_card"),
@@ -174,7 +182,9 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             "qr": self._get_bool(event, "enable_qr"),
         }
 
+    # ------------------ Checkout ------------------
     def adjust_payment_form_data(self, data):
+        """Enriquece el contexto enviado al template de checkout."""
         registration = data["registration"]
         event = data["event"]
         amount = registration.price
@@ -190,18 +200,28 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             "checkout_button_color": self._get_setting(event, "button_color"),
             "checkout_methods": self._collect_methods(event),
             "tokenization_enabled": self._get_bool(event, "enable_tokenization"),
-            "start_url": url_for("payment_niubiz.start", event_id=event.id,
-                                 reg_form_id=registration.registration_form.id, reg_id=registration.id),
-            "cancel_url": url_for("payment_niubiz.cancel", event_id=event.id,
-                                  reg_form_id=registration.registration_form.id, reg_id=registration.id),
+            "start_url": url_for(
+                "payment_niubiz.start",
+                event_id=event.id,
+                reg_form_id=registration.registration_form.id,
+                reg_id=registration.id,
+            ),
+            "cancel_url": url_for(
+                "payment_niubiz.cancel",
+                event_id=event.id,
+                reg_form_id=registration.registration_form.id,
+                reg_id=registration.id,
+            ),
         })
 
+        # Tokens almacenados del usuario
         user = getattr(registration, "user", None)
         if user:
-            data["stored_tokens"] = NiubizStoredToken.query.filter_by(user_id=user.id)\
+            data["stored_tokens"] = NiubizStoredToken.query.filter_by(user_id=user.id) \
                 .order_by(NiubizStoredToken.created_at.desc()).all()
 
     def process_payment(self, registration, data):
+        """Procesa un intento de pago y devuelve la acción a ejecutar."""
         method = (data or {}).get("method") or "card"
         event = registration.event
         methods = self._collect_methods(event)
@@ -214,22 +234,33 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
                 raise BadRequest(_("No se proporcionó el token almacenado."))
             return {
                 "action": "redirect",
-                "url": url_for("payment_niubiz.start", event_id=event.id,
-                               reg_form_id=registration.registration_form.id, reg_id=registration.id,
-                               method="token", token_id=token_id),
+                "url": url_for(
+                    "payment_niubiz.start",
+                    event_id=event.id,
+                    reg_form_id=registration.registration_form.id,
+                    reg_id=registration.id,
+                    method="token",
+                    token_id=token_id,
+                ),
             }
 
-        if method not in methods or not methods[method]:
+        if not methods.get(method):
             raise BadRequest(_("El método de pago seleccionado no está habilitado."))
 
         return {
             "action": "redirect",
-            "url": url_for("payment_niubiz.start", event_id=event.id,
-                           reg_form_id=registration.registration_form.id,
-                           reg_id=registration.id, method=method),
+            "url": url_for(
+                "payment_niubiz.start",
+                event_id=event.id,
+                reg_form_id=registration.registration_form.id,
+                reg_id=registration.id,
+                method=method,
+            ),
         }
 
+    # ------------------ Reembolsos ------------------
     def refund(self, registration, transaction=None, amount=None, reason=None, **kwargs):
+        """Inicia un reembolso en Niubiz y registra el resultado en Indico."""
         registration = registration or getattr(transaction, "registration", None)
         if not registration:
             return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
@@ -237,12 +268,16 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         event = getattr(registration, "event", None)
         txn = transaction or getattr(registration, "transaction", None)
         currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
-        amount_decimal = parse_amount(amount, None) if amount is not None else None
-        if amount_decimal is None:
-            amount_decimal = parse_amount(getattr(txn, "amount", None), None)
-        if amount_decimal is None:
-            amount_decimal = parse_amount(getattr(registration, "price", None), None)
 
+        # Determinar monto
+        amount_decimal = parse_amount(amount, None) or \
+                         parse_amount(getattr(txn, "amount", None), None) or \
+                         parse_amount(getattr(registration, "price", None), None)
+
+        if event is None or amount_decimal is None:
+            return {"success": False, "error": _("Datos insuficientes para procesar el reembolso.")}
+
+        # Determinar transaction_id
         transaction_payload = getattr(txn, "data", {}) or {}
         transaction_id = (
             self._extract_transaction_id(transaction_payload)
@@ -250,55 +285,14 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             or getattr(txn, "external_transaction_id", None)
         )
         transaction_id = str(transaction_id) if transaction_id else None
-
-        def _finalize_failure(summary: str, *, status: str = "FAILED", payload=None):
-            data = build_transaction_data(
-                payload=payload if isinstance(payload, dict) else transaction_payload,
-                source="refund",
-                transaction_id=transaction_id,
-                reason=reason,
-                message=summary,
-                status=status,
-            )
-            data["currency"] = currency
-            if amount_decimal is not None:
-                data["amount"] = float(amount_decimal)
-            data["error"] = summary
-
-            handle_refund(
-                registration,
-                amount=amount_decimal,
-                currency=currency,
-                transaction_id=transaction_id,
-                status=status,
-                summary=summary,
-                data=data,
-                success=False,
-            )
-            return {"success": False, "error": summary}
-
-        if event is None:
-            return _finalize_failure(_("La inscripción no está asociada a un evento válido."))
-
         if transaction_id is None:
-            return _finalize_failure(_("No se encontró el identificador de transacción en Niubiz."))
+            return {"success": False, "error": _("No se encontró el identificador de transacción en Niubiz.")}
 
-        if amount_decimal is None:
-            return _finalize_failure(_("No se pudo determinar el monto a reembolsar."))
+        logger.info("Solicitando reembolso Niubiz: reg=%s, txn=%s", getattr(registration, "id", "?"), transaction_id)
 
-        logger.info(
-            "Solicitando reembolso Niubiz para registration_id=%s, transaction_id=%s",
-            getattr(registration, "id", "?"),
-            transaction_id,
-        )
-
+        # Llamar al cliente
         try:
             client = self._build_client(event)
-        except Exception:
-            logger.exception("No se pudo inicializar el cliente de Niubiz para reembolsar")
-            return _finalize_failure(_("No se pudo inicializar el cliente de Niubiz."))
-
-        try:
             result = client.refund_transaction(
                 transaction_id=transaction_id,
                 amount=amount_decimal,
@@ -306,14 +300,15 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
                 reason=reason,
             )
         except Exception:
-            logger.exception("Error inesperado al solicitar el reembolso en Niubiz")
-            return _finalize_failure(_("Error al comunicarse con Niubiz para el reembolso."))
+            logger.exception("Error al solicitar el reembolso en Niubiz")
+            return {"success": False, "error": _("Error al comunicarse con Niubiz.")}
 
-        payload_for_storage = None
-        if result.get("success"):
-            payload_for_storage = result.get("data") if isinstance(result.get("data"), dict) else result
-        else:
-            payload_for_storage = result.get("payload") if isinstance(result.get("payload"), dict) else result
+        # Preparar payload
+        payload_for_storage = (
+            result.get("data") if result.get("success") and isinstance(result.get("data"), dict)
+            else result.get("payload") if isinstance(result.get("payload"), dict)
+            else result
+        )
 
         status_value = result.get("status") or ""
         status_key = status_value.upper()
@@ -334,25 +329,11 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
 
         if is_success:
             summary = _("Niubiz confirmó el reembolso correctamente.")
-            transaction_data["message"] = summary
-            logger.info(
-                "Reembolso Niubiz exitoso para registration_id=%s, transaction_id=%s",
-                getattr(registration, "id", "?"),
-                niubiz_transaction_id,
-            )
+            logger.info("Reembolso Niubiz exitoso: reg=%s, txn=%s", registration.id, niubiz_transaction_id)
         else:
             summary = result.get("error") or _("Niubiz no pudo completar el reembolso.")
-            if result.get("status_code"):
-                transaction_data["status_code"] = result["status_code"]
-            if result.get("error"):
-                transaction_data["message"] = result["error"]
+            logger.warning("Reembolso Niubiz fallido: reg=%s, txn=%s, error=%s", registration.id, niubiz_transaction_id, summary)
             transaction_data["error"] = summary
-            logger.warning(
-                "Reembolso Niubiz fallido para registration_id=%s, transaction_id=%s: %s",
-                getattr(registration, "id", "?"),
-                niubiz_transaction_id,
-                summary,
-            )
 
         handle_refund(
             registration,
@@ -365,20 +346,18 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             success=is_success,
         )
 
-        if not is_success and "message" not in transaction_data:
-            transaction_data["message"] = summary
-
         return {"success": is_success, **({} if is_success else {"error": summary})}
 
+    # ------------------ Tokens ------------------
     @staticmethod
     def _extract_transaction_id(payload: Dict[str, object]) -> Optional[str]:
+        """Extrae transaction_id desde un payload flexible."""
         if not isinstance(payload, dict):
             return None
         for key in ("transaction_id", "transactionId", "TRANSACTION_ID", "operationNumber"):
-            value = payload.get(key)
-            if value:
-                return str(value)
-        nested = payload.get("payload") or payload.get("data") or payload.get("ORDER") or payload.get("order")
+            if payload.get(key):
+                return str(payload[key])
+        nested = payload.get("payload") or payload.get("data") or payload.get("order") or payload.get("ORDER")
         if isinstance(nested, dict):
             return NiubizPaymentPlugin._extract_transaction_id(nested)
         return None
@@ -386,8 +365,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
     def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:
         if user is None:
             return []
-        return NiubizStoredToken.query.filter_by(user_id=user.id)\
-            .order_by(NiubizStoredToken.created_at.desc())
+        return NiubizStoredToken.query.filter_by(user_id=user.id).order_by(NiubizStoredToken.created_at.desc())
 
     def store_token(self, user, token: str, payload: Dict[str, object]) -> NiubizStoredToken:
         stored = NiubizStoredToken(user_id=user.id, token=token)
