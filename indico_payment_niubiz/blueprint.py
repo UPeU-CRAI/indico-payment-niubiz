@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict
 from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import BadRequest, Forbidden
 
+from indico.modules.events.payment.models.transactions import TransactionAction
 from indico.modules.events.registration.models.registrations import Registration
 from indico.web.rh import RH
 
@@ -38,7 +39,7 @@ class RHNiubizCallback(RH):
     """Procesa los callbacks de Niubiz y delega la lógica centralizada."""
 
     def _check_access(self):
-        return True  # No requiere autenticación de usuario
+        return True  # no requiere autenticación de usuario
 
     def _process(self):
         # -------------------------------
@@ -61,7 +62,7 @@ class RHNiubizCallback(RH):
         self._validate_ip(event, plugin)
 
         # -------------------------------
-        # Extraer identificadores
+        # Identificadores de inscripción
         # -------------------------------
         purchase_number = self._extract_value(payload, "purchaseNumber")
         if not purchase_number:
@@ -78,7 +79,7 @@ class RHNiubizCallback(RH):
             return jsonify({"received": False, "error": "registration_not_found"})
 
         # -------------------------------
-        # Extraer datos de la transacción
+        # Datos de la transacción
         # -------------------------------
         transaction_id = self._extract_value(payload, "transactionId", "operationNumber")
         status_value = self._extract_value(payload, "STATUS", "status")
@@ -103,7 +104,9 @@ class RHNiubizCallback(RH):
             transaction_id=transaction_id,
             order_id=purchase_number,
         )
-        transaction_data.update(self._collect_additional_details(payload, currency, amount_decimal))
+        transaction_data.update(
+            self._collect_additional_details(payload, currency, amount_decimal)
+        )
 
         # -------------------------------
         # Resolver acción según mapping
@@ -134,7 +137,7 @@ class RHNiubizCallback(RH):
                 data=transaction_data,
                 success=True,
             )
-        elif action.complete == action:  # pago confirmado
+        elif action == TransactionAction.complete:
             handle_successful_payment(
                 registration,
                 amount=amount_decimal,
@@ -145,7 +148,7 @@ class RHNiubizCallback(RH):
                 data=transaction_data,
                 toggle_paid=toggle_paid,
             )
-        elif action.pending == action:  # pago pendiente
+        elif action == TransactionAction.pending:
             handle_pending_payment(
                 registration,
                 amount=amount_decimal,
@@ -155,7 +158,7 @@ class RHNiubizCallback(RH):
                 summary=summary,
                 data=transaction_data,
             )
-        elif action in {action.reject, action.cancel}:  # fallidos/anulados
+        elif action in {TransactionAction.reject, TransactionAction.cancel}:
             handle_failed_payment(
                 registration,
                 amount=amount_decimal,
@@ -164,7 +167,7 @@ class RHNiubizCallback(RH):
                 status=status_value,
                 summary=summary,
                 data=transaction_data,
-                cancelled=(action == action.cancel),
+                cancelled=(action == TransactionAction.cancel),
                 toggle_paid=toggle_paid,
             )
         else:  # fallback defensivo
