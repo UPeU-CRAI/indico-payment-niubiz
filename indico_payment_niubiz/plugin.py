@@ -97,7 +97,7 @@ class EventSettingsForm(PaymentEventSettingsFormBase):
 
 
 # --------------------- PLUGIN PRINCIPAL ---------------------
-class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
+class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
     """Plugin de integración de Niubiz en Indico."""
 
     configurable = True
@@ -367,7 +367,7 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
                 return str(payload[key])
         nested = payload.get("payload") or payload.get("data") or payload.get("order") or payload.get("ORDER")
         if isinstance(nested, dict):
-            return NiubizPaymentPlugin._extract_transaction_id(nested)
+            return NiubizPlugin._extract_transaction_id(nested)
         return None
 
     def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:

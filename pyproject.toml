@@ -18,7 +18,7 @@ dependencies = ['indico>=3.3']
 GitHub = 'https://github.com/indico/indico-plugins'
 
 [project.entry-points.'indico.plugins']
-payment_niubiz = 'indico_payment_niubiz.plugin:NiubizPaymentPlugin'
+payment_niubiz = 'indico_payment_niubiz.plugin:NiubizPlugin'
 
 [build-system]
 requires = ['hatchling==1.27.0']
