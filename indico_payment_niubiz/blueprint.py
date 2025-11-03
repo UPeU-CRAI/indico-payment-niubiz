@@ -39,10 +39,10 @@ from indico_payment_niubiz.util import (
 logger = logging.getLogger(__name__)
 
 
-def _get_plugin() -> "NiubizPaymentPlugin":
-    from indico_payment_niubiz.plugin import NiubizPaymentPlugin
+def _get_plugin() -> "NiubizPlugin":
+    from indico_payment_niubiz.plugin import NiubizPlugin
 
-    return NiubizPaymentPlugin.instance
+    return NiubizPlugin.instance
 
 
 def _parse_purchase_number(value: Optional[str]) -> Tuple[Optional[int], Optional[int]]:

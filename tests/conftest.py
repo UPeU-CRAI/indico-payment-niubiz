@@ -21,13 +21,13 @@ pytest.importorskip("indico", reason="Indico no está disponible en el entorno d
 pytest.importorskip("indico.modules.events.payment", reason="Indico no está disponible en el entorno de pruebas.")
 pytest.importorskip("indico.modules.events.logs", reason="Indico no está disponible en el entorno de pruebas.")
 
-from indico_payment_niubiz.plugin import NiubizPaymentPlugin
+from indico_payment_niubiz.plugin import NiubizPlugin
 
 
 @pytest.fixture
 def plugin(monkeypatch):
     """Mock del plugin Niubiz con configuraciones mínimas."""
-    plugin = MagicMock(spec=NiubizPaymentPlugin)
+    plugin = MagicMock(spec=NiubizPlugin)
     plugin._get_setting = MagicMock(return_value=None)
     return plugin
 

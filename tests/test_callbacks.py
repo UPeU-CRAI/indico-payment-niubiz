@@ -23,8 +23,8 @@ def _make_payload(status="AUTHORIZED", purchase_number="1-1", txn_id="abc123", a
 @pytest.fixture
 def plugin(app):
     """Obtener el plugin Niubiz ya cargado en Indico."""
-    from indico_payment_niubiz.plugin import NiubizPaymentPlugin
-    return NiubizPaymentPlugin.instance
+    from indico_payment_niubiz.plugin import NiubizPlugin
+    return NiubizPlugin.instance
 
 
 @pytest.fixture
