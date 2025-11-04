@@ -1,128 +1,96 @@
-# Plugin de pagos Niubiz para Indico
+# Indico Niubiz Plugin
 
-Extiende el módulo de pagos de Indico con la pasarela peruana **Niubiz**. El
-plugin cubre cobros con tarjeta, Yape, PagoEfectivo, códigos QR y reutilización
-de tokens, además de manejar automáticamente los callbacks de estado y los
-reembolsos iniciados desde Indico.
+La integración oficial de Niubiz para Indico permite cobrar inscripciones usando
+`checkout.js`, Yape, PagoEfectivo y tokenización de tarjetas. Incluye manejo de
+notificaciones, reembolsos y controles de seguridad basados en HMAC e IP
+whitelist.
 
-La versión inicial publicada de este repositorio es la **0.0.1**. El detalle de
-cambios se encuentra en [`CHANGELOG.md`](CHANGELOG.md).
-
-
-## Características principales
-
-* Creación de órdenes y carga del `checkout.js` oficial de Niubiz.
-* Confirmación automática de pagos autorizados y soporte opcional para
-  tokenización de tarjetas.
-* Callbacks seguros con validación de token, HMAC y lista blanca de IPs.
-* Registro detallado en los logs del evento y en las transacciones de Indico.
-* Gestión de reembolsos (reverse/refund) con sincronización del estado de la
-  inscripción.
-
-
-## Requisitos
-
-* Indico **3.3** o superior con acceso a la sección de administración.
-* Credenciales válidas de Niubiz (`merchantId`, `accessKey`, `secretKey`).
-* Certificado TLS público para exponer los endpoints de inicio, retorno y
-  notificación.
-* Whitelist de IPs que permita el tráfico desde las redes publicadas por
-  Niubiz (`200.48.119.0/24`, `200.48.62.0/24`, `200.48.63.0/24`,
-  `200.37.132.0/24`, `200.37.133.0/24`).
-
-
-## Instalación rápida
+## Instalación
 
 ```bash
 git clone https://github.com/UPeU-CRAI/indico-payment-niubiz.git
-pip install -e indico-payment-niubiz
+pip install -e indico-payment-niubiz[dev]
 
 indico setup plugins
 indico maintenance build-cache
-sudo systemctl restart indico-celery indico-web
+sudo systemctl restart indico-web indico-celery
 ```
 
+## Configuración inicial
 
-## Configuración
+1. **Administración → Plugins → Niubiz**
+   - Carga `Merchant ID`, `Access key` y `Secret key`.
+   - Define el **Entorno** (sandbox o producción) y la apariencia del checkout
+     (logo, color del botón, MDD opcional).
+   - Activa los métodos disponibles: Tarjeta, Yape, PagoEfectivo, QR y
+     tokenización.
+   - Configura seguridad para callbacks: token Bearer, secreto HMAC y rangos de
+     IP adicionales.
+2. **Evento → Pagos → Niubiz**
+   - Permite sobrescribir credenciales, método por defecto y parámetros de
+     seguridad por evento.
+   - Cada formulario de registro puede habilitar o deshabilitar métodos
+     específicos sin afectar a los demás eventos.
 
-### Configuración global
+## Flujo NO-PCI (checkout.js)
 
-Desde **Administración → Plugins → Niubiz**:
+1. **Inicio de pago**: el participante elige Niubiz; el plugin crea una sesión
+   (`sessionKey`) y renderiza `checkout.js` con el resumen de la orden.
+2. **Captura de tarjeta**: todo el ingreso de datos ocurre en el formulario
+   embebido de Niubiz, Indico nunca procesa PANs.
+3. **Respuesta inmediata**: el iframe devuelve un estado provisional (éxito,
+   cancelado o error) que se refleja en `templates/niubiz/checkout.html`.
+4. **Webhook NO-PCI**: Niubiz notifica el resultado definitivo mediante callbacks
+   firmados (`NBZ-Signature`). Se valida token, HMAC e IP.
+5. **Actualización de inscripción**: el estado del registro se sincroniza y se
+   muestra un mensaje amigable en `templates/niubiz/result.html`.
 
-* `Merchant ID`, `Access key` y `Secret key` entregados por Niubiz.
-* Entorno (`sandbox` o `producción`).
-* Apariencia del checkout: logo y color del botón.
-* Merchant Defined Data (MDD) opcional para reglas antifraude.
-* Métodos de pago habilitados (Tarjeta, Yape, PagoEfectivo, QR) y tokenización.
-* Token de autorización para callbacks, secreto HMAC y whitelist de IPs
-  adicionales.
+## Tabla de estados
 
-### Configuración por evento
+| Estado Niubiz / actionCode | Estado Indico             | Nota                                      |
+|----------------------------|---------------------------|-------------------------------------------|
+| `AUTHORIZED` + `000`       | `successful`              | Pago confirmado automáticamente           |
+| `REFUNDED`, `VOIDED`       | `cancelled`               | Marca la inscripción como no pagada       |
+| `PENDING`, `REVIEW`, CIP   | `pending`                 | Espera confirmación manual/webhook        |
+| `REJECTED`, `NOT AUTHORIZED`, códigos `101`, `116`, `191` | `failed` | Se registra rechazo y no cambia la inscripción |
+| actionCode `9997`, `9905`  | `cancelled`               | Cancelado por expiración o timeout        |
+| Otros valores              | `pending` (seguro)        | Se requiere revisión manual               |
 
-Cada formulario de registro puede sobrescribir las credenciales y parámetros
-anteriores desde **Gestión del evento → Pagos → Niubiz**. Es útil cuando se
-trabaja con múltiples comercios o cuando se desean métodos de pago distintos por
-evento.
+## Sandbox vs. Producción
 
-
-## Flujo resumido
-
-1. **Inicio**: el participante selecciona Niubiz. El plugin crea la sesión en la
-   API de Niubiz y renderiza el checkout con la información del registro.
-2. **Checkout**: se carga `checkout.js` con el `transactionToken`. En el caso de
-   Yape, PagoEfectivo o tokens reutilizados, se usan los endpoints específicos de
-   la API.
-3. **Autorización y confirmación**: el retorno de Niubiz se procesa con
-   `authorizeTransaction` y `confirmation`. La inscripción solo se marca como
-   pagada cuando Niubiz responde `CAPTURED`/`CONFIRMED`.
-4. **Notificaciones**: el endpoint `/notify` recibe callbacks firmados por Niubiz
-   y sincroniza el estado de la inscripción (pagado, pendiente, cancelado o
-   reembolsado). Cada mensaje queda registrado en el log del evento.
-5. **Reembolsos**: desde Indico se puede iniciar un reembolso. El plugin decide
-   automáticamente si corresponde un `reverse` (transacción no liquidada) o un
-   `refund` y actualiza el estado de la inscripción.
-
+| Característica              | Sandbox                                         | Producción                                      |
+|-----------------------------|-------------------------------------------------|-------------------------------------------------|
+| URL base API                | `https://apitestenv.vnforapps.com`             | `https://apiprod.vnforapps.com`                 |
+| checkout.js                 | `https://static-content-qas.vnforapps.com/...` | `https://static-content.vnforapps.com/v2/...`   |
+| Credenciales                | Provistas por Niubiz para pruebas               | Requieren alta formal con contratos vigentes    |
+| IPs de callback             | Redes publicadas por Niubiz (usar whitelist)   | Mismas redes, confirmar con soporte             |
+| Tokens y tarjetas           | Datos de prueba, sin cargo real                 | Datos reales; habilita tokenización segura      |
 
 ## Seguridad de callbacks
 
-El endpoint público `.../payment/response/niubiz/notify` aplica las siguientes
-validaciones antes de procesar el payload:
+- `Authorization: Bearer <token>` configurable.
+- Firma HMAC `NBZ-Signature` validada con `security.validate_nbz_signature`.
+- Lista blanca de IPs usando redes oficiales + configurables.
+- Datos normalizados con `utils.extract_callback_details` antes de registrar
+  transacciones.
 
-* **Token de autorización** (`Authorization: Bearer ...`).
-* **Firma HMAC** (`NBZ-Signature`) usando el secreto configurado.
-* **Lista blanca de IPs**, combinando las redes oficiales de Niubiz con las
-  adicionales definidas en el plugin.
-* Validación de monto y moneda contra la inscripción original.
+## Reembolsos
 
-Si alguno de estos chequeos falla se devuelve `403` o `400`, evitando marcar
-pagos erróneos.
-
-
-## Reembolsos y tokenización
-
-* Los tokens de tarjeta se almacenan en `NiubizStoredToken` y pueden reutilizarse
-  para cobros recurrentes.
-* `handle_refund` registra tanto la reversa como el reembolso y marca la
-  inscripción como no pagada cuando procede.
-* Toda la información relevante (códigos de autorización, `transactionId`,
-  `actionCode`, payloads) queda guardada para auditoría.
-
+- `NiubizClient.refund_transaction` utiliza dataclasses (`RefundResponse`) para
+  unificar el resultado de refund/void.
+- `NiubizClient.reverse_payment` intenta `refund` y cae a `void` cuando la
+  operación aún no ha sido capturada.
+- El plugin registra los resultados en logs del evento y actualiza la inscripción.
 
 ## Desarrollo y pruebas
 
-Este repositorio incluye pruebas unitarias para el cliente HTTP, el mapeo de
-estados y el endpoint de callbacks. Para ejecutarlas:
-
 ```bash
-pytest
+pip install -e .[dev]
+ruff check .
+black --check .
+isort --check-only .
+mypy indico_payment_niubiz
+pytest -q
 ```
 
-Se recomienda habilitar un entorno virtual con Indico y ejecutar las pruebas
-antes de desplegar cambios en producción.
-
-
-## Historial de cambios
-
-Consulta [`CHANGELOG.md`](CHANGELOG.md) para revisar las versiones publicadas y
-las novedades de cada una.
-
+Consulta [`CHANGELOG.md`](CHANGELOG.md) para conocer la evolución del proyecto.

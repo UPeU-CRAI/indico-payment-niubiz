@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Resultado del pago</title>
+    <style>
+      body {
+        font-family: "Segoe UI", sans-serif;
+        background: #0f172a;
+        margin: 0;
+        padding: 0;
+        color: #fff;
+      }
+      .wrapper {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 32px;
+        box-sizing: border-box;
+      }
+      .card {
+        max-width: 520px;
+        width: 100%;
+        background: rgba(15, 23, 42, 0.85);
+        border-radius: 20px;
+        padding: 40px;
+        box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.6);
+        backdrop-filter: blur(6px);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 2rem;
+        letter-spacing: -0.02em;
+      }
+      p {
+        font-size: 1rem;
+        line-height: 1.6;
+        margin-bottom: 24px;
+        color: rgba(255, 255, 255, 0.82);
+      }
+      .badge {
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 999px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        margin-bottom: 18px;
+      }
+      .badge.success {
+        background: rgba(16, 185, 129, 0.15);
+        color: #34d399;
+      }
+      .badge.error {
+        background: rgba(248, 113, 113, 0.15);
+        color: #f87171;
+      }
+      .badge.pending {
+        background: rgba(250, 204, 21, 0.15);
+        color: #facc15;
+      }
+      a.button {
+        display: inline-block;
+        padding: 12px 24px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+      a.button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 16px 30px rgba(59, 130, 246, 0.35);
+      }
+      .details {
+        margin-top: 24px;
+        padding-top: 20px;
+        border-top: 1px solid rgba(148, 163, 184, 0.24);
+        font-size: 0.9rem;
+        color: rgba(226, 232, 240, 0.8);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="card">
+        {% set normalized = status|default('pending')|lower %}
+        <span
+          class="badge {{ 'success' if normalized in ['success', 'approved'] else 'error' if normalized in ['error', 'failed', 'declined'] else 'pending' }}"
+        >
+          {{ normalized|upper }}
+        </span>
+        <h1>
+          {% if normalized in ['success', 'approved'] %}
+          ¡Pago completado!
+          {% elif normalized in ['error', 'failed', 'declined'] %}
+          Pago rechazado
+          {% else %}
+          Pago en revisión
+          {% endif %}
+        </h1>
+        <p>
+          {% if message %}
+            {{ message }}
+          {% elif normalized in ['success', 'approved'] %}
+            Hemos recibido la confirmación de Niubiz y tu inscripción quedará marcada como pagada en Indico.
+          {% elif normalized in ['error', 'failed', 'declined'] %}
+            No pudimos completar el cargo. Revisa los datos ingresados o utiliza otra tarjeta para finalizar el registro.
+          {% else %}
+            El pago aún está pendiente. Recibirás una notificación cuando Niubiz procese la operación.
+          {% endif %}
+        </p>
+        <a class="button" href="javascript:window.close();">Cerrar y volver a Indico</a>
+        <div class="details">
+          Este resumen refleja el flujo NO-PCI: Niubiz procesa los datos de tarjeta mientras Indico
+          actualiza automáticamente el estado de tu inscripción.
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

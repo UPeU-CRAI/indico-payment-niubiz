@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Niubiz Checkout</title>
+    <style>
+      body {
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        background: #f6f7fb;
+        margin: 0;
+        padding: 0;
+        color: #1f1f1f;
+      }
+      .container {
+        max-width: 720px;
+        margin: 40px auto;
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+        overflow: hidden;
+      }
+      header {
+        background: linear-gradient(120deg, #0d47a1, #42a5f5);
+        color: #fff;
+        padding: 24px 32px;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 1.8rem;
+      }
+      main {
+        padding: 32px;
+      }
+      .summary {
+        margin-bottom: 32px;
+      }
+      .summary dl {
+        display: grid;
+        grid-template-columns: 180px 1fr;
+        gap: 12px 16px;
+        margin: 0;
+      }
+      .summary dt {
+        font-weight: 600;
+        color: #4b5563;
+      }
+      .summary dd {
+        margin: 0;
+        color: #111827;
+      }
+      .status-message {
+        border-radius: 10px;
+        padding: 18px 20px;
+        background: #f3f4f6;
+        border: 1px solid #e5e7eb;
+        margin-bottom: 24px;
+      }
+      .status-message[data-status="success"] {
+        background: #ecfdf5;
+        border-color: #a7f3d0;
+        color: #047857;
+      }
+      .status-message[data-status="error"] {
+        background: #fef2f2;
+        border-color: #fecaca;
+        color: #b91c1c;
+      }
+      .status-message h2 {
+        margin: 0 0 8px;
+        font-size: 1.1rem;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .actions button,
+      .actions a {
+        border-radius: 8px;
+        border: none;
+        padding: 12px 18px;
+        font-size: 0.95rem;
+        cursor: pointer;
+        text-decoration: none;
+        transition: transform 0.2s ease;
+      }
+      .actions button {
+        background: #0d47a1;
+        color: #fff;
+      }
+      .actions button:hover,
+      .actions a:hover {
+        transform: translateY(-1px);
+      }
+      .actions a {
+        color: #0d47a1;
+        background: transparent;
+      }
+      footer {
+        font-size: 0.8rem;
+        color: #6b7280;
+        padding: 24px 32px;
+        background: #f9fafb;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Confirma tu pago con Niubiz</h1>
+        <p>Integración NO-PCI • Entorno: <strong>{{ endpoint|upper }}</strong></p>
+      </header>
+      <main>
+        <section class="summary" aria-label="Resumen de la orden">
+          <h2>Resumen de la orden</h2>
+          <dl>
+            <dt>Orden</dt>
+            <dd>{{ purchase_number }}</dd>
+            <dt>Descripción</dt>
+            <dd>{{ description }}</dd>
+            <dt>Monto</dt>
+            <dd>{{ currency }} {{ amount }}</dd>
+          </dl>
+        </section>
+        <div class="status-message" id="checkout-status" data-status="pending">
+          <h2>Esperando confirmación…</h2>
+          <p>
+            Al confirmar la transacción se actualizará automáticamente este estado.
+            Si cancelas, podrás iniciar nuevamente desde tu panel de registro.
+          </p>
+        </div>
+        <section class="actions" aria-label="Acciones de pago">
+          <button type="button" id="launch-checkout">Pagar con Checkout.js</button>
+          <a href="javascript:history.back()">Volver</a>
+        </section>
+      </main>
+      <footer>
+        Niubiz Checkout.js. El flujo NO-PCI mantiene tus credenciales seguras y
+        delega la captura de la tarjeta a Niubiz.
+      </footer>
+    </div>
+    <script src="{{ checkout_js_url }}" async></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        var statusBox = document.getElementById("checkout-status");
+        var button = document.getElementById("launch-checkout");
+
+        function updateStatus(type, message) {
+          statusBox.dataset.status = type;
+          statusBox.querySelector("h2").textContent = message.title;
+          statusBox.querySelector("p").textContent = message.body;
+        }
+
+        var messages = {
+          pending: {
+            title: "Esperando confirmación…",
+            body:
+              "Completa el flujo de Niubiz para finalizar tu pago. Recibirás un correo con el resultado.",
+          },
+          success: {
+            title: "¡Pago confirmado!",
+            body:
+              "Tu pago fue procesado correctamente. Puedes cerrar esta ventana y revisar el estado en Indico.",
+          },
+          error: {
+            title: "No se pudo completar el pago",
+            body:
+              "Hubo un inconveniente al procesar la tarjeta. Inténtalo nuevamente o elige otro método de pago.",
+          },
+          cancelled: {
+            title: "Pago cancelado",
+            body:
+              "Cancelaste la operación. Si fue un error, vuelve a iniciar el flujo cuando estés listo.",
+          },
+        };
+
+        updateStatus("pending", messages.pending);
+
+        button.addEventListener("click", function () {
+          if (typeof window.checkout === "function") {
+            window.checkout({
+              amount: "{{ amount }}",
+              currency: "{{ currency }}",
+              purchaseNumber: "{{ purchase_number }}",
+              action: function (status) {
+                var normalized = (status || "").toLowerCase();
+                if (normalized === "success" || normalized === "approved") {
+                  updateStatus("success", messages.success);
+                } else if (normalized === "cancelled" || normalized === "canceled") {
+                  updateStatus("cancelled", messages.cancelled);
+                } else {
+                  updateStatus("error", messages.error);
+                }
+              },
+            });
+          } else {
+            updateStatus("error", {
+              title: "Checkout.js no disponible",
+              body:
+                "No se pudo cargar el script de Niubiz. Verifica tu conexión o intenta nuevamente en unos minutos.",
+            });
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -12,21 +12,14 @@ import logging
 from typing import Dict, Iterable, Optional
 
 from werkzeug.exceptions import BadRequest
-from wtforms.fields import BooleanField, SelectField, StringField, TextAreaField
-from wtforms.validators import DataRequired, Optional as OptionalValidator
 
 from indico.core.plugins import IndicoPlugin
-from indico.modules.events.payment import (
-    PaymentEventSettingsFormBase,
-    PaymentPluginMixin,
-    PaymentPluginSettingsFormBase,
-)
-from indico.web.forms.fields import IndicoPasswordField
+from indico.modules.events.payment import PaymentPluginMixin
 from indico.web.flask.util import url_for
 
 from indico_payment_niubiz import _
-from indico_payment_niubiz.blueprint import blueprint
 from indico_payment_niubiz.client import NiubizClient
+from indico_payment_niubiz.forms import EventSettingsForm, PluginSettingsForm
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
     handle_refund,
@@ -39,61 +32,9 @@ from indico_payment_niubiz.settings import (
     get_merchant_id_for_event,
     get_scoped_setting,
 )
+from indico_payment_niubiz.views import blueprint
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------- CONFIGURACIÓN GLOBAL ---------------------
-BOOL_INHERIT_CHOICES = (
-    ("", _("Usar configuración global")),
-    ("1", _("Activado")),
-    ("0", _("Desactivado")),
-)
-
-
-class PluginSettingsForm(PaymentPluginSettingsFormBase):
-    merchant_id = StringField(_("Merchant ID"), [DataRequired()])
-    access_key = IndicoPasswordField(_("Access key"), [DataRequired()])
-    secret_key = IndicoPasswordField(_("Secret key"), [DataRequired()])
-    merchant_logo_url = StringField(_("Logo del comercio"), [OptionalValidator()])
-    button_color = StringField(_("Color del botón"), [OptionalValidator()])
-    merchant_defined_data = TextAreaField(_("Merchant Define Data (MDD)"), [OptionalValidator()])
-    endpoint = SelectField(
-        _("Entorno"), [DataRequired()],
-        choices=[("sandbox", _("Sandbox (pruebas)")), ("prod", _("Producción"))],
-    )
-    enable_card = BooleanField(_("Tarjeta"), default=True)
-    enable_yape = BooleanField(_("Yape"), default=False)
-    enable_pagoefectivo = BooleanField(_("PagoEfectivo"), default=False)
-    enable_qr = BooleanField(_("QR"), default=False)
-    enable_tokenization = BooleanField(_("Tokenización"), default=False)
-    callback_authorization_token = IndicoPasswordField(_("Token de autorización de callback"), [OptionalValidator()])
-    callback_hmac_secret = IndicoPasswordField(_("Secreto HMAC"), [OptionalValidator()])
-    callback_ip_whitelist = TextAreaField(_("Whitelist de IPs"), [OptionalValidator()])
-
-
-# --------------------- CONFIG POR EVENTO ---------------------
-class EventSettingsForm(PaymentEventSettingsFormBase):
-    merchant_id = StringField(_("Merchant ID"), [OptionalValidator()])
-    access_key = IndicoPasswordField(_("Access key"), [OptionalValidator()])
-    secret_key = IndicoPasswordField(_("Secret key"), [OptionalValidator()])
-    merchant_logo_url = StringField(_("Logo"), [OptionalValidator()])
-    button_color = StringField(_("Color del botón"), [OptionalValidator()])
-    merchant_defined_data = TextAreaField(_("Merchant Define Data"), [OptionalValidator()])
-    endpoint = SelectField(
-        _("Entorno"), [OptionalValidator()],
-        choices=[("", _("Usar configuración global")),
-                 ("sandbox", _("Sandbox (pruebas)")),
-                 ("prod", _("Producción"))],
-    )
-    enable_card = SelectField(_("Tarjeta"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_yape = SelectField(_("Yape"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_pagoefectivo = SelectField(_("PagoEfectivo"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_qr = SelectField(_("QR"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_tokenization = SelectField(_("Tokenización"), choices=BOOL_INHERIT_CHOICES, default="")
-    callback_authorization_token = IndicoPasswordField(_("Token de autorización"), [OptionalValidator()])
-    callback_hmac_secret = IndicoPasswordField(_("Secreto HMAC"), [OptionalValidator()])
-    callback_ip_whitelist = TextAreaField(_("Whitelist de IPs"), [OptionalValidator()])
 
 
 # --------------------- PLUGIN PRINCIPAL ---------------------
@@ -312,15 +253,11 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
             return {"success": False, "error": _("Error al comunicarse con Niubiz.")}
 
         # Preparar payload
-        payload_for_storage = (
-            result.get("data") if result.get("success") and isinstance(result.get("data"), dict)
-            else result.get("payload") if isinstance(result.get("payload"), dict)
-            else result
-        )
+        payload_for_storage = result.data if isinstance(result.data, dict) else {"raw": result.data}
 
-        status_value = result.get("status") or ""
+        status_value = result.status or ""
         status_key = status_value.upper()
-        niubiz_transaction_id = result.get("transaction_id") or transaction_id
+        niubiz_transaction_id = result.transaction_id or transaction_id
 
         transaction_data = build_transaction_data(
             payload=payload_for_storage,
@@ -333,13 +270,17 @@ class NiubizPaymentPlugin(PaymentPluginMixin, IndicoPlugin):
         transaction_data["amount"] = float(amount_decimal)
 
         success_statuses = {"REFUNDED", "VOIDED"}
-        is_success = bool(result.get("success")) and status_key in success_statuses
+        is_success = bool(result.success) and status_key in success_statuses
 
         if is_success:
             summary = _("Niubiz confirmó el reembolso correctamente.")
             logger.info("Reembolso Niubiz exitoso: reg=%s, txn=%s", registration.id, niubiz_transaction_id)
         else:
-            summary = result.get("error") or _("Niubiz no pudo completar el reembolso.")
+            summary = (
+                result.data.get("error")
+                if isinstance(result.data, dict) and result.data.get("error")
+                else _("Niubiz no pudo completar el reembolso.")
+            )
             logger.warning("Reembolso Niubiz fallido: reg=%s, txn=%s, error=%s", registration.id, niubiz_transaction_id, summary)
             transaction_data["error"] = summary
 

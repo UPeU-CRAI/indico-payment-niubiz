@@ -2,47 +2,35 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import ipaddress
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+import time
+from typing import Any, Dict, List, Optional
 
-from indico.modules.events.payment.models.transactions import TransactionStatus
+from indico_payment_niubiz.schema import StatusMapping, WebhookDetails
 
+try:  # pragma: no cover - executed when Indico is available
+    from indico.modules.events.payment.models.transactions import TransactionStatus
+except Exception:  # pragma: no cover - fallback for tests
+    from enum import Enum
+
+    class TransactionStatus(Enum):  # type: ignore[override]
+        successful = "successful"
+        failed = "failed"
+        pending = "pending"
+        cancelled = "cancelled"
 
 logger = logging.getLogger(__name__)
-
 
 CHECKOUT_JS_URLS = {
     "sandbox": "https://static-content-qas.vnforapps.com/env/sandbox/js/checkout.js",
     "prod": "https://static-content.vnforapps.com/v2/js/checkout.js",
 }
 
-# Official production IP ranges published by Niubiz for callbacks.
-DEFAULT_CALLBACK_IPS = (
-    "200.48.119.0/24",
-    "200.48.62.0/24",
-    "200.48.63.0/24",
-    "200.37.132.0/24",
-    "200.37.133.0/24",
-)
-
 # Additional codes documented as rejections or technical failures.
 REJECTED_CODES = {"101", "102", "116", "129", "180", "191"}
 FAILED_CODES = {"670", "678", "754", "666"}
 CANCELLED_CODES = {"9997", "9905"}
 TIMEOUT_CODES = {"909", "9999"}
-
-
-@dataclass(frozen=True)
-class StatusMapping:
-    """Structured result describing the mapped transaction status."""
-
-    status: TransactionStatus
-    manual_confirmation: bool = False
-    reason: Optional[str] = None
 
 
 def _collect_dicts(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -87,11 +75,20 @@ def _extract_value(payload: Dict[str, Any], *keys: str) -> Optional[Any]:
     return None
 
 
-def extract_callback_details(payload: Dict[str, Any]) -> Dict[str, Optional[Any]]:
-    """Normalize raw Niubiz callback payloads into a flat dictionary."""
+def extract_callback_details(payload: Dict[str, Any]) -> WebhookDetails:
+    """Normalize raw Niubiz callback payloads into :class:`WebhookDetails`."""
 
     if not isinstance(payload, dict):
-        return {}
+        return WebhookDetails(
+            purchase_number=None,
+            transaction_id=None,
+            status=None,
+            status_order=None,
+            action_code=None,
+            payment_method=None,
+            action_description=None,
+            raw={}
+        )
 
     details: Dict[str, Optional[Any]] = {
         "purchase_number": _extract_value(
@@ -119,18 +116,7 @@ def extract_callback_details(payload: Dict[str, Any]) -> Dict[str, Optional[Any]
             "message",
             "detalle",
         ),
-        "transaction_date": _extract_value(payload, "transactionDate", "TRANSACTION_DATE"),
-        "amount": _extract_value(payload, "amount"),
-        "currency": _extract_value(payload, "currency"),
-        "authorization_code": _extract_value(payload, "authorizationCode", "AUTHORIZATION_CODE"),
-        "trace_number": _extract_value(payload, "traceNumber", "TRACE_NUMBER"),
-        "brand": _extract_value(payload, "brand", "BRAND"),
-        "masked_card": _extract_value(payload, "maskedCard", "masked_card", "PAN", "pan"),
-        "eci": _extract_value(payload, "eci", "ECI"),
-        "cip": _extract_value(payload, "cip", "CIP"),
-        "operation_number": _extract_value(payload, "operationNumber", "operation_number"),
         "payment_method": _extract_value(payload, "paymentMethod", "payment_method"),
-        "channel": _extract_value(payload, "channel"),
     }
 
     # ``purchaseNumber`` is sometimes nested within ``order`` and should override
@@ -139,18 +125,26 @@ def extract_callback_details(payload: Dict[str, Any]) -> Dict[str, Optional[Any]
     if order_purchase:
         details["purchase_number"] = order_purchase
 
-    return details
+    return WebhookDetails(
+        purchase_number=details["purchase_number"],
+        transaction_id=details["transaction_id"],
+        status=details["status"],
+        status_order=details["status_order"],
+        action_code=details["action_code"],
+        payment_method=details["payment_method"],
+        action_description=details["action_description"],
+        raw=payload,
+    )
 
 
-def validate_nbz_signature(secret: str, body: bytes, signature: str) -> bool:
-    """Validate the ``NBZ-Signature`` header using HMAC SHA-256."""
+def validate_webhook_reason(details: WebhookDetails) -> Optional[str]:
+    """Return a human readable reason when Niubiz indicates a failure."""
 
-    if not secret or not signature:
-        return False
-
-    computed = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    provided = signature.strip().lower()
-    return hmac.compare_digest(provided, computed.lower())
+    if details.action_description:
+        return str(details.action_description)
+    if details.action_code and details.action_code != "000":
+        return f"Action code {details.action_code}"
+    return None
 
 
 def get_checkout_script_url(endpoint: str = "sandbox") -> str:
@@ -190,6 +184,13 @@ def map_niubiz_status(
     if status_lower == "confirmed":
         manual_confirmation = True
         return StatusMapping(TransactionStatus.successful, manual_confirmation=manual_confirmation)
+
+    if payment_method_lower:
+        if "pagoefectivo" in payment_method_lower or "pago efectivo" in payment_method_lower:
+            return StatusMapping(TransactionStatus.pending)
+        if "yape" in payment_method_lower:
+            if action_code_upper != "000" or status_lower in {"pending", "review", "", "authorized"}:
+                return StatusMapping(TransactionStatus.pending)
 
     if status_lower == "authorized":
         if action_code_upper == "000":
@@ -241,13 +242,6 @@ def map_niubiz_status(
         if any(keyword in action_description_lower for keyword in ("anulad", "void")):
             return StatusMapping(TransactionStatus.cancelled)
 
-    if payment_method_lower:
-        if "pagoefectivo" in payment_method_lower or "pago efectivo" in payment_method_lower:
-            return StatusMapping(TransactionStatus.pending)
-        if "yape" in payment_method_lower:
-            if action_code_upper != "000" or status_lower in {"pending", "review", "", "authorized"}:
-                return StatusMapping(TransactionStatus.pending)
-
     if action_code_upper in CANCELLED_CODES or action_code_upper in TIMEOUT_CODES:
         return StatusMapping(TransactionStatus.cancelled)
 
@@ -269,23 +263,29 @@ def map_action_code_to_status(action_code: str, status: str) -> TransactionStatu
     return map_niubiz_status(status=status, action_code=action_code).status
 
 
-def parse_ip_list(values: Sequence[str]) -> Sequence[ipaddress._BaseNetwork]:  # type: ignore[name-defined]
-    networks = []
-    for value in values:
-        value = (value or "").strip()
-        if not value:
-            continue
-        try:
-            networks.append(ipaddress.ip_network(value, strict=False))
-        except ValueError:
-            logger.warning("Ignoring invalid Niubiz callback IP range: %%s", value)
-    return tuple(networks)
+class WebhookIdempotencyCache:
+    """Simple in-memory helper to guard webhook processing."""
 
+    def __init__(self, ttl_seconds: int = 300) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._store: Dict[str, float] = {}
 
-def ip_in_whitelist(ip: str, networks: Iterable[ipaddress._BaseNetwork]) -> bool:  # type: ignore[name-defined]
-    try:
-        address = ipaddress.ip_address(ip)
-    except ValueError:
-        logger.warning("Received Niubiz callback from invalid IP address: %%s", ip)
-        return False
-    return any(address in network for network in networks)
+    def _now(self) -> float:
+        return time.time()
+
+    def purge_expired(self, *, now: Optional[float] = None) -> None:
+        current = self._now() if now is None else now
+        expired = [key for key, expiry in self._store.items() if expiry <= current]
+        for key in expired:
+            self._store.pop(key, None)
+
+    def mark_if_new(self, key: str, *, now: Optional[float] = None) -> bool:
+        """Return ``True`` if ``key`` has not been seen recently."""
+
+        current = self._now() if now is None else now
+        self.purge_expired(now=current)
+        expiry = self._store.get(key)
+        if expiry and expiry > current:
+            return False
+        self._store[key] = current + self.ttl_seconds
+        return True
