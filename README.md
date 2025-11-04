@@ -49,20 +49,26 @@ sudo systemctl restart indico-celery indico-web
 
 Desde **Administración → Plugins → Niubiz**:
 
-* `Merchant ID`, `Access key` y `Secret key` entregados por Niubiz.
-* Entorno (`sandbox` o `producción`).
-* Apariencia del checkout: logo y color del botón.
-* Merchant Defined Data (MDD) opcional para reglas antifraude.
+* Credenciales NO-PCI entregadas por Niubiz: `merchant_id`, `client_id`,
+  `client_secret`, `username`, `password` y `realm_code`.
+* Entorno (`sandbox`/`prod`). Si se selecciona una variante PCI el formulario
+  mostrará una advertencia, ya que el plugin solo soporta flujos NO-PCI.
+* Moneda por defecto para eventos sin moneda configurada.
+* Permitir o bloquear reembolsos iniciados desde Indico.
 * Métodos de pago habilitados (Tarjeta, Yape, PagoEfectivo, QR) y tokenización.
-* Token de autorización para callbacks, secreto HMAC y whitelist de IPs
-  adicionales.
+* Branding del checkout (JSON con logo/color o un identificador simple) y
+  requerimiento de Merchant Defined Data.
+* Token de autorización para callbacks, secreto HMAC y lista adicional de IPs
+  permitidas (se suman a las publicadas por Niubiz).
 
 ### Configuración por evento
 
 Cada formulario de registro puede sobrescribir las credenciales y parámetros
 anteriores desde **Gestión del evento → Pagos → Niubiz**. Es útil cuando se
-trabaja con múltiples comercios o cuando se desean métodos de pago distintos por
-evento.
+trabaja con múltiples comercios, cuando se requieren entornos diferentes o cuando
+se desean métodos de pago distintos por evento. También es posible definir un
+branding específico, cambiar la moneda por defecto o deshabilitar reembolsos
+para un evento puntual.
 
 
 ## Flujo resumido
