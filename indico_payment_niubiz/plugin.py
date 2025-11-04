@@ -12,21 +12,18 @@ import logging
 from typing import Dict, Iterable, Optional
 
 from werkzeug.exceptions import BadRequest
-from wtforms.fields import BooleanField, SelectField, StringField, TextAreaField
-from wtforms.validators import DataRequired, Optional as OptionalValidator
 
 from indico.core.plugins import IndicoPlugin
-from indico.modules.events.payment import (
-    PaymentEventSettingsFormBase,
-    PaymentPluginMixin,
-    PaymentPluginSettingsFormBase,
-)
-from indico.web.forms.fields import IndicoPasswordField
+from indico.modules.events.payment import PaymentPluginMixin
 from indico.web.flask.util import url_for
 
 from indico_payment_niubiz import _
 from indico_payment_niubiz.blueprint import blueprint
 from indico_payment_niubiz.client import NiubizClient
+from indico_payment_niubiz.forms import (
+    NiubizEventSettingsForm,
+    NiubizPluginSettingsForm,
+)
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
     handle_refund,
@@ -34,66 +31,16 @@ from indico_payment_niubiz.indico_integration import (
 )
 from indico_payment_niubiz.models import NiubizStoredToken
 from indico_payment_niubiz.settings import (
+    get_branding,
     get_credentials_for_event,
-    get_endpoint_for_event,
-    get_merchant_id_for_event,
+    get_default_currency,
+    get_merchant_defined_data,
+    get_scoped_bool,
     get_scoped_setting,
+    is_mdd_required,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------- CONFIGURACIÓN GLOBAL ---------------------
-BOOL_INHERIT_CHOICES = (
-    ("", _("Usar configuración global")),
-    ("1", _("Activado")),
-    ("0", _("Desactivado")),
-)
-
-
-class PluginSettingsForm(PaymentPluginSettingsFormBase):
-    merchant_id = StringField(_("Merchant ID"), [DataRequired()])
-    access_key = IndicoPasswordField(_("Access key"), [DataRequired()])
-    secret_key = IndicoPasswordField(_("Secret key"), [DataRequired()])
-    merchant_logo_url = StringField(_("Logo del comercio"), [OptionalValidator()])
-    button_color = StringField(_("Color del botón"), [OptionalValidator()])
-    merchant_defined_data = TextAreaField(_("Merchant Define Data (MDD)"), [OptionalValidator()])
-    endpoint = SelectField(
-        _("Entorno"), [DataRequired()],
-        choices=[("sandbox", _("Sandbox (pruebas)")), ("prod", _("Producción"))],
-    )
-    enable_card = BooleanField(_("Tarjeta"), default=True)
-    enable_yape = BooleanField(_("Yape"), default=False)
-    enable_pagoefectivo = BooleanField(_("PagoEfectivo"), default=False)
-    enable_qr = BooleanField(_("QR"), default=False)
-    enable_tokenization = BooleanField(_("Tokenización"), default=False)
-    callback_authorization_token = IndicoPasswordField(_("Token de autorización de callback"), [OptionalValidator()])
-    callback_hmac_secret = IndicoPasswordField(_("Secreto HMAC"), [OptionalValidator()])
-    callback_ip_whitelist = TextAreaField(_("Whitelist de IPs"), [OptionalValidator()])
-
-
-# --------------------- CONFIG POR EVENTO ---------------------
-class EventSettingsForm(PaymentEventSettingsFormBase):
-    merchant_id = StringField(_("Merchant ID"), [OptionalValidator()])
-    access_key = IndicoPasswordField(_("Access key"), [OptionalValidator()])
-    secret_key = IndicoPasswordField(_("Secret key"), [OptionalValidator()])
-    merchant_logo_url = StringField(_("Logo"), [OptionalValidator()])
-    button_color = StringField(_("Color del botón"), [OptionalValidator()])
-    merchant_defined_data = TextAreaField(_("Merchant Define Data"), [OptionalValidator()])
-    endpoint = SelectField(
-        _("Entorno"), [OptionalValidator()],
-        choices=[("", _("Usar configuración global")),
-                 ("sandbox", _("Sandbox (pruebas)")),
-                 ("prod", _("Producción"))],
-    )
-    enable_card = SelectField(_("Tarjeta"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_yape = SelectField(_("Yape"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_pagoefectivo = SelectField(_("PagoEfectivo"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_qr = SelectField(_("QR"), choices=BOOL_INHERIT_CHOICES, default="")
-    enable_tokenization = SelectField(_("Tokenización"), choices=BOOL_INHERIT_CHOICES, default="")
-    callback_authorization_token = IndicoPasswordField(_("Token de autorización"), [OptionalValidator()])
-    callback_hmac_secret = IndicoPasswordField(_("Secreto HMAC"), [OptionalValidator()])
-    callback_ip_whitelist = TextAreaField(_("Whitelist de IPs"), [OptionalValidator()])
 
 
 # --------------------- PLUGIN PRINCIPAL ---------------------
@@ -101,46 +48,56 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
     """Plugin de integración de Niubiz en Indico."""
 
     configurable = True
-    settings_form = PluginSettingsForm
-    event_settings_form = EventSettingsForm
+    settings_form = NiubizPluginSettingsForm
+    event_settings_form = NiubizEventSettingsForm
 
     default_settings = {
         "method_name": "Niubiz",
         "merchant_id": "",
-        "access_key": "",
-        "secret_key": "",
-        "merchant_logo_url": "",
-        "button_color": "",
+        "client_id": "",
+        "client_secret": "",
+        "username": "",
+        "password": "",
+        "realm_code": "",
+        "env": "sandbox",
+        "authorization_token": "",
+        "hmac_secret": "",
+        "allowed_ips": "",
         "merchant_defined_data": "",
-        "endpoint": "sandbox",
+        "enable_refunds": True,
+        "default_currency": "PEN",
         "enable_card": True,
         "enable_yape": False,
         "enable_pagoefectivo": False,
         "enable_qr": False,
         "enable_tokenization": False,
-        "callback_authorization_token": "",
-        "callback_hmac_secret": "",
-        "callback_ip_whitelist": "",
+        "branding": "",
+        "mdd_required": False,
     }
 
     default_event_settings = {
         "enabled": False,
         "method_name": None,
         "merchant_id": None,
-        "access_key": None,
-        "secret_key": None,
-        "merchant_logo_url": None,
-        "button_color": None,
+        "client_id": None,
+        "client_secret": None,
+        "username": None,
+        "password": None,
+        "realm_code": None,
+        "env": None,
+        "authorization_token": None,
+        "hmac_secret": None,
+        "allowed_ips": None,
         "merchant_defined_data": None,
-        "endpoint": None,
+        "enable_refunds": None,
+        "default_currency": None,
         "enable_card": None,
         "enable_yape": None,
         "enable_pagoefectivo": None,
         "enable_qr": None,
         "enable_tokenization": None,
-        "callback_authorization_token": None,
-        "callback_hmac_secret": None,
-        "callback_ip_whitelist": None,
+        "branding": None,
+        "mdd_required": None,
     }
 
     # ------------------ Registro ------------------
@@ -148,37 +105,20 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         return blueprint
 
     # ------------------ Helpers de settings ------------------
-    def _get_bool(self, event, name: str) -> bool:
-        """Obtiene un booleano considerando overrides por evento."""
-        override = self.event_settings.get(event, name)
-        if isinstance(override, str) and override in {"0", "1"}:
-            return override == "1"
-        if override not in (None, ""):
-            return bool(override)
-
-        value = get_scoped_setting(event, name, plugin=self)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "on"}:
-                return True
-            if normalized in {"0", "false", "no", "off"}:
-                return False
-        return bool(value)
+    def _get_bool(self, event, name: str, *, default: bool = False) -> bool:
+        return get_scoped_bool(event, name, plugin=self, default=default)
 
     def _get_setting(self, event, name: str) -> Optional[str]:
-        """Obtiene un setting de evento o global."""
         return get_scoped_setting(event, name, plugin=self)
 
     # ------------------ Cliente ------------------
     def _build_client(self, event) -> NiubizClient:
-        merchant_id = get_merchant_id_for_event(event, plugin=self)
-        access_key, secret_key = get_credentials_for_event(event, plugin=self)
-        endpoint = get_endpoint_for_event(event, plugin=self)
+        credentials = get_credentials_for_event(event, plugin=self)
         return NiubizClient(
-            merchant_id=merchant_id,
-            access_key=access_key,
-            secret_key=secret_key,
-            endpoint=endpoint,
+            merchant_id=credentials.merchant_id,
+            access_key=credentials.client_id,
+            secret_key=credentials.client_secret,
+            endpoint=credentials.endpoint,
         )
 
     # ------------------ Métodos de pago ------------------
@@ -196,18 +136,24 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         registration = data["registration"]
         event = data["event"]
         amount = registration.price
-        currency = registration.currency or "PEN"
+        currency = registration.currency or get_default_currency(event, plugin=self)
         purchase_number = f"{registration.event_id}-{registration.id}"
+
+        branding = get_branding(event, plugin=self)
+        merchant_defined_data = get_merchant_defined_data(event, plugin=self)
 
         data.update({
             "merchant_id": self._get_setting(event, "merchant_id"),
             "amount": amount,
             "currency": currency,
             "purchase_number": purchase_number,
-            "merchant_logo_url": self._get_setting(event, "merchant_logo_url"),
-            "checkout_button_color": self._get_setting(event, "button_color"),
+            "merchant_logo_url": branding.get("logo_url") or branding.get("logo"),
+            "checkout_button_color": branding.get("button_color"),
             "checkout_methods": self._collect_methods(event),
             "tokenization_enabled": self._get_bool(event, "enable_tokenization"),
+            "branding": branding,
+            "mdd_required": is_mdd_required(event, plugin=self),
+            "merchant_defined_data": merchant_defined_data,
             "start_url": url_for(
                 "payment_niubiz.start",
                 event_id=event.id,
@@ -274,8 +220,18 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
             return {"success": False, "error": _("No se pudo determinar la inscripción a reembolsar.")}
 
         event = getattr(registration, "event", None)
+        if event and not self._get_bool(event, "enable_refunds", default=True):
+            return {"success": False, "error": _("Los reembolsos están deshabilitados para Niubiz en este evento.")}
+
         txn = transaction or getattr(registration, "transaction", None)
-        currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
+        if event:
+            currency = (
+                getattr(txn, "currency", None)
+                or getattr(registration, "currency", None)
+                or get_default_currency(event, plugin=self)
+            )
+        else:
+            currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
 
         # Determinar monto
         amount_decimal = parse_amount(amount, None) or \

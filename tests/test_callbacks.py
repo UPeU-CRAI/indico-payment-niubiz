@@ -47,14 +47,14 @@ def callback_url(registration):
 # Tests de seguridad
 # ----------------------------------------------------------------------
 def test_callback_rejects_invalid_token(client, plugin, registration, callback_url):
-    plugin.settings.set("callback_authorization_token", "SECRET123")
+    plugin.settings.set("authorization_token", "SECRET123")
 
     resp = client.post(callback_url, json=_make_payload(), headers={"Authorization": "WRONG"})
     assert resp.status_code == 403
 
 
 def test_callback_rejects_invalid_signature(client, plugin, registration, callback_url):
-    plugin.settings.set("callback_hmac_secret", "hmac_secret")
+    plugin.settings.set("hmac_secret", "hmac_secret")
 
     payload = _make_payload()
     resp = client.post(
@@ -66,7 +66,7 @@ def test_callback_rejects_invalid_signature(client, plugin, registration, callba
 
 
 def test_callback_rejects_ip_not_in_whitelist(client, plugin, registration, callback_url, monkeypatch):
-    plugin.settings.set("callback_ip_whitelist", "192.168.0.0/24")
+    plugin.settings.set("allowed_ips", "192.168.0.0/24")
 
     monkeypatch.setattr("flask.Request.remote_addr", "10.0.0.1")
     resp = client.post(callback_url, json=_make_payload())

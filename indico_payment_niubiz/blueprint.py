@@ -23,7 +23,11 @@ from indico_payment_niubiz.indico_integration import (
     handle_successful_payment,
     parse_amount,
 )
-from indico_payment_niubiz.settings import get_scoped_setting
+from indico_payment_niubiz.settings import (
+    get_allowed_ips,
+    get_authorization_token,
+    get_hmac_secret,
+)
 from indico_payment_niubiz.status_mapping import DEFAULT_STATUS, NIUBIZ_STATUS_MAP
 from indico_payment_niubiz.util import (
     DEFAULT_CALLBACK_IPS,
@@ -89,7 +93,7 @@ def _collect_allowed_ips(extra_config: Optional[str]) -> Iterable[str]:
 
 
 def _validate_authorization(event, plugin) -> None:
-    expected = get_scoped_setting(event, "callback_authorization_token", plugin)
+    expected = get_authorization_token(event, plugin)
     if not expected:
         return
 
@@ -100,8 +104,8 @@ def _validate_authorization(event, plugin) -> None:
 
 
 def _validate_ip(event, plugin) -> None:
-    whitelist_raw = get_scoped_setting(event, "callback_ip_whitelist", plugin) or ""
-    networks = parse_ip_list(_collect_allowed_ips(whitelist_raw))
+    extra_ips = get_allowed_ips(event, plugin)
+    networks = parse_ip_list(_collect_allowed_ips("\n".join(extra_ips)))
 
     if not networks:
         return
@@ -116,7 +120,7 @@ def _validate_ip(event, plugin) -> None:
 
 
 def _validate_signature(event, plugin, body: bytes) -> None:
-    secret = get_scoped_setting(event, "callback_hmac_secret", plugin)
+    secret = get_hmac_secret(event, plugin)
     if not secret:
         return
 
