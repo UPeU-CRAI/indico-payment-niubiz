@@ -5,6 +5,7 @@ from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 
+from indico.core.db import db
 from indico.modules.events.payment.models.transactions import TransactionAction, TransactionStatus
 from indico.modules.events.payment.util import register_transaction, toggle_registration_payment
 from indico.modules.events.logs.models.entries import EventLogRealm, LogKind
@@ -38,6 +39,8 @@ def build_transaction_data(
     transaction_id: Optional[str] = None,
     order_id: Optional[str] = None,
     external_id: Optional[str] = None,
+    purchase_number: Optional[str] = None,
+    external_transaction_id: Optional[str] = None,
     message: Optional[str] = None,
     reason: Optional[str] = None,
     **extra: Any,
@@ -58,6 +61,10 @@ def build_transaction_data(
         data["order_id"] = order_id
     if external_id:
         data["external_id"] = external_id
+    if purchase_number:
+        data.setdefault("purchase_number", purchase_number)
+    if external_transaction_id:
+        data.setdefault("external_transaction_id", external_transaction_id)
     if message:
         data["message"] = message
     if reason:
@@ -74,6 +81,8 @@ def _prepare_transaction_payload(
     status: Optional[str],
     amount: Optional[Decimal],
     currency: Optional[str],
+    purchase_number: Optional[str],
+    external_transaction_id: Optional[str],
 ) -> Dict[str, Any]:
     """Completa el diccionario data con campos básicos faltantes."""
     payload = deepcopy(data) if data else {}
@@ -90,6 +99,10 @@ def _prepare_transaction_payload(
             pass
     if currency and not payload.get("currency"):
         payload["currency"] = currency
+    if purchase_number and not payload.get("purchase_number"):
+        payload["purchase_number"] = purchase_number
+    if external_transaction_id and not payload.get("external_transaction_id"):
+        payload["external_transaction_id"] = external_transaction_id
     return payload
 
 
@@ -173,16 +186,65 @@ def record_payment_transaction(
         amount_value = float(parse_amount(getattr(registration, "price", None), Decimal("0")) or 0)
 
     currency_value = currency or getattr(registration, "currency", None) or "PEN"
+    purchase_number = None
+    external_transaction_id = None
+    if data:
+        purchase_number = data.get("purchase_number") or data.get("order_id")
+        external_transaction_id = (
+            data.get("external_transaction_id") or data.get("external_id")
+        )
+
     data_payload = _prepare_transaction_payload(
         data,
         transaction_id=None,
         status=None,
         amount=amount,
         currency=currency_value,
+        purchase_number=purchase_number,
+        external_transaction_id=external_transaction_id,
     )
 
+    existing = None
     try:
-        return register_transaction(
+        transactions = list(getattr(registration, "transactions", []) or [])
+    except Exception:
+        transactions = []
+
+    for txn in transactions:
+        if getattr(txn, "provider", None) != "niubiz":
+            continue
+        txn_data = getattr(txn, "data", {}) or {}
+        txn_purchase = txn_data.get("purchase_number") or txn_data.get("order_id")
+        txn_external = (
+            getattr(txn, "external_transaction_id", None)
+            or txn_data.get("external_transaction_id")
+            or txn_data.get("external_id")
+        )
+        if purchase_number and txn_purchase and purchase_number != txn_purchase:
+            continue
+        if external_transaction_id and txn_external and external_transaction_id != txn_external:
+            continue
+        existing = txn
+        break
+
+    if existing:
+        try:
+            existing.data = data_payload
+            existing.amount = amount_value
+            existing.currency = currency_value
+            if (
+                external_transaction_id
+                and hasattr(existing, "external_transaction_id")
+                and not getattr(existing, "external_transaction_id")
+            ):
+                existing.external_transaction_id = external_transaction_id
+            db.session.flush()
+        except Exception:
+            logger.exception("No se pudo actualizar la transacción existente de Niubiz")
+        return existing
+
+    try:
+        transaction = register_transaction(
             registration=registration,
             amount=amount_value,
             currency=currency_value,
@@ -190,6 +252,14 @@ def record_payment_transaction(
             provider="niubiz",
             data=data_payload,
         )
+        if (
+            transaction
+            and external_transaction_id
+            and hasattr(transaction, "external_transaction_id")
+        ):
+            transaction.external_transaction_id = external_transaction_id
+            db.session.flush()
+        return transaction
     except Exception:
         logger.exception("Error registrando transacción Niubiz para inscripción %s", getattr(registration, "id", "?"))
         return None

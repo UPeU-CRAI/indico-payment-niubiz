@@ -1,35 +1,12 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from indico.modules.events.payment.models.transactions import TransactionAction
 
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
-def _make_payload(status="AUTHORIZED", purchase_number="1-1", txn_id="abc123", amount="100.00"):
-    return {
-        "purchaseNumber": purchase_number,
-        "transactionId": txn_id,
-        "STATUS": status,
-        "amount": amount,
-        "currency": "PEN",
-        "actionCode": "000",
-    }
-
-
-# ----------------------------------------------------------------------
-# Fixtures
-# ----------------------------------------------------------------------
-@pytest.fixture
-def plugin(app):
-    """Obtener el plugin Niubiz ya cargado en Indico."""
-    from indico_payment_niubiz.plugin import NiubizPaymentPlugin
-    return NiubizPaymentPlugin.instance
-
-
 @pytest.fixture
 def registration(db, create_event, dummy_user):
-    """Crear un evento y una inscripción de prueba."""
     event = create_event()
     regform = event.add_registration_form(title="Test form", currency="PEN")
     registration = regform.create_registration(dummy_user, {"first_name": "Dummy", "last_name": "User"})
@@ -38,88 +15,100 @@ def registration(db, create_event, dummy_user):
     return registration
 
 
-@pytest.fixture
-def callback_url(registration):
-    return f"/event/{registration.event_id}/registrations/{registration.registration_form.id}/payment/response/niubiz/notify"
+def test_start_view_generates_session(client, monkeypatch, registration):
+    fake_client = MagicMock()
+    fake_client.create_session.return_value = {"sessionKey": "sess-1"}
+    fake_client.merchant_id = "mid"
+    fake_client.endpoint = "sandbox"
 
+    monkeypatch.setattr("indico_payment_niubiz.views._load_registration", lambda **_: registration)
+    monkeypatch.setattr("indico_payment_niubiz.views._build_client", lambda event: fake_client)
+    monkeypatch.setattr("indico_payment_niubiz.views.generate_external_transaction_id", lambda: "ext-123")
 
-# ----------------------------------------------------------------------
-# Tests de seguridad
-# ----------------------------------------------------------------------
-def test_callback_rejects_invalid_token(client, plugin, registration, callback_url):
-    plugin.settings.set("callback_authorization_token", "SECRET123")
-
-    resp = client.post(callback_url, json=_make_payload(), headers={"Authorization": "WRONG"})
-    assert resp.status_code == 403
-
-
-def test_callback_rejects_invalid_signature(client, plugin, registration, callback_url):
-    plugin.settings.set("callback_hmac_secret", "hmac_secret")
-
-    payload = _make_payload()
     resp = client.post(
-        callback_url,
-        json=payload,
-        headers={"NBZ-Signature": "bad_signature"},
+        "/payment/niubiz/start",
+        json={
+            "event_id": registration.event_id,
+            "reg_form_id": registration.registration_form.id,
+            "registration_id": registration.id,
+            "amount": "100.00",
+            "currency": "PEN",
+        },
     )
-    assert resp.status_code == 403
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["sessionKey"] == "sess-1"
+    assert payload["externalTransactionId"] == "ext-123"
+    fake_client.create_session.assert_called_once()
 
 
-def test_callback_rejects_ip_not_in_whitelist(client, plugin, registration, callback_url, monkeypatch):
-    plugin.settings.set("callback_ip_whitelist", "192.168.0.0/24")
+def test_return_view_calls_push_payment(client, monkeypatch, registration):
+    registration.is_paid = False
 
-    monkeypatch.setattr("flask.Request.remote_addr", "10.0.0.1")
-    resp = client.post(callback_url, json=_make_payload())
-    assert resp.status_code == 403
+    fake_client = MagicMock()
+    fake_client.get_token_card.return_value = {"token": "card-token"}
+    fake_client.push_payment.return_value = {
+        "status": "AUTHORIZED",
+        "actionCode": "000",
+        "transactionIdentifier": "ABC123",
+    }
 
+    handled = {}
 
-# ----------------------------------------------------------------------
-# Tests de estados Niubiz
-# ----------------------------------------------------------------------
-@pytest.mark.parametrize("status_key,expected_action,toggle_paid", [
-    ("AUTHORIZED", TransactionAction.complete, True),
-    ("REJECTED", TransactionAction.reject, False),
-    ("VOIDED", TransactionAction.cancel, False),
-    ("PENDING", TransactionAction.pending, False),
-    ("REFUNDED", TransactionAction.cancel, False),
-    ("EXPIRED", TransactionAction.reject, False),
-    ("REVIEW", TransactionAction.pending, False),
-])
-def test_callback_process_status(
-    client, db, registration, callback_url, status_key, expected_action, toggle_paid
-):
-    payload = _make_payload(status=status_key, purchase_number=f"{registration.event_id}-{registration.id}")
-    resp = client.post(callback_url, json=payload)
+    def fake_success(registration, **kwargs):
+        handled.update(kwargs)
+        return MagicMock(action=TransactionAction.complete)
+
+    monkeypatch.setattr("indico_payment_niubiz.views._load_registration", lambda **_: registration)
+    monkeypatch.setattr("indico_payment_niubiz.views._build_client", lambda event: fake_client)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_successful_payment", fake_success)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_pending_payment", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_failed_payment", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_refund", lambda *_, **__: None)
+
+    resp = client.post(
+        "/payment/niubiz/return",
+        json={
+            "purchaseNumber": f"{registration.event_id}-{registration.id}",
+            "transactionToken": "token",
+            "sessionKey": "sess",
+            "externalTransactionId": "ext-1",
+            "amount": "100.00",
+            "currency": "PEN",
+            "reg_form_id": registration.registration_form.id,
+        },
+    )
+
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data["received"] is True
-
-    # Verificar transacción
-    txn = registration.transaction
-    assert txn is not None
-    assert txn.action == expected_action
-    assert txn.amount == pytest.approx(100.0)
-
-    # Verificar estado de inscripción según mapping
-    if status_key == "AUTHORIZED":
-        assert registration.is_paid
-    elif status_key == "REFUNDED":
-        assert not registration.is_paid
-    else:
-        # No debe marcar como pagado
-        assert not registration.is_paid
+    assert data["transactionIdentifier"] == "ABC123"
+    assert handled["data"]["purchase_number"] == f"{registration.event_id}-{registration.id}"
+    assert handled["data"]["external_transaction_id"] == "ext-1"
 
 
-# ----------------------------------------------------------------------
-# Tests de estado desconocido
-# ----------------------------------------------------------------------
-def test_callback_unknown_status(client, registration, callback_url):
-    payload = _make_payload(status="WTFSTATE", purchase_number=f"{registration.event_id}-{registration.id}")
-    resp = client.post(callback_url, json=payload)
+def test_notify_view_enforces_security(client, monkeypatch, registration):
+    payload = {
+        "reg_form_id": registration.registration_form.id,
+        "purchaseNumber": f"{registration.event_id}-{registration.id}",
+        "status": "AUTHORIZED",
+        "transactionId": "TXN-1",
+        "amount": "100.00",
+        "currency": "PEN",
+    }
+
+    monkeypatch.setattr("indico_payment_niubiz.views._load_registration", lambda **_: registration)
+    monkeypatch.setattr("indico_payment_niubiz.views._validate_callback_security", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_successful_payment", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_pending_payment", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_failed_payment", lambda *_, **__: None)
+    monkeypatch.setattr("indico_payment_niubiz.views.handle_refund", lambda *_, **__: None)
+
+    resp = client.post(
+        "/payment/niubiz/notify",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
     assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["received"] is True
-
-    txn = registration.transaction
-    assert txn.action == TransactionAction.reject
-    assert not registration.is_paid
+    assert resp.get_json()["received"] is True

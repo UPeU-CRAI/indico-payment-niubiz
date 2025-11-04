@@ -1,10 +1,14 @@
 import json
+from decimal import Decimal
 
 import pytest
 import responses
-from decimal import Decimal
 
-from indico_payment_niubiz.client import NiubizAuthError, NiubizClient
+from indico_payment_niubiz.client import (
+    NiubizAPIError,
+    NiubizAuthError,
+    NiubizClient,
+)
 
 
 @pytest.fixture
@@ -13,131 +17,103 @@ def client():
         merchant_id="123456789",
         access_key="fake-access",
         secret_key="fake-secret",
-        endpoint="sandbox"
+        endpoint="sandbox",
     )
 
 
-# ----------------------
-# Helper para stub
-# ----------------------
-def add_response(method, url, status=200, body=None, json_data=None):
+def _add_response(method, url, *, status=200, json_data=None, body=None):
     if json_data is not None:
         body = json.dumps(json_data)
     responses.add(method, url, body=body, status=status, content_type="application/json")
 
 
-# ----------------------
-# Auth / sesión
-# ----------------------
 @responses.activate
-def test_get_auth_token_ok(client):
+def test_get_access_token_cached(client):
     url = f"{client.base_url}/api.security/v1/security"
-    add_response("POST", url, json_data={"accessToken": "abc123"})
+    _add_response("POST", url, json_data={"accessToken": "abc123"})
 
-    token = client.get_auth_token()
-    assert token == "abc123"
-    # Cached en segunda llamada
-    token2 = client.get_auth_token()
+    token1 = client.get_access_token()
+    token2 = client.get_access_token()
+
+    assert token1 == "abc123"
     assert token2 == "abc123"
+    assert len(responses.calls) == 1
 
 
 @responses.activate
-def test_get_auth_token_fail(client):
+def test_get_access_token_failure(client):
     url = f"{client.base_url}/api.security/v1/security"
     responses.add("POST", url, status=500)
 
     with pytest.raises(NiubizAuthError):
-        client.get_auth_token()
-
-
-# ----------------------
-# Órdenes
-# ----------------------
-@responses.activate
-def test_create_order_ok(client):
-    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/session/{client.merchant_id}"
-    add_response("POST", url, json_data={"sessionKey": "sess-123", "status": "AUTHORIZED"})
-
-    result = client.create_order(Decimal("10.50"), "PEN", "1-100")
-    assert result["success"]
-    assert result["data"]["sessionKey"] == "sess-123"
+        client.get_access_token(force_refresh=True)
 
 
 @responses.activate
-def test_get_order_status_ok(client):
-    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/order/{client.merchant_id}/ORD-123"
-    add_response("GET", url, json_data={"status": "PENDING"})
+def test_create_session_adds_idempotency_header(client):
+    security_url = f"{client.base_url}/api.security/v1/security"
+    _add_response("POST", security_url, json_data={"accessToken": "token"})
 
-    result = client.get_order_status("ORD-123")
-    assert result["success"]
-    assert result["data"]["status"] == "PENDING"
+    session_url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/session/{client.merchant_id}"
+    _add_response("POST", session_url, json_data={"sessionKey": "sess-123"})
 
+    response = client.create_session(amount=Decimal("10.50"), currency="PEN", purchase_number="1-100")
 
-# ----------------------
-# Refunds
-# ----------------------
-@responses.activate
-def test_refund_transaction_success(client):
-    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/{client.merchant_id}/refund"
-    add_response("POST", url, json_data={"status": "REFUNDED", "transactionId": "TXN-1"})
-
-    result = client.refund_transaction("TXN-1", Decimal("20.0"), "PEN", reason="Test refund")
-    assert result["success"]
-    assert result["status"] == "REFUNDED"
-    assert result["transaction_id"] == "TXN-1"
+    assert response["sessionKey"] == "sess-123"
+    headers = responses.calls[1].request.headers
+    assert headers.get("Idempotency-Key") == "1-100"
 
 
 @responses.activate
-def test_refund_transaction_fail(client):
-    url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/{client.merchant_id}/refund"
-    add_response("POST", url, json_data={"status": "FAILED", "transactionId": "TXN-2"})
+def test_get_token_card_returns_payload(client):
+    security_url = f"{client.base_url}/api.security/v1/security"
+    _add_response("POST", security_url, json_data={"accessToken": "token"})
 
-    result = client.refund_transaction("TXN-2", Decimal("20.0"), "PEN")
-    assert not result["success"]
-    assert result["status"] == "FAILED"
+    card_url = f"{client.base_url}/api.ecommerce/v2/ecommerce/token/card/{client.merchant_id}"
+    _add_response("POST", card_url, json_data={"token": "card-token"})
 
-
-# ----------------------
-# Capture
-# ----------------------
-@responses.activate
-def test_capture_payment_ok(client):
-    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/capture"
-    add_response("POST", url, json_data={"status": "CAPTURED", "transactionId": "TXN-3"})
-
-    result = client.capture_payment("TXN-3")
-    assert result["success"]
-    assert result["status"] == "CAPTURED"
+    payload = client.get_token_card(transaction_token="txn-token", session_key="sess-1", purchase_number="1-2")
+    assert payload["token"] == "card-token"
 
 
 @responses.activate
-def test_capture_payment_fail(client):
-    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/capture"
-    add_response("POST", url, json_data={"status": "DECLINED", "transactionId": "TXN-4"})
+def test_push_payment_retries_on_429(client, monkeypatch):
+    security_url = f"{client.base_url}/api.security/v1/security"
+    _add_response("POST", security_url, json_data={"accessToken": "token"})
 
-    result = client.capture_payment("TXN-4")
-    assert not result["success"]
-    assert result["status"] == "DECLINED"
+    push_url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/push"
+    _add_response("POST", push_url, status=429)
+    _add_response("POST", push_url, json_data={"actionCode": "000", "transactionIdentifier": "ABC"})
+
+    monkeypatch.setattr(client, "_sleep", lambda value: None)
+
+    payload = client.push_payment(
+        amount=Decimal("20"),
+        currency="PEN",
+        purchase_number="1-3",
+        external_transaction_id="ext-1",
+        card_token="card-token",
+    )
+
+    assert payload["actionCode"] == "000"
+    assert len(responses.calls) == 3  # auth + two push attempts
+    headers = responses.calls[-1].request.headers
+    assert headers.get("Idempotency-Key") == "1-3:ext-1"
 
 
-# ----------------------
-# Void
-# ----------------------
 @responses.activate
-def test_void_payment_ok(client):
-    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/void"
-    add_response("POST", url, json_data={"status": "VOIDED", "transactionId": "TXN-5"})
+def test_push_payment_error_raises(client, monkeypatch):
+    security_url = f"{client.base_url}/api.security/v1/security"
+    _add_response("POST", security_url, json_data={"accessToken": "token"})
 
-    result = client.void_payment("TXN-5")
-    assert result["success"]
-    assert result["status"] == "VOIDED"
+    push_url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/push"
+    responses.add("POST", push_url, status=500)
 
-
-@responses.activate
-def test_void_payment_fail(client):
-    url = f"{client.base_url}/api.authorization/v3/authorization/{client.merchant_id}/void"
-    add_response("POST", url, json_data={"status": "FAILED", "transactionId": "TXN-6"})
-
-    result = client.void_payment("TXN-6")
-    assert not result["success"]
-    assert result["status"] == "FAILED"
+    with pytest.raises(NiubizAPIError):
+        client.push_payment(
+            amount="10",
+            currency="PEN",
+            purchase_number="1-4",
+            external_transaction_id="ext-2",
+            card_token="token",
+        )
