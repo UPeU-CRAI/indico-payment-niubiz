@@ -50,11 +50,8 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
     default_settings = {
         "method_name": "Niubiz",
         "merchant_id": "",
-        "client_id": "",
-        "client_secret": "",
         "username": "",
         "password": "",
-        "realm_code": "",
         "env": "sandbox",
         "authorization_token": "",
         "hmac_secret": "",
@@ -75,11 +72,8 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         "enabled": False,
         "method_name": None,
         "merchant_id": None,
-        "client_id": None,
-        "client_secret": None,
         "username": None,
         "password": None,
-        "realm_code": None,
         "env": None,
         "authorization_token": None,
         "hmac_secret": None,
@@ -112,11 +106,8 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         credentials = get_credentials_for_event(event, plugin=self)
         return NiubizClient(
             merchant_id=credentials.merchant_id,
-            client_id=credentials.client_id,
-            client_secret=credentials.client_secret,
             username=credentials.username,
             password=credentials.password,
-            realm_code=credentials.realm_code,
             endpoint=credentials.endpoint,
         )
 

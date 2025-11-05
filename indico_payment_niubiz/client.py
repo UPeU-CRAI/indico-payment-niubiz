@@ -1,13 +1,14 @@
-"""Cliente HTTP para integrar con la API de Niubiz (PushPayment NO-PCI).
+"""Cliente HTTP para integrar con la API NO-PCI de Niubiz.
 
 Este módulo centraliza la lógica para autenticar con el flujo NO-PCI,
-generar sesiones, verificar tokens de tarjeta, ejecutar cobros push y
+generar sesiones, verificar tokens de tarjeta, autorizar cobros y
 gestionar operaciones complementarias como reembolsos. Todas las
 interacciones siguen la guía oficial de Niubiz 2025.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from decimal import Decimal
@@ -34,102 +35,69 @@ class NiubizAPIError(NiubizClientError):
 
 
 class NiubizClient:
-    """Cliente para la API de Niubiz siguiendo el flujo PushPayment NO-PCI."""
+    """Cliente para la API NO-PCI de Niubiz siguiendo el flujo documentado."""
 
     BASE_URLS = {
         "sandbox": "https://apitestenv.vnforapps.com",
         "prod": "https://apiprod.vnforapps.com",
     }
 
-    SECURITY_PATH = "/api.security/v1/security/push"
+    SECURITY_PATH = "/api.security/v1/security"
 
     def __init__(
         self,
         *,
         merchant_id: str,
-        client_id: str,
-        client_secret: str,
         username: str,
         password: str,
-        realm_code: str,
         endpoint: str = "sandbox",
     ) -> None:
         if endpoint not in self.BASE_URLS:
             raise ValueError(f"Endpoint desconocido: {endpoint}")
 
         self.merchant_id = merchant_id
-        self.client_id = client_id
-        self.client_secret = client_secret
         self.username = username
         self.password = password
-        self.realm_code = realm_code
         self.endpoint = endpoint
         self.base_url = self.BASE_URLS[endpoint]
 
-        self._access_token: Optional[str] = None
-        self._access_expiry: Optional[float] = None
+        self._security_token: Optional[str] = None
+        self._security_expiry: Optional[float] = None
 
     # ------------------ Autenticación ------------------
-    def _build_security_payload(self) -> Dict[str, Any]:
-        return {
-            "grant_type": "password",
-            "scope": "*",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "username": self.username,
-            "password": self.password,
-            "realm": self.realm_code,
-        }
-
-    def _get_access_token(self) -> str:
-        """Obtiene un JWT válido desde el endpoint ``security/push``."""
+    def _get_security_token(self) -> str:
+        """Obtiene el ``securityToken`` usando autenticación Basic."""
 
         now = time.time()
-        if self._access_token and self._access_expiry and now < self._access_expiry:
-            return self._access_token
+        if self._security_token and self._security_expiry and now < self._security_expiry:
+            return self._security_token
 
+        credentials = f"{self.username}:{self.password}".encode("utf-8")
+        encoded = base64.b64encode(credentials).decode("ascii")
         url = f"{self.base_url}{self.SECURITY_PATH}"
         headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "request-id": str(uuid4()),
-            "org-code": "1",
-            "client-code": "inpms",
+            "Authorization": f"Basic {encoded}",
+            "Accept": "text/plain",
         }
 
         try:
-            response = requests.post(
-                url,
-                json=self._build_security_payload(),
-                headers=headers,
-                timeout=20,
-            )
+            response = requests.post(url, headers=headers, timeout=20)
             response.raise_for_status()
         except requests.RequestException as exc:
             logger.error("Error de conexión al autenticarse con Niubiz: %s", exc)
             raise NiubizAuthError("No se pudo autenticar con Niubiz") from exc
 
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            logger.error("Respuesta inválida al autenticarse con Niubiz: %s", response.text[:200])
-            raise NiubizAuthError("Niubiz devolvió una respuesta no JSON al autenticarse") from exc
-
-        token = (payload or {}).get("accessToken")
+        token = response.text.strip()
         if not token:
-            logger.error("Niubiz no devolvió accessToken en security/push")
+            logger.error("Niubiz no devolvió securityToken en security")
             raise NiubizAuthError("Niubiz no devolvió token válido")
 
-        expires_in = 0
-        try:
-            expires_in = int(payload.get("expiresIn", 0))
-        except (TypeError, ValueError):
-            expires_in = 0
-        # Los tokens suelen durar 5 minutos; restamos un margen de seguridad de 30 s.
-        validity = max(30, expires_in - 30) if expires_in else 300
-        self._access_token = str(token)
-        self._access_expiry = now + validity
-        return self._access_token
+        # La documentación no indica el tiempo exacto de vida; usamos 5 minutos
+        # con un margen de seguridad para evitar expiraciones en medio de un flujo.
+        validity = 300 - 30
+        self._security_token = token
+        self._security_expiry = now + max(validity, 30)
+        return token
 
     # ------------------ HTTP genérico ------------------
     def _request(
@@ -147,13 +115,14 @@ class NiubizClient:
 
         for attempt in range(2):
             headers = {
-                "Authorization": f"Bearer {self._get_access_token()}",
+                "Authorization": self._get_security_token(),
                 "Accept": "application/json",
-                "Content-Type": "application/json",
                 "request-id": str(uuid4()),
                 "org-code": "1",
                 "client-code": "inpms",
             }
+            if json is not None:
+                headers["Content-Type"] = "application/json"
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -166,9 +135,9 @@ class NiubizClient:
                     timeout=20,
                 )
                 if response.status_code == 401 and attempt == 0:
-                    logger.info("Token Niubiz expirado; reintentando autenticación")
-                    self._access_token = None
-                    self._access_expiry = None
+                    logger.info("securityToken Niubiz expirado; reintentando autenticación")
+                    self._security_token = None
+                    self._security_expiry = None
                     continue
                 response.raise_for_status()
                 return response
@@ -193,9 +162,9 @@ class NiubizClient:
 
     # ------------------ API pública ------------------
     def get_auth_token(self) -> str:
-        """Expone públicamente la obtención del access token (usado en pruebas)."""
+        """Expone públicamente el ``securityToken`` (usado en pruebas)."""
 
-        return self._get_access_token()
+        return self._get_security_token()
 
     # ------------------ Helpers ------------------
     @staticmethod
@@ -216,7 +185,7 @@ class NiubizClient:
         amount: Decimal,
         currency: str,
         purchase_number: str,
-        channel: str = "web",
+        channel: str = "paycard",
         payment_method: Optional[str] = None,
         data_map: Optional[Dict[str, Any]] = None,
         antifraud: Optional[Dict[str, Any]] = None,
@@ -226,7 +195,7 @@ class NiubizClient:
 
         path = f"/api.ecommerce/v2/ecommerce/token/session/{self.merchant_id}"
         payload: Dict[str, Any] = {
-            "channel": channel,
+            "channel": channel or "paycard",
             "amount": self._normalize_amount(amount),
             "currency": currency,
             "purchaseNumber": purchase_number,
@@ -275,63 +244,122 @@ class NiubizClient:
         return {"success": True, "data": result}
 
     # ------------------ Push Payment ------------------
+    def authorize_payment(
+        self,
+        *,
+        purchase_number: str,
+        amount: Decimal,
+        currency: str,
+        token_id: str,
+        channel: str = "web",
+        capture_type: str = "manual",
+        countable: bool = True,
+        antifraud: Optional[Dict[str, Any]] = None,
+        product_id: Optional[str] = None,
+        card_holder: Optional[Dict[str, Any]] = None,
+        additional_fields: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Autoriza un pago utilizando el token de tarjeta proporcionado."""
+
+        path = f"/api.authorization/v3/authorization/ecommerce/{self.merchant_id}"
+        order: Dict[str, Any] = {
+            "purchaseNumber": purchase_number,
+            "amount": self._normalize_amount(amount),
+            "currency": currency,
+            "tokenId": token_id,
+        }
+        if product_id:
+            order["productId"] = product_id
+
+        payload: Dict[str, Any] = {
+            "captureType": capture_type,
+            "channel": channel,
+            "countable": bool(countable),
+            "order": order,
+        }
+
+        if antifraud:
+            payload["antifraud"] = antifraud
+        if card_holder:
+            payload["cardHolder"] = card_holder
+        if additional_fields:
+            payload.update(additional_fields)
+
+        logger.debug("Autorizando pago Niubiz: %r", payload)
+        response = self._request("POST", path, json=payload)
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise NiubizAPIError("Respuesta inválida al autorizar pago Niubiz") from exc
+
+        action_code_raw = result.get("actionCode") or result.get("ACTION_CODE") or ""
+        action_code = str(action_code_raw).zfill(3) if str(action_code_raw).isdigit() else str(action_code_raw)
+        success = action_code == "000"
+
+        transaction_id = result.get("transactionId") or result.get("transactionIdentifier")
+        if not transaction_id:
+            order_info = result.get("order") if isinstance(result.get("order"), dict) else {}
+            if isinstance(order_info, dict):
+                transaction_id = (
+                    order_info.get("transactionId")
+                    or order_info.get("TRANSACTION_ID")
+                    or order_info.get("operationNumber")
+                )
+
+        logger.info(
+            "Autorización Niubiz %s purchase=%s action=%s txn=%s",
+            "OK" if success else "fallida",
+            purchase_number,
+            action_code,
+            transaction_id,
+        )
+
+        return {
+            "success": success,
+            "data": result,
+            "action_code": action_code,
+            "transaction_id": transaction_id,
+        }
+
     def push_payment(
         self,
         *,
         purchase_number: str,
         amount: Decimal,
         currency: str,
-        external_transaction_id: str,
+        external_transaction_id: Optional[str] = None,
         token_id: str,
         payer_email: Optional[str] = None,
         payer_name: Optional[str] = None,
         additional_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Ejecuta un cobro PushPayment usando un token de tarjeta."""
+        **kwargs,
+    ) -> Dict[str, Any]:  # pragma: no cover - compatibilidad
+        """Compatibilidad con el API histórico ``push_payment``."""
 
-        path = f"/api.instantpayments/pushpayment/{self.merchant_id}"
-        payload: Dict[str, Any] = {
-            "purchaseNumber": purchase_number,
-            "externalTransactionId": external_transaction_id,
-            "amount": self._normalize_amount(amount),
-            "currency": currency,
-            "recipient": {
-                "tokenId": token_id,
-            },
-        }
-
-        if payer_email:
-            payload["recipient"]["email"] = payer_email
-        if payer_name:
-            payload["recipient"]["name"] = payer_name
+        additional_fields = dict(kwargs.pop("additional_fields", {}) or {})
         if additional_data:
-            payload.update(additional_data)
+            additional_fields.update(additional_data)
+        if external_transaction_id:
+            additional_fields.setdefault("externalTransactionId", external_transaction_id)
 
-        logger.debug("Ejecutando PushPayment Niubiz: %r", payload)
-        response = self._request("POST", path, json=payload)
-        try:
-            result = response.json()
-        except ValueError as exc:
-            raise NiubizAPIError("Respuesta inválida al ejecutar PushPayment") from exc
+        card_holder = dict(kwargs.pop("card_holder", {}) or {})
+        if payer_name and "name" not in card_holder:
+            card_holder["name"] = payer_name
+        if payer_email and "email" not in card_holder:
+            card_holder["email"] = payer_email
 
-        success_codes = {"00", "000", "0"}
-        action_code = str(result.get("actionCode") or result.get("ACTION_CODE") or "").zfill(2)
-        success = action_code in success_codes
-        logger.info(
-            "PushPayment %s purchase=%s action=%s txn=%s",
-            "OK" if success else "fallido",
-            purchase_number,
-            action_code,
-            result.get("transactionId") or result.get("transactionIdentifier"),
+        antifraud = kwargs.pop("antifraud", None)
+
+        return self.authorize_payment(
+            purchase_number=purchase_number,
+            amount=amount,
+            currency=currency,
+            token_id=token_id,
+            antifraud=antifraud,
+            card_holder=card_holder or None,
+            additional_fields=additional_fields or None,
+            **kwargs,
         )
-        return {
-            "success": success,
-            "data": result,
-            "action_code": action_code,
-            "transaction_id": result.get("transactionId")
-            or result.get("transactionIdentifier")
-            or result.get("operationNumber"),
-        }
 
     # ------------------ Reembolsos ------------------
     def refund_transaction(

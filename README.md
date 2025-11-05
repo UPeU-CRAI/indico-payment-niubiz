@@ -12,7 +12,7 @@ cambios se encuentra en [`CHANGELOG.md`](CHANGELOG.md).
 ## Características principales
 
 * Flujo NO-PCI completo con creación de sesión y `checkout.js` oficial de Niubiz.
-* Verificación de token y cobro `PushPayment` host-to-host con idempotencia.
+* Verificación de token y autorización `v3` host-to-host con idempotencia.
 * Confirmación automática de pagos autorizados y soporte opcional para
   tokenización de tarjetas.
 * Envío automático de Merchant Defined Data (MDD) obligatorios y objeto antifraude.
@@ -25,8 +25,7 @@ cambios se encuentra en [`CHANGELOG.md`](CHANGELOG.md).
 ## Requisitos
 
 * Indico **3.3** o superior con acceso a la sección de administración.
-* Credenciales NO-PCI de Niubiz (`merchantId`, `clientId`, `clientSecret`,
-  `username`, `password`, `realm`).
+* Credenciales NO-PCI de Niubiz (`merchantId`, `username`, `password`).
 * Certificado TLS público para exponer los endpoints de inicio, retorno y
   notificación.
 * Whitelist de IPs que permita el tráfico desde las redes publicadas por
@@ -52,8 +51,8 @@ sudo systemctl restart indico-celery indico-web
 
 Desde **Administración → Plugins → Niubiz**:
 
-* Credenciales NO-PCI entregadas por Niubiz: `merchant_id`, `client_id`,
-  `client_secret`, `username`, `password` y `realm_code`.
+* Credenciales NO-PCI entregadas por Niubiz: `merchant_id`, `username` y
+  `password`.
 * Entorno (`sandbox`/`prod`). Si se selecciona una variante PCI el formulario
   mostrará una advertencia, ya que el plugin solo soporta flujos NO-PCI.
 * Moneda por defecto para eventos sin moneda configurada.
@@ -81,9 +80,10 @@ para un evento puntual.
 2. **Checkout**: se carga `checkout.js` con el `transactionToken`. En el caso de
    Yape, PagoEfectivo o tokens reutilizados, se usan los endpoints específicos de
    la API.
-3. **Autorización y confirmación**: el retorno de Niubiz se procesa con
-   `authorizeTransaction` y `confirmation`. La inscripción solo se marca como
-   pagada cuando Niubiz responde `CAPTURED`/`CONFIRMED`.
+3. **Autorización y confirmación**: el retorno de Niubiz se procesa llamando al
+   endpoint `/api.authorization/v3/authorization/ecommerce/{merchantId}` con el
+   `tokenId` recibido. La inscripción solo se marca como pagada cuando Niubiz
+   responde con `actionCode` `000`.
 4. **Notificaciones**: el endpoint `/notify` recibe callbacks firmados por Niubiz
    y sincroniza el estado de la inscripción (pagado, pendiente, cancelado o
    reembolsado). Cada mensaje queda registrado en el log del evento.
