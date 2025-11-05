@@ -1,5 +1,7 @@
 {% set has_session = sessionKey %}
 
+<script src="https://static-content.vnforapps.com/v2/js/fingerprint.min.js"></script>
+
 <div class="i-box">
   <div class="i-box-content">
     {% if not has_session %}
@@ -7,11 +9,32 @@
         {% trans %}Click the button below to start the Niubiz checkout process.{% endtrans %}
       </p>
       <form action="{{ url_for('payment_niubiz.start', event_id=event.id, reg_form_id=registration.registration_form.id, reg_id=registration.id) }}"
-            method="post">
-        <button type="submit" class="btn btn-primary">
-          {% trans %}Pay with Niubiz{% endtrans %}
-        </button>
+            method="post"
+            id="niubiz-start-form"
+            class="niubiz-start-form">
+        <input type="hidden" name="method" value="card">
+        <input type="hidden" name="payment_channel" value="card">
+        <input type="hidden" name="device_fingerprint_id" id="niubiz-fingerprint-id">
+        <div class="d-flex flex-column flex-sm-row gap-2">
+          <button type="submit" class="btn btn-primary">
+            {% trans %}Pay with Niubiz{% endtrans %}
+          </button>
+        </div>
       </form>
+      <div id="niubiz-fingerprint-warning" class="alert alert-warning d-none mt-3" role="alert">
+        {% trans %}Necesitamos validar tu dispositivo antes de iniciar el pago. Por favor, vuelve a intentarlo en unos segundos.{% endtrans %}
+      </div>
+      <div class="niubiz-future-methods mt-3">
+        <button type="button" class="btn btn-outline-secondary mb-2" disabled>
+          Yape — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+        <button type="button" class="btn btn-outline-secondary mb-2" disabled>
+          PagoEfectivo — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+        <button type="button" class="btn btn-outline-secondary" disabled>
+          QR — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+      </div>
     {% else %}
       <p>
         {% trans amount=format_currency(amount, currency or 'PEN', locale=session.lang) %}Estás a punto de pagar {{ amount }} con Niubiz.{% endtrans %}
@@ -30,6 +53,17 @@
         </a>
       </div>
       <div id="niubiz-error" class="alert alert-danger d-none mt-3" role="alert"></div>
+      <div class="niubiz-future-methods mt-3">
+        <button type="button" class="btn btn-outline-secondary mb-2" disabled>
+          Yape — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+        <button type="button" class="btn btn-outline-secondary mb-2" disabled>
+          PagoEfectivo — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+        <button type="button" class="btn btn-outline-secondary" disabled>
+          QR — {% trans %}Próximamente disponible{% endtrans %}
+        </button>
+      </div>
 
       <script src="{{ checkout_js_url or 'https://static-content-qas.vnforapps.com/env/sandbox/js/checkout.js' }}"></script>
       {% set checkout_amount = amount_value if amount_value is defined else amount %}
@@ -242,3 +276,153 @@
     {% endif %}
   </div>
 </div>
+
+<script>
+  (function() {
+    const form = document.getElementById('niubiz-start-form');
+    const fingerprintField = document.getElementById('niubiz-fingerprint-id');
+    const warningBox = document.getElementById('niubiz-fingerprint-warning');
+    if (!form || !fingerprintField) {
+      return;
+    }
+
+    let currentFingerprint = fingerprintField.value || '';
+    let pendingRequest = null;
+
+    function hideWarning() {
+      if (warningBox) {
+        warningBox.classList.add('d-none');
+      }
+    }
+
+    function showWarning(message) {
+      if (!warningBox) {
+        return;
+      }
+      if (message) {
+        warningBox.textContent = message;
+      }
+      warningBox.classList.remove('d-none');
+    }
+
+    function setFingerprint(value) {
+      currentFingerprint = value || '';
+      fingerprintField.value = currentFingerprint;
+      if (currentFingerprint) {
+        hideWarning();
+      }
+      return currentFingerprint;
+    }
+
+    function tryResolveFromObject(obj) {
+      if (!obj) {
+        return '';
+      }
+      if (typeof obj === 'string') {
+        return obj;
+      }
+      if (typeof obj.get === 'function') {
+        try {
+          return obj.get() || '';
+        } catch (error) {
+          console.warn('Niubiz fingerprint get() failed', error);
+        }
+      }
+      return (
+        obj.sessionId ||
+        obj.sessionID ||
+        obj.fingerprint ||
+        obj.deviceId ||
+        obj.deviceFingerprint ||
+        ''
+      );
+    }
+
+    function requestFingerprint() {
+      if (pendingRequest) {
+        return pendingRequest;
+      }
+      pendingRequest = new Promise(function(resolve, reject) {
+        const lib = window.Fingerprint || window.NiubizFingerprint || window.deviceFingerprint;
+        const handleSuccess = function(value) {
+          pendingRequest = null;
+          resolve(value || '');
+        };
+        const handleError = function(error) {
+          pendingRequest = null;
+          reject(error || new Error('fingerprint_unavailable'));
+        };
+
+        if (lib && typeof lib.getSessionId === 'function') {
+          try {
+            lib.getSessionId(handleSuccess, function(err) {
+              handleError(err);
+            });
+            return;
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+
+        if (typeof window.getDeviceFingerprint === 'function') {
+          try {
+            const value = window.getDeviceFingerprint();
+            if (value) {
+              return handleSuccess(value);
+            }
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+
+        const fallback = tryResolveFromObject(lib);
+        if (fallback) {
+          return handleSuccess(fallback);
+        }
+
+        handleError(new Error('fingerprint_unavailable'));
+      });
+      return pendingRequest;
+    }
+
+    function ensureFingerprint(event) {
+      if (currentFingerprint) {
+        return true;
+      }
+      if (event) {
+        event.preventDefault();
+      }
+      requestFingerprint()
+        .then(function(value) {
+          if (!setFingerprint(value)) {
+            showWarning({{ _('No pudimos identificar tu dispositivo. Recarga la página e inténtalo nuevamente.')|tojson }});
+            return;
+          }
+          form.submit();
+        })
+        .catch(function() {
+          showWarning({{ _('No pudimos identificar tu dispositivo. Recarga la página e inténtalo nuevamente.')|tojson }});
+        });
+      return false;
+    }
+
+    form.addEventListener('submit', function(event) {
+      if (!currentFingerprint) {
+        ensureFingerprint(event);
+      }
+    });
+
+    document.addEventListener('DOMContentLoaded', function() {
+      if (currentFingerprint) {
+        return;
+      }
+      requestFingerprint()
+        .then(function(value) {
+          setFingerprint(value);
+        })
+        .catch(function(error) {
+          console.warn('Niubiz fingerprint capture failed', error);
+        });
+    });
+  })();
+</script>

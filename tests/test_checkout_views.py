@@ -59,6 +59,7 @@ def test_start_returns_session_data(client, plugin, registration, start_url, mon
             amount,
             currency,
             purchase_number,
+            channel,
             payment_method,
             data_map,
             antifraud,
@@ -67,10 +68,12 @@ def test_start_returns_session_data(client, plugin, registration, start_url, mon
             assert amount == Decimal("150.50")
             assert currency == "PEN"
             assert purchase_number == f"{registration.event_id}-{registration.id}"
+            assert channel == "paycard"
             assert payment_method == "card"
             assert data_map["MDD4"] == registration.email
             assert data_map["MDD57"] == "PushPayments"
             assert "merchantDefineData" in antifraud
+            assert antifraud.get("deviceFingerprintId") == "fp-123"
             return {
                 "success": True,
                 "data": {
@@ -81,16 +84,28 @@ def test_start_returns_session_data(client, plugin, registration, start_url, mon
 
     monkeypatch.setattr(plugin, "_build_client", lambda event: DummyClient())
 
-    response = client.post(start_url, data={"method": "card"})
+    response = client.post(
+        start_url,
+        data={"method": "card", "device_fingerprint_id": "fp-123"},
+    )
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["success"] is True
+    assert payload["payment_channel"] == "card"
     assert payload["sessionKey"] == "sess-123"
     assert payload["session_expiration"] == "2025-01-01T00:00:00Z"
     assert payload["purchase_number"] == f"{registration.event_id}-{registration.id}"
     assert payload["amount"] == "150.50"
     assert payload["currency"] == "PEN"
     assert payload["merchantDefinedData"]["MDD4"] == registration.email
+
+
+def test_start_requires_fingerprint(client, start_url):
+    response = client.post(start_url, data={"method": "card"})
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "missing_fingerprint"
 
 
 def test_success_endpoint_marks_registration_paid(client, db, registration, success_url):

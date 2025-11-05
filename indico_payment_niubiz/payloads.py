@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 from uuid import uuid4
@@ -9,7 +11,11 @@ from uuid import uuid4
 from werkzeug.exceptions import BadRequest
 
 
+logger = logging.getLogger(__name__)
+
+
 REQUIRED_MDD_KEYS = ("MDD4", "MDD5", "MDD32", "MDD75", "MDD77")
+ALLOWED_CUSTOMER_TYPES = {"Registrado", "Invitado", "Empleado"}
 
 
 def _safe_string(value: Any) -> str:
@@ -166,6 +172,36 @@ def collect_mdd_data(
                 continue
             mdd[str(key)] = _safe_string(value)
 
+    def _require(key: str, condition: bool, message: str) -> None:
+        if condition:
+            return
+        logger.error("MDD inválido para Niubiz: %s -> %s", key, message)
+        raise BadRequest(message)
+
+    if email:
+        email_pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+        _require(
+            "MDD4",
+            bool(re.match(email_pattern, email)),
+            "El correo electrónico del cliente (MDD4) es inválido.",
+        )
+    else:
+        logger.warning("MDD4 ausente al construir antifraude Niubiz")
+
+    if user_type and user_type not in ALLOWED_CUSTOMER_TYPES:
+        logger.warning(
+            "Tipo de cliente Niubiz no permitido: %s. Forzando validación", user_type
+        )
+        _require(
+            "MDD75",
+            False,
+            "El tipo de cliente (MDD75) debe ser Registrado, Invitado o Empleado.",
+        )
+
+    if mdd.get("MDD77") and not str(mdd["MDD77"]).isdigit():
+        logger.error("MDD77 debe ser numérico. Valor recibido: %s", mdd["MDD77"])
+        raise BadRequest("El valor de MDD77 debe ser un número entero.")
+
     if require_all:
         missing = [key for key in REQUIRED_MDD_KEYS if not _safe_string(mdd.get(key))]
         if missing:
@@ -178,11 +214,24 @@ def collect_mdd_data(
 
 def build_antifraud_payload(
     registration,
-    mdd: Dict[str, str],
     *,
+    fingerprint_id: str,
     client_ip: Optional[str] = None,
+    extra_mdd: Optional[Dict[str, Any]] = None,
+    require_all: bool = False,
 ) -> Dict[str, Any]:
-    """Construye el objeto antifraud recomendado por Niubiz."""
+    """Construye el objeto ``antifraud`` completo exigido por Niubiz."""
+
+    fingerprint = _safe_string(fingerprint_id)
+    if not fingerprint:
+        logger.error("No se proporcionó deviceFingerprintId para antifraude Niubiz")
+        raise BadRequest("Se requiere deviceFingerprintId para antifraude Niubiz.")
+
+    mdd = collect_mdd_data(
+        registration,
+        extra=extra_mdd,
+        require_all=require_all,
+    )
 
     first_name = _safe_string(
         _get_registration_value(registration, ("first_name", "firstname", "first"))
@@ -200,6 +249,7 @@ def build_antifraud_payload(
 
     antifraud: Dict[str, Any] = {
         "merchantDefineData": mdd,
+        "deviceFingerprintId": fingerprint,
     }
 
     if client_ip:

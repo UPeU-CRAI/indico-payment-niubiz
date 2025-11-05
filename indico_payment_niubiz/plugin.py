@@ -25,6 +25,10 @@ from indico_payment_niubiz.indico_integration import (
 )
 from indico_payment_niubiz.models import NiubizStoredToken
 from indico_payment_niubiz.settings import (
+    ENABLE_CARD,
+    ENABLE_EFECTIVO,
+    ENABLE_QR,
+    ENABLE_YAPE,
     get_branding,
     get_credentials_for_event,
     get_default_currency,
@@ -59,10 +63,10 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         "merchant_defined_data": "",
         "enable_refunds": True,
         "default_currency": "PEN",
-        "enable_card": True,
-        "enable_yape": False,
-        "enable_pagoefectivo": False,
-        "enable_qr": False,
+        "enable_card": ENABLE_CARD,
+        "enable_yape": ENABLE_YAPE,
+        "enable_pagoefectivo": ENABLE_EFECTIVO,
+        "enable_qr": ENABLE_QR,
         "enable_tokenization": False,
         "branding": "",
         "mdd_required": False,
@@ -114,10 +118,10 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
     # ------------------ Métodos de pago ------------------
     def _collect_methods(self, event) -> Dict[str, bool]:
         return {
-            "card": self._get_bool(event, "enable_card"),
-            "yape": self._get_bool(event, "enable_yape"),
-            "pagoefectivo": self._get_bool(event, "enable_pagoefectivo"),
-            "qr": self._get_bool(event, "enable_qr"),
+            "card": self._get_bool(event, "enable_card", default=ENABLE_CARD),
+            "yape": self._get_bool(event, "enable_yape", default=ENABLE_YAPE),
+            "pagoefectivo": self._get_bool(event, "enable_pagoefectivo", default=ENABLE_EFECTIVO),
+            "qr": self._get_bool(event, "enable_qr", default=ENABLE_QR),
         }
 
     # ------------------ Checkout ------------------
