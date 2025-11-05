@@ -13,11 +13,8 @@ from indico_payment_niubiz.client import NiubizAuthError, NiubizClient
 def client():
     return NiubizClient(
         merchant_id="123456789",
-        client_id="fake-client",
-        client_secret="fake-secret",
         username="fake-user",
         password="fake-pass",
-        realm_code="test-realm",
         endpoint="sandbox"
     )
 
@@ -37,7 +34,7 @@ def add_response(method, url, status=200, body=None, json_data=None):
 @responses.activate
 def test_get_auth_token_ok(client):
     url = f"{client.base_url}{client.SECURITY_PATH}"
-    add_response("POST", url, json_data={"accessToken": "abc123"})
+    responses.add("POST", url, body="abc123", status=201, content_type="text/plain")
 
     token = client.get_auth_token()
     assert token == "abc123"
@@ -51,8 +48,7 @@ def test_get_auth_token_ok(client):
     add_response("GET", protected_url, json_data={"ok": True})
     client._request("GET", "/dummy")
     auth_header = responses.calls[-1].request.headers["Authorization"]
-    assert auth_header.startswith("Bearer ")
-    assert auth_header.endswith("abc123")
+    assert auth_header == "abc123"
 
 
 @responses.activate
@@ -65,9 +61,9 @@ def test_get_auth_token_fail(client):
 
 
 @responses.activate
-def test_get_auth_token_plain_text(client):
+def test_get_auth_token_empty_response(client):
     url = f"{client.base_url}{client.SECURITY_PATH}"
-    responses.add("POST", url, body="abc123", status=200, content_type="text/plain")
+    responses.add("POST", url, body="", status=201, content_type="text/plain")
 
     with pytest.raises(NiubizAuthError):
         client.get_auth_token()
@@ -186,44 +182,41 @@ def test_verify_transaction_token_ok(client):
 
 
 @responses.activate
-def test_push_payment_success(client):
-    url = f"{client.base_url}/api.instantpayments/pushpayment/{client.merchant_id}"
+def test_authorize_payment_success(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/ecommerce/{client.merchant_id}"
     add_response(
         "POST",
         url,
-        json_data={"actionCode": "00", "transactionId": "TX-1", "status": "CAPTURED"},
+        json_data={"actionCode": "000", "transactionId": "TX-1", "status": "CAPTURED"},
     )
 
-    result = client.push_payment(
-        purchase_number="1-100",
+    result = client.authorize_payment(
+        purchase_number="000000001",
         amount=Decimal("20.00"),
         currency="PEN",
-        external_transaction_id="ext-1",
         token_id="tok-1",
-        payer_email="test@example.com",
+        antifraud={"clientIp": "127.0.0.1"},
     )
     assert result["success"]
     assert result["transaction_id"] == "TX-1"
 
 
 @responses.activate
-def test_push_payment_failure(client):
-    url = f"{client.base_url}/api.instantpayments/pushpayment/{client.merchant_id}"
+def test_authorize_payment_failure(client):
+    url = f"{client.base_url}/api.authorization/v3/authorization/ecommerce/{client.merchant_id}"
     add_response(
         "POST",
         url,
-        json_data={"actionCode": "05", "transactionId": "TX-2", "status": "DECLINED"},
+        json_data={"actionCode": "101", "transactionId": "TX-2", "status": "DECLINED"},
     )
 
-    result = client.push_payment(
-        purchase_number="1-100",
+    result = client.authorize_payment(
+        purchase_number="000000002",
         amount=Decimal("20.00"),
         currency="PEN",
-        external_transaction_id="ext-2",
         token_id="tok-2",
-        payer_email="test@example.com",
     )
     assert not result["success"]
-    assert result["action_code"] == "05"
+    assert result["action_code"] == "101"
 
 

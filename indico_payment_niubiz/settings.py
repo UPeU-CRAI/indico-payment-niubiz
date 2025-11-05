@@ -46,11 +46,8 @@ class EnvironmentInfo:
 @dataclass(frozen=True)
 class NiubizCredentials:
     merchant_id: str
-    client_id: str
-    client_secret: str
     username: str
     password: str
-    realm_code: str
     environment: EnvironmentInfo
 
     @property
@@ -119,7 +116,7 @@ def _get_setting_with_fallback(event, names: Sequence[str], plugin=None) -> Opti
 
 def _collect_credentials(event, plugin=None) -> Dict[str, str]:
     plugin = _resolve_plugin(plugin)
-    keys = ("merchant_id", "client_id", "client_secret", "username", "password", "realm_code")
+    keys = ("merchant_id", "username", "password")
     values: Dict[str, str] = {}
     missing: List[str] = []
 

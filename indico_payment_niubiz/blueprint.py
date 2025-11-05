@@ -6,7 +6,6 @@ import json
 import logging
 from decimal import Decimal
 from typing import Any, Dict, Iterable, Optional, Tuple
-from uuid import uuid4
 
 from flask import Blueprint, abort, flash, jsonify, redirect, request, url_for
 from werkzeug.exceptions import BadRequest, Forbidden
@@ -275,27 +274,6 @@ def _extract_token_id(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _compose_registrant_name(registration) -> Optional[str]:
-    for attr in ("full_name", "display_name", "name"):
-        value = getattr(registration, attr, None)
-        if value:
-            return str(value)
-
-    first = getattr(registration, "first_name", None)
-    last = getattr(registration, "last_name", None)
-    parts = [part for part in (first, last) if part]
-    if parts:
-        return " ".join(str(part) for part in parts)
-
-    user = getattr(registration, "user", None)
-    if user is not None:
-        for attr in ("full_name", "display_name", "name"):
-            value = getattr(user, attr, None)
-            if value:
-                return str(value)
-    return None
-
-
 @blueprint.post(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/start"
 )
@@ -446,6 +424,8 @@ def _complete_push_payment(
     transaction_token: str,
     mdd_payload: Dict[str, str],
     plugin,
+    *,
+    client_ip: Optional[str] = None,
 ):
     amount = parse_amount(getattr(registration, "price", None), None) or Decimal("0.00")
     currency = (
@@ -532,28 +512,29 @@ def _complete_push_payment(
         return redirect(_registration_redirect_url(registration))
 
     purchase_number = verification_details.get("purchase_number") or f"{registration.event_id}-{registration.id}"
-    external_transaction_id = str(uuid4())
-    payer_name = _compose_registrant_name(registration)
+
+    antifraud_payload = build_antifraud_payload(
+        registration,
+        dict(mdd_payload),
+        client_ip=client_ip,
+    )
 
     try:
-        push_response = client.push_payment(
+        push_response = client.authorize_payment(
             purchase_number=purchase_number,
             amount=amount,
             currency=currency,
-            external_transaction_id=external_transaction_id,
             token_id=token_id,
-            payer_email=mdd_payload.get("MDD4"),
-            payer_name=payer_name,
+            antifraud=antifraud_payload,
         )
     except NiubizClientError as exc:
-        logger.exception("Error ejecutando PushPayment Niubiz")
+        logger.exception("Error autorizando pago Niubiz")
         data = build_transaction_data(
-            payload={"push_error": str(exc), "verification": verification_data},
+            payload={"authorization_error": str(exc), "verification": verification_data},
             source="success",
-            status="push_failed",
+            status="authorization_failed",
             action_code=None,
             order_id=purchase_number,
-            external_id=external_transaction_id,
             message=str(exc),
         )
         handle_failed_payment(
@@ -561,8 +542,8 @@ def _complete_push_payment(
             amount=amount,
             currency=currency,
             transaction_id=None,
-            status="push_failed",
-            summary=_("No fue posible completar el cobro con Niubiz."),
+            status="authorization_failed",
+            summary=_("No fue posible autorizar el pago con Niubiz."),
             data=data,
             toggle_paid=True,
         )
@@ -580,6 +561,7 @@ def _complete_push_payment(
         "transactionToken": transaction_token,
         "token_id": token_id,
         "merchantDefinedData": mdd_payload,
+        "antifraud": antifraud_payload,
     }
 
     data = build_transaction_data(
@@ -589,8 +571,7 @@ def _complete_push_payment(
         action_code=push_action,
         transaction_id=transaction_id,
         order_id=purchase_number,
-        external_id=external_transaction_id,
-        message="push_payment",
+        message="authorization",
     )
 
     if push_response.get("success"):
@@ -607,24 +588,40 @@ def _complete_push_payment(
         )
         flash(_("Tu pago con Niubiz se registró correctamente."), "success")
     else:
-        error_message = (
-            push_data.get("errorMessage")
-            or push_data.get("message")
-            or _("Niubiz rechazó la transacción.")
-        )
-        if push_action:
-            error_message = f"{error_message} (código {push_action})"
-        handle_failed_payment(
-            registration,
-            amount=amount,
-            currency=currency,
-            transaction_id=transaction_id,
-            status=push_status or "rejected",
-            summary=error_message,
-            data=data,
-            toggle_paid=True,
-        )
-        flash(error_message, "error")
+        normalized_status = (push_status or "").strip().lower()
+        action_upper = (push_action or "").strip().upper()
+
+        if normalized_status in {"pending", "review"} or action_upper in {"PENDING", "REVIEW"}:
+            summary = _("Tu pago con Niubiz está en revisión.")
+            handle_pending_payment(
+                registration,
+                amount=amount,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=push_status or "PENDING",
+                summary=summary,
+                data=data,
+            )
+            flash(summary, "warning")
+        else:
+            error_message = (
+                push_data.get("errorMessage")
+                or push_data.get("message")
+                or _("Niubiz rechazó la transacción.")
+            )
+            if push_action:
+                error_message = f"{error_message} (código {push_action})"
+            handle_failed_payment(
+                registration,
+                amount=amount,
+                currency=currency,
+                transaction_id=transaction_id,
+                status=push_status or "rejected",
+                summary=error_message,
+                data=data,
+                toggle_paid=True,
+            )
+            flash(error_message, "error")
 
     return redirect(_registration_redirect_url(registration))
 
@@ -682,6 +679,7 @@ def success(event_id: int, reg_form_id: int, reg_id: int):
             transaction_token,
             mdd_payload,
             plugin,
+            client_ip=request.headers.get("X-Forwarded-For", request.remote_addr),
         )
 
     amount = parse_amount(getattr(registration, "price", None), None)

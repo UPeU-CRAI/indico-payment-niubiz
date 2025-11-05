@@ -117,20 +117,6 @@ class _BrandingValidator:
         field.data = value
 
 
-class _RealmCodeValidator:
-    _pattern = re.compile(r"^[A-Za-z0-9._-]+$")
-
-    def __call__(self, form, field) -> None:  # type: ignore[override]
-        value = (field.data or "").strip()
-        if not value:
-            field.data = ""
-            return
-        if not self._pattern.match(value):
-            raise ValidationError(
-                _("El realm solo puede contener letras, números, puntos, guiones y guiones bajos."))
-        field.data = value
-
-
 class _PCIWarningMixin:
     def _emit_pci_warning(self, env_value: str | None) -> None:
         if not env_value:
@@ -148,11 +134,8 @@ class NiubizPluginSettingsForm(_PCIWarningMixin, PaymentPluginSettingsFormBase):
     """Formulario global para la administración del plugin."""
 
     merchant_id = StringField(_("Merchant ID"), [DataRequired()])
-    client_id = StringField(_("Client ID"), [DataRequired()])
-    client_secret = IndicoPasswordField(_("Client secret"), [DataRequired()])
     username = StringField(_("Usuario NO-PCI"), [DataRequired()])
     password = IndicoPasswordField(_("Contraseña NO-PCI"), [DataRequired()])
-    realm_code = StringField(_("Realm"), [DataRequired(), _RealmCodeValidator()])
     env = SelectField(_("Entorno"), [DataRequired()], choices=ENV_CHOICES, default="sandbox")
 
     authorization_token = IndicoPasswordField(_("Token de autorización"), [OptionalValidator()])
@@ -184,11 +167,8 @@ class NiubizEventSettingsForm(_PCIWarningMixin, PaymentEventSettingsFormBase):
     """Formulario de configuración por evento."""
 
     merchant_id = StringField(_("Merchant ID"), [OptionalValidator()])
-    client_id = StringField(_("Client ID"), [OptionalValidator()])
-    client_secret = IndicoPasswordField(_("Client secret"), [OptionalValidator()])
     username = StringField(_("Usuario NO-PCI"), [OptionalValidator()])
     password = IndicoPasswordField(_("Contraseña NO-PCI"), [OptionalValidator()])
-    realm_code = StringField(_("Realm"), [OptionalValidator(), _RealmCodeValidator()])
     env = SelectField(
         _("Entorno"),
         [OptionalValidator()],
