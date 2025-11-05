@@ -1,10 +1,4 @@
-"""Niubiz payment plugin configuration and integration with Indico.
-
-Este módulo define:
-- Configuración global y por evento para la pasarela Niubiz.
-- Métodos habilitados: tarjeta, Yape, PagoEfectivo, QR y tokenización.
-- Integración con el flujo de pagos de Indico, incluyendo reembolsos.
-"""
+"""Niubiz payment plugin configuration and integration with Indico."""
 
 from __future__ import annotations
 
@@ -34,11 +28,13 @@ from indico_payment_niubiz.settings import (
     get_branding,
     get_credentials_for_event,
     get_default_currency,
+    get_environment_for_event,
     get_merchant_defined_data,
     get_scoped_bool,
     get_scoped_setting,
     is_mdd_required,
 )
+from indico_payment_niubiz.util import get_checkout_script_url
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +112,11 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         credentials = get_credentials_for_event(event, plugin=self)
         return NiubizClient(
             merchant_id=credentials.merchant_id,
-            access_key=credentials.client_id,
-            secret_key=credentials.client_secret,
+            client_id=credentials.client_id,
+            client_secret=credentials.client_secret,
+            username=credentials.username,
+            password=credentials.password,
+            realm_code=credentials.realm_code,
             endpoint=credentials.endpoint,
         )
 
@@ -141,6 +140,7 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
 
         branding = get_branding(event, plugin=self)
         merchant_defined_data = get_merchant_defined_data(event, plugin=self)
+        environment = get_environment_for_event(event, plugin=self)
 
         data.update({
             "merchant_id": self._get_setting(event, "merchant_id"),
@@ -154,6 +154,7 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
             "branding": branding,
             "mdd_required": is_mdd_required(event, plugin=self),
             "merchant_defined_data": merchant_defined_data,
+            "checkout_js_url": get_checkout_script_url(environment.endpoint),
             "start_url": url_for(
                 "payment_niubiz.start",
                 event_id=event.id,
@@ -179,6 +180,10 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         method = (data or {}).get("method") or "card"
         event = registration.event
         methods = self._collect_methods(event)
+
+        currency = registration.currency or get_default_currency(event, plugin=self)
+        if currency not in {"PEN", "USD"}:
+            raise BadRequest(_("Niubiz solo soporta pagos en PEN o USD."))
 
         if method == "token":
             if not self._get_bool(event, "enable_tokenization"):

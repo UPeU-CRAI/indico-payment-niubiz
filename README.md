@@ -11,9 +11,11 @@ cambios se encuentra en [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Características principales
 
-* Creación de órdenes y carga del `checkout.js` oficial de Niubiz.
+* Flujo NO-PCI completo con creación de sesión y `checkout.js` oficial de Niubiz.
+* Verificación de token y cobro `PushPayment` host-to-host con idempotencia.
 * Confirmación automática de pagos autorizados y soporte opcional para
   tokenización de tarjetas.
+* Envío automático de Merchant Defined Data (MDD) obligatorios y objeto antifraude.
 * Callbacks seguros con validación de token, HMAC y lista blanca de IPs.
 * Registro detallado en los logs del evento y en las transacciones de Indico.
 * Gestión de reembolsos (reverse/refund) con sincronización del estado de la
@@ -23,7 +25,8 @@ cambios se encuentra en [`CHANGELOG.md`](CHANGELOG.md).
 ## Requisitos
 
 * Indico **3.3** o superior con acceso a la sección de administración.
-* Credenciales válidas de Niubiz (`merchantId`, `accessKey`, `secretKey`).
+* Credenciales NO-PCI de Niubiz (`merchantId`, `clientId`, `clientSecret`,
+  `username`, `password`, `realm`).
 * Certificado TLS público para exponer los endpoints de inicio, retorno y
   notificación.
 * Whitelist de IPs que permita el tráfico desde las redes publicadas por
