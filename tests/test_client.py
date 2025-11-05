@@ -39,6 +39,13 @@ def test_get_auth_token_ok(client):
     # Cached en segunda llamada
     token2 = client.get_auth_token()
     assert token2 == "abc123"
+    security_calls = [call for call in responses.calls if call.request.url == url]
+    assert len(security_calls) == 1
+
+    protected_url = f"{client.base_url}/dummy"
+    add_response("GET", protected_url, json_data={"ok": True})
+    client._request("GET", "/dummy")
+    assert responses.calls[-1].request.headers["Authorization"] == "abc123"
 
 
 @responses.activate
@@ -48,6 +55,24 @@ def test_get_auth_token_fail(client):
 
     with pytest.raises(NiubizAuthError):
         client.get_auth_token()
+
+
+@responses.activate
+def test_get_auth_token_plain_text(client):
+    url = f"{client.base_url}/api.security/v1/security"
+    responses.add("POST", url, body="abc123", status=200, content_type="text/plain")
+
+    token = client.get_auth_token()
+    assert token == "abc123"
+    assert client.get_auth_token() == "abc123"
+
+    security_calls = [call for call in responses.calls if call.request.url == url]
+    assert len(security_calls) == 1
+
+    protected_url = f"{client.base_url}/plain"
+    add_response("GET", protected_url, json_data={"ok": True})
+    client._request("GET", "/plain")
+    assert responses.calls[-1].request.headers["Authorization"] == "abc123"
 
 
 # ----------------------

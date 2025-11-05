@@ -64,7 +64,25 @@ class NiubizClient:
             logger.error("Error de conexión al autenticarse con Niubiz: %s", exc)
             raise NiubizAuthError("No se pudo autenticar con Niubiz") from exc
 
-        token = response.text.strip().strip('"')
+        raw_body = response.text.strip()
+        token: Optional[str] = None
+
+        if raw_body:
+            try:
+                parsed = response.json()
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and "accessToken" in parsed:
+                token_value = parsed.get("accessToken")
+                if token_value is not None:
+                    token = str(token_value)
+            elif isinstance(parsed, str):
+                token = parsed
+
+        if token is None:
+            token = raw_body
+
+        token = token.strip().strip('"')
         if not token:
             logger.error("Respuesta vacía al autenticar con Niubiz")
             raise NiubizAuthError("Niubiz no devolvió token válido")
