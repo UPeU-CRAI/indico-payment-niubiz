@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
     """Plugin de integración de Niubiz en Indico."""
 
+    _TRANSACTION_ID_KEYS = ("transaction_id", "transactionId", "TRANSACTION_ID", "operationNumber")
+    _NESTED_PAYLOAD_KEYS = ("payload", "data", "order", "ORDER")
+
     configurable = True
     settings_form = NiubizPluginSettingsForm
     event_settings_form = NiubizEventSettingsForm
@@ -133,8 +136,8 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         currency = registration.currency or get_default_currency(event, plugin=self)
         purchase_number = f"{registration.event_id}-{registration.id}"
 
-        branding = get_branding(event, plugin=self)
-        merchant_defined_data = get_merchant_defined_data(event, plugin=self)
+        branding = get_branding(event, plugin=self) or {}
+        merchant_defined_data = get_merchant_defined_data(event, plugin=self) or {}
         environment = get_environment_for_event(event, plugin=self)
 
         data.update({
@@ -167,12 +170,12 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         # Tokens almacenados del usuario
         user = getattr(registration, "user", None)
         if user:
-            data["stored_tokens"] = NiubizStoredToken.query.filter_by(user_id=user.id) \
-                .order_by(NiubizStoredToken.created_at.desc()).all()
+            data["stored_tokens"] = list(self.get_stored_tokens(user))
 
     def process_payment(self, registration, data):
         """Procesa un intento de pago y devuelve la acción a ejecutar."""
-        method = (data or {}).get("method") or "card"
+        data = data or {}
+        method = data.get("method") or "card"
         event = registration.event
         methods = self._collect_methods(event)
 
@@ -183,7 +186,7 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         if method == "token":
             if not self._get_bool(event, "enable_tokenization"):
                 raise BadRequest(_("La tokenización no está habilitada para este evento."))
-            token_id = (data or {}).get("token_id")
+            token_id = data.get("token_id")
             if not token_id:
                 raise BadRequest(_("No se proporcionó el token almacenado."))
             return {
@@ -224,19 +227,10 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
             return {"success": False, "error": _("Los reembolsos están deshabilitados para Niubiz en este evento.")}
 
         txn = transaction or getattr(registration, "transaction", None)
-        if event:
-            currency = (
-                getattr(txn, "currency", None)
-                or getattr(registration, "currency", None)
-                or get_default_currency(event, plugin=self)
-            )
-        else:
-            currency = getattr(txn, "currency", None) or getattr(registration, "currency", None) or "PEN"
+        currency = self._resolve_currency(event, registration, txn)
 
         # Determinar monto
-        amount_decimal = parse_amount(amount, None) or \
-                         parse_amount(getattr(txn, "amount", None), None) or \
-                         parse_amount(getattr(registration, "price", None), None)
+        amount_decimal = self._resolve_refund_amount(amount, txn, registration)
 
         if event is None or amount_decimal is None:
             return {"success": False, "error": _("Datos insuficientes para procesar el reembolso.")}
@@ -313,17 +307,41 @@ class NiubizPlugin(PaymentPluginMixin, IndicoPlugin):
         return {"success": is_success, **({} if is_success else {"error": summary})}
 
     # ------------------ Tokens ------------------
+    def _resolve_currency(self, event, registration, transaction) -> str:
+        if event:
+            return (
+                getattr(transaction, "currency", None)
+                or getattr(registration, "currency", None)
+                or get_default_currency(event, plugin=self)
+            )
+        return (
+            getattr(transaction, "currency", None)
+            or getattr(registration, "currency", None)
+            or "PEN"
+        )
+
+    @staticmethod
+    def _resolve_refund_amount(amount, transaction, registration):
+        for candidate in (amount, getattr(transaction, "amount", None), getattr(registration, "price", None)):
+            parsed = parse_amount(candidate, None)
+            if parsed is not None:
+                return parsed
+        return None
+
     @staticmethod
     def _extract_transaction_id(payload: Dict[str, object]) -> Optional[str]:
         """Extrae transaction_id desde un payload flexible."""
         if not isinstance(payload, dict):
             return None
-        for key in ("transaction_id", "transactionId", "TRANSACTION_ID", "operationNumber"):
+        for key in NiubizPlugin._TRANSACTION_ID_KEYS:
             if payload.get(key):
                 return str(payload[key])
-        nested = payload.get("payload") or payload.get("data") or payload.get("order") or payload.get("ORDER")
-        if isinstance(nested, dict):
-            return NiubizPlugin._extract_transaction_id(nested)
+        for nested_key in NiubizPlugin._NESTED_PAYLOAD_KEYS:
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                nested_result = NiubizPlugin._extract_transaction_id(nested)
+                if nested_result:
+                    return nested_result
         return None
 
     def get_stored_tokens(self, user) -> Iterable[NiubizStoredToken]:
