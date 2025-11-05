@@ -21,6 +21,7 @@ def registration(db, create_event, dummy_user):
     )
     registration.price = Decimal("150.50")
     registration.currency = "PEN"
+    registration.email = dummy_user.email
     db.session.add(registration)
     db.session.flush()
     return registration
@@ -52,11 +53,24 @@ def cancel_url(registration):
 
 def test_start_returns_session_data(client, plugin, registration, start_url, monkeypatch):
     class DummyClient:
-        def create_order(self, *, amount, currency, purchase_number, data=None):
+        def create_session(
+            self,
+            *,
+            amount,
+            currency,
+            purchase_number,
+            payment_method,
+            data_map,
+            antifraud,
+            token_id=None,
+        ):
             assert amount == Decimal("150.50")
             assert currency == "PEN"
             assert purchase_number == f"{registration.event_id}-{registration.id}"
-            assert data == {"paymentMethod": "card"}
+            assert payment_method == "card"
+            assert data_map["MDD4"] == registration.email
+            assert data_map["MDD57"] == "PushPayments"
+            assert "merchantDefineData" in antifraud
             return {
                 "success": True,
                 "data": {
@@ -76,6 +90,7 @@ def test_start_returns_session_data(client, plugin, registration, start_url, mon
     assert payload["purchase_number"] == f"{registration.event_id}-{registration.id}"
     assert payload["amount"] == "150.50"
     assert payload["currency"] == "PEN"
+    assert payload["merchantDefinedData"]["MDD4"] == registration.email
 
 
 def test_success_endpoint_marks_registration_paid(client, db, registration, success_url):

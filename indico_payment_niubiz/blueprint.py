@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
-
 from decimal import Decimal
+from typing import Any, Dict, Iterable, Optional, Tuple
+from uuid import uuid4
 
 from flask import Blueprint, abort, flash, jsonify, redirect, request, url_for
-from werkzeug.exceptions import Forbidden
+from werkzeug.exceptions import BadRequest, Forbidden
 
 from indico.modules.events.payment.models.transactions import (
     PaymentTransaction,
@@ -26,11 +27,14 @@ from indico_payment_niubiz.indico_integration import (
     handle_successful_payment,
     parse_amount,
 )
+from indico_payment_niubiz.payloads import build_antifraud_payload, collect_mdd_data
 from indico_payment_niubiz.settings import (
     get_allowed_ips,
     get_authorization_token,
     get_default_currency,
     get_hmac_secret,
+    get_merchant_defined_data,
+    is_mdd_required,
 )
 from indico_payment_niubiz.status_mapping import DEFAULT_STATUS, NIUBIZ_STATUS_MAP
 from indico_payment_niubiz.util import (
@@ -247,6 +251,51 @@ def _extract_method_payload() -> Dict[str, Any]:
     return data
 
 
+def _extract_token_id(payload: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("tokenId", "token_id", "TOKEN_ID", "token", "TOKEN"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+
+    for nested_key in ("card", "order", "data", "dataMap", "result", "payload"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            token = _extract_token_id(nested)
+            if token:
+                return token
+        elif isinstance(nested, list):
+            for item in nested:
+                if isinstance(item, dict):
+                    token = _extract_token_id(item)
+                    if token:
+                        return token
+    return None
+
+
+def _compose_registrant_name(registration) -> Optional[str]:
+    for attr in ("full_name", "display_name", "name"):
+        value = getattr(registration, attr, None)
+        if value:
+            return str(value)
+
+    first = getattr(registration, "first_name", None)
+    last = getattr(registration, "last_name", None)
+    parts = [part for part in (first, last) if part]
+    if parts:
+        return " ".join(str(part) for part in parts)
+
+    user = getattr(registration, "user", None)
+    if user is not None:
+        for attr in ("full_name", "display_name", "name"):
+            value = getattr(user, attr, None)
+            if value:
+                return str(value)
+    return None
+
+
 @blueprint.post(
     "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/start"
 )
@@ -285,17 +334,52 @@ def start(event_id: int, reg_form_id: int, reg_id: int):
 
     client = plugin._build_client(event)
 
-    request_data: Dict[str, Any] = {"paymentMethod": method}
-    if method == "token" and payload.get("token_id"):
-        request_data["tokenId"] = payload.get("token_id")
+    merchant_defined_raw = get_merchant_defined_data(event, plugin=plugin)
+    try:
+        extra_mdd = json.loads(merchant_defined_raw) if merchant_defined_raw else {}
+    except ValueError:
+        logger.warning("Merchant Defined Data inválido en evento %s", event.id)
+        extra_mdd = {}
 
     try:
-        order_result = client.create_order(
-            amount=amount,
-            currency=currency,
-            purchase_number=purchase_number,
-            data=request_data,
+        mdd_payload = collect_mdd_data(
+            registration,
+            extra=extra_mdd,
+            require_all=is_mdd_required(event, plugin=plugin),
         )
+    except Exception as exc:
+        logger.exception("Error preparando Merchant Defined Data para Niubiz")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "mdd_invalid",
+                    "message": str(exc),
+                }
+            ),
+            400,
+        )
+
+    antifraud_payload = build_antifraud_payload(
+        registration,
+        dict(mdd_payload),
+        client_ip=request.headers.get("X-Forwarded-For", request.remote_addr),
+    )
+
+    session_kwargs: Dict[str, Any] = {
+        "amount": amount,
+        "currency": currency,
+        "purchase_number": purchase_number,
+        "payment_method": method,
+        "data_map": mdd_payload,
+        "antifraud": antifraud_payload,
+    }
+
+    if method == "token" and payload.get("token_id"):
+        session_kwargs["token_id"] = payload.get("token_id")
+
+    try:
+        order_result = client.create_session(**session_kwargs)
     except NiubizClientError as exc:
         logger.exception("No se pudo iniciar sesión de pago en Niubiz")
         return (
@@ -311,6 +395,33 @@ def start(event_id: int, reg_form_id: int, reg_id: int):
         or order_data.get("expirationDate")
     )
 
+    transaction_data = build_transaction_data(
+        payload=order_data,
+        source="session",
+        status=order_data.get("status"),
+        order_id=purchase_number,
+        message="session_created",
+    )
+    transaction_data.update(
+        {
+            "purchase_number": purchase_number,
+            "session_key": session_key,
+            "payment_method": method,
+            "mdd": mdd_payload,
+            "antifraud": antifraud_payload,
+        }
+    )
+
+    handle_pending_payment(
+        registration,
+        amount=amount,
+        currency=currency,
+        transaction_id=None,
+        status=order_data.get("status") or "SESSION_CREATED",
+        summary=_("Sesión de pago Niubiz iniciada."),
+        data=transaction_data,
+    )
+
     response_payload: Dict[str, Any] = {
         "success": True,
         "method": method,
@@ -320,6 +431,7 @@ def start(event_id: int, reg_form_id: int, reg_id: int):
         "sessionKey": session_key,
         "session_expiration": expiration,
         "data": order_data,
+        "merchantDefinedData": mdd_payload,
     }
     if method == "token" and payload.get("token_id"):
         response_payload["token_id"] = payload.get("token_id")
@@ -327,8 +439,199 @@ def start(event_id: int, reg_form_id: int, reg_id: int):
     return jsonify(response_payload)
 
 
-@blueprint.get(
-    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/success"
+def _complete_push_payment(
+    registration,
+    event,
+    payload: Dict[str, Any],
+    transaction_token: str,
+    mdd_payload: Dict[str, str],
+    plugin,
+):
+    amount = parse_amount(getattr(registration, "price", None), None) or Decimal("0.00")
+    currency = (
+        getattr(registration, "currency", None)
+        or get_default_currency(event, plugin=plugin)
+        or "PEN"
+    )
+
+    client = plugin._build_client(event)
+
+    try:
+        verification = client.verify_transaction_token(transaction_token)
+    except NiubizClientError as exc:
+        logger.exception("No se pudo verificar el token de transacción Niubiz")
+        data = build_transaction_data(
+            payload={"verification_error": str(exc)},
+            source="success",
+            status="verification_failed",
+            message=str(exc),
+        )
+        handle_failed_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=None,
+            status="verification_failed",
+            summary=_("Niubiz no pudo verificar el token de transacción."),
+            data=data,
+            toggle_paid=True,
+        )
+        flash(_("No fue posible verificar tu tarjeta con Niubiz."), "error")
+        return redirect(_registration_redirect_url(registration))
+
+    verification_data = verification.get("data", {}) if isinstance(verification, dict) else {}
+    verification_details = extract_callback_details(verification_data)
+    verification_action = (verification_details.get("action_code") or "").strip()
+    verification_status = (verification_details.get("status") or "").strip()
+
+    if verification_action not in {"000", "0"} or verification_status.lower() not in {"verified", "authorized", "success"}:
+        summary = _("Niubiz no pudo verificar la tarjeta tokenizada.")
+        data = build_transaction_data(
+            payload=verification_data,
+            source="success",
+            status=verification_status or None,
+            action_code=verification_action or None,
+            order_id=verification_details.get("purchase_number"),
+            message="verification_rejected",
+        )
+        handle_failed_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=None,
+            status=verification_status or "rejected",
+            summary=summary,
+            data=data,
+            toggle_paid=True,
+        )
+        flash(summary, "error")
+        return redirect(_registration_redirect_url(registration))
+
+    token_id = _extract_token_id(verification_data)
+    if not token_id:
+        summary = _("Niubiz no devolvió un token de tarjeta válido.")
+        data = build_transaction_data(
+            payload=verification_data,
+            source="success",
+            status=verification_status or None,
+            action_code=verification_action or None,
+            order_id=verification_details.get("purchase_number"),
+            message="token_missing",
+        )
+        handle_failed_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=None,
+            status="token_missing",
+            summary=summary,
+            data=data,
+            toggle_paid=True,
+        )
+        flash(summary, "error")
+        return redirect(_registration_redirect_url(registration))
+
+    purchase_number = verification_details.get("purchase_number") or f"{registration.event_id}-{registration.id}"
+    external_transaction_id = str(uuid4())
+    payer_name = _compose_registrant_name(registration)
+
+    try:
+        push_response = client.push_payment(
+            purchase_number=purchase_number,
+            amount=amount,
+            currency=currency,
+            external_transaction_id=external_transaction_id,
+            token_id=token_id,
+            payer_email=mdd_payload.get("MDD4"),
+            payer_name=payer_name,
+        )
+    except NiubizClientError as exc:
+        logger.exception("Error ejecutando PushPayment Niubiz")
+        data = build_transaction_data(
+            payload={"push_error": str(exc), "verification": verification_data},
+            source="success",
+            status="push_failed",
+            action_code=None,
+            order_id=purchase_number,
+            external_id=external_transaction_id,
+            message=str(exc),
+        )
+        handle_failed_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=None,
+            status="push_failed",
+            summary=_("No fue posible completar el cobro con Niubiz."),
+            data=data,
+            toggle_paid=True,
+        )
+        flash(_("No fue posible completar tu pago con Niubiz. Inténtalo nuevamente."), "error")
+        return redirect(_registration_redirect_url(registration))
+
+    push_data = push_response.get("data", {}) if isinstance(push_response, dict) else {}
+    push_action = push_response.get("action_code") or ""
+    push_status = (push_data.get("status") or "").strip() or "PENDING"
+    transaction_id = push_response.get("transaction_id") or push_data.get("transactionId")
+
+    combined_payload = {
+        "verification": verification_data,
+        "push": push_data,
+        "transactionToken": transaction_token,
+        "token_id": token_id,
+        "merchantDefinedData": mdd_payload,
+    }
+
+    data = build_transaction_data(
+        payload=combined_payload,
+        source="success",
+        status=push_status,
+        action_code=push_action,
+        transaction_id=transaction_id,
+        order_id=purchase_number,
+        external_id=external_transaction_id,
+        message="push_payment",
+    )
+
+    if push_response.get("success"):
+        summary = _("Pago completado correctamente a través de Niubiz.")
+        handle_successful_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=transaction_id,
+            status=push_status,
+            summary=summary,
+            data=data,
+            toggle_paid=True,
+        )
+        flash(_("Tu pago con Niubiz se registró correctamente."), "success")
+    else:
+        error_message = (
+            push_data.get("errorMessage")
+            or push_data.get("message")
+            or _("Niubiz rechazó la transacción.")
+        )
+        if push_action:
+            error_message = f"{error_message} (código {push_action})"
+        handle_failed_payment(
+            registration,
+            amount=amount,
+            currency=currency,
+            transaction_id=transaction_id,
+            status=push_status or "rejected",
+            summary=error_message,
+            data=data,
+            toggle_paid=True,
+        )
+        flash(error_message, "error")
+
+    return redirect(_registration_redirect_url(registration))
+
+
+@blueprint.route(
+    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/success",
+    methods=["GET", "POST"],
 )
 def success(event_id: int, reg_form_id: int, reg_id: int):
     registration = _load_registration(
@@ -339,9 +642,50 @@ def success(event_id: int, reg_form_id: int, reg_id: int):
     if not registration:
         abort(404)
 
+    payload: Dict[str, Any] = {}
+    if request.method == "POST":
+        json_payload = request.get_json(silent=True)
+        if isinstance(json_payload, dict):
+            payload.update(json_payload)
+        payload.update(request.form.to_dict())
+    payload.update(request.args.to_dict())
+
+    plugin = _get_plugin()
+    event = registration.event
+
+    merchant_defined_raw = get_merchant_defined_data(event, plugin=plugin)
+    try:
+        extra_mdd = json.loads(merchant_defined_raw) if merchant_defined_raw else {}
+    except ValueError:
+        extra_mdd = {}
+
+    try:
+        mdd_payload = collect_mdd_data(
+            registration,
+            extra=extra_mdd,
+            require_all=is_mdd_required(event, plugin=plugin),
+        )
+    except BadRequest as exc:
+        flash(str(exc), "error")
+        return redirect(_registration_redirect_url(registration))
+
+    transaction_token = (
+        payload.get("transactionToken")
+        or payload.get("transaction_token")
+        or payload.get("TRANSACTIONTOKEN")
+    )
+    if transaction_token:
+        return _complete_push_payment(
+            registration,
+            event,
+            payload,
+            transaction_token,
+            mdd_payload,
+            plugin,
+        )
+
     amount = parse_amount(getattr(registration, "price", None), None)
     currency = getattr(registration, "currency", None)
-    payload = request.args.to_dict()
 
     transaction_id = (
         payload.get("transactionId")
