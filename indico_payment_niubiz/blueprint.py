@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from decimal import Decimal
+
+from flask import Blueprint, abort, flash, jsonify, redirect, request, url_for
 from werkzeug.exceptions import Forbidden
 
 from indico.modules.events.payment.models.transactions import (
@@ -15,6 +17,7 @@ from indico.modules.events.payment.models.transactions import (
 from indico.modules.events.registration.models.registrations import Registration
 
 from indico_payment_niubiz import _
+from indico_payment_niubiz.client import NiubizClientError
 from indico_payment_niubiz.indico_integration import (
     build_transaction_data,
     handle_failed_payment,
@@ -26,6 +29,7 @@ from indico_payment_niubiz.indico_integration import (
 from indico_payment_niubiz.settings import (
     get_allowed_ips,
     get_authorization_token,
+    get_default_currency,
     get_hmac_secret,
 )
 from indico_payment_niubiz.status_mapping import DEFAULT_STATUS, NIUBIZ_STATUS_MAP
@@ -218,6 +222,208 @@ def _handle_cancelled(
 
 
 blueprint = Blueprint("payment_niubiz", __name__)
+
+
+def _registration_redirect_url(registration) -> str:
+    try:
+        return registration.display_regform_url
+    except Exception:
+        locator = getattr(registration, "locator", None)
+        if locator is not None and hasattr(locator, "registrant"):
+            try:
+                return url_for("event_registration.display_regform", locator.registrant)
+            except Exception:
+                pass
+    return "/"
+
+
+def _extract_method_payload() -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    if request.is_json:
+        json_payload = request.get_json(silent=True)
+        if isinstance(json_payload, dict):
+            data.update(json_payload)
+    data.update(request.values.to_dict())
+    return data
+
+
+@blueprint.post(
+    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/start"
+)
+def start(event_id: int, reg_form_id: int, reg_id: int):
+    registration = _load_registration(
+        registration_id=reg_id,
+        reg_form_id=reg_form_id,
+        event_id=event_id,
+    )
+    if not registration:
+        abort(404)
+
+    plugin = _get_plugin()
+    event = registration.event
+
+    payload = _extract_method_payload()
+    method = (payload.get("method") or "card").strip().lower()
+
+    if method not in {"card", "yape", "pagoefectivo", "qr", "token"}:
+        return jsonify({"success": False, "error": "invalid_method"}), 400
+
+    if method == "token" and not plugin._get_bool(event, "enable_tokenization"):
+        return jsonify({"success": False, "error": "tokenization_disabled"}), 400
+
+    enabled_methods = plugin._collect_methods(event)
+    if method != "token" and not enabled_methods.get(method, False):
+        return jsonify({"success": False, "error": "method_disabled"}), 400
+
+    amount = parse_amount(getattr(registration, "price", None), None) or Decimal("0.00")
+    currency = (
+        getattr(registration, "currency", None)
+        or get_default_currency(event, plugin=plugin)
+        or "PEN"
+    )
+    purchase_number = f"{event_id}-{reg_id}"
+
+    client = plugin._build_client(event)
+
+    request_data: Dict[str, Any] = {"paymentMethod": method}
+    if method == "token" and payload.get("token_id"):
+        request_data["tokenId"] = payload.get("token_id")
+
+    try:
+        order_result = client.create_order(
+            amount=amount,
+            currency=currency,
+            purchase_number=purchase_number,
+            data=request_data,
+        )
+    except NiubizClientError as exc:
+        logger.exception("No se pudo iniciar sesión de pago en Niubiz")
+        return (
+            jsonify({"success": False, "error": "order_creation_failed", "message": str(exc)}),
+            502,
+        )
+
+    order_data = order_result.get("data", {}) if isinstance(order_result, dict) else {}
+    session_key = order_data.get("sessionKey")
+    expiration = (
+        order_data.get("expirationTime")
+        or order_data.get("expirationDateTime")
+        or order_data.get("expirationDate")
+    )
+
+    response_payload: Dict[str, Any] = {
+        "success": True,
+        "method": method,
+        "purchase_number": purchase_number,
+        "amount": f"{amount:.2f}",
+        "currency": currency,
+        "sessionKey": session_key,
+        "session_expiration": expiration,
+        "data": order_data,
+    }
+    if method == "token" and payload.get("token_id"):
+        response_payload["token_id"] = payload.get("token_id")
+
+    return jsonify(response_payload)
+
+
+@blueprint.get(
+    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/success"
+)
+def success(event_id: int, reg_form_id: int, reg_id: int):
+    registration = _load_registration(
+        registration_id=reg_id,
+        reg_form_id=reg_form_id,
+        event_id=event_id,
+    )
+    if not registration:
+        abort(404)
+
+    amount = parse_amount(getattr(registration, "price", None), None)
+    currency = getattr(registration, "currency", None)
+    payload = request.args.to_dict()
+
+    transaction_id = (
+        payload.get("transactionId")
+        or payload.get("transaction_id")
+        or payload.get("transactionID")
+    )
+    status_value = payload.get("status") or payload.get("STATUS") or "AUTHORIZED"
+    action_code = payload.get("actionCode") or payload.get("ACTION_CODE")
+    purchase_number = payload.get("purchaseNumber") or f"{event_id}-{reg_id}"
+
+    data = build_transaction_data(
+        payload=payload,
+        source="success",
+        status=status_value,
+        action_code=action_code,
+        transaction_id=transaction_id,
+        order_id=purchase_number,
+    )
+
+    handle_successful_payment(
+        registration,
+        amount=amount,
+        currency=currency,
+        transaction_id=transaction_id,
+        status=status_value,
+        summary=_("Pago completado correctamente a través de Niubiz."),
+        data=data,
+        toggle_paid=True,
+    )
+
+    flash(_("Tu pago con Niubiz se registró correctamente."), "success")
+    return redirect(_registration_redirect_url(registration))
+
+
+@blueprint.get(
+    "/event/<int:event_id>/registrations/<int:reg_form_id>/payment/niubiz/<int:reg_id>/cancel"
+)
+def cancel(event_id: int, reg_form_id: int, reg_id: int):
+    registration = _load_registration(
+        registration_id=reg_id,
+        reg_form_id=reg_form_id,
+        event_id=event_id,
+    )
+    if not registration:
+        abort(404)
+
+    amount = parse_amount(getattr(registration, "price", None), None)
+    currency = getattr(registration, "currency", None)
+    payload = request.args.to_dict()
+
+    transaction_id = (
+        payload.get("transactionId")
+        or payload.get("transaction_id")
+        or payload.get("transactionID")
+    )
+    status_value = payload.get("status") or payload.get("STATUS") or "CANCELLED"
+    action_code = payload.get("actionCode") or payload.get("ACTION_CODE")
+    purchase_number = payload.get("purchaseNumber") or f"{event_id}-{reg_id}"
+
+    data = build_transaction_data(
+        payload=payload,
+        source="cancel",
+        status=status_value,
+        action_code=action_code,
+        transaction_id=transaction_id,
+        order_id=purchase_number,
+    )
+
+    handle_failed_payment(
+        registration,
+        amount=amount,
+        currency=currency,
+        transaction_id=transaction_id,
+        status=status_value,
+        summary=_("El pago fue cancelado desde Niubiz."),
+        data=data,
+        cancelled=True,
+        toggle_paid=True,
+    )
+
+    flash(_("El pago fue cancelado. Puedes intentarlo nuevamente cuando desees."), "warning")
+    return redirect(_registration_redirect_url(registration))
 
 
 @blueprint.post(
