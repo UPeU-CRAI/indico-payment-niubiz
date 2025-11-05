@@ -17,6 +17,11 @@ from indico_payment_niubiz import _
 TRUTHY = {"1", "true", "yes", "on", "si", "sí", "y", "t"}
 FALSY = {"0", "false", "no", "off", "n", "f"}
 
+ENABLE_CARD = True
+ENABLE_YAPE = False
+ENABLE_QR = False
+ENABLE_EFECTIVO = False
+
 ENVIRONMENT_ALIASES = {
     "sandbox": ("sandbox", True),
     "qa": ("sandbox", True),
